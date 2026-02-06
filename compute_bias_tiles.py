@@ -22,6 +22,9 @@ except Exception as exc:  # pragma: no cover - environment dependent
 DEFAULT_STATS_DIR = Path("stats") / "bias" / "ppt"
 # Web Mercator (EPSG:3857) is only valid for |lat| <= this (degrees)
 WEB_MERCATOR_MAX_LAT = 85.05112878
+# Default PMTiles header: center and bounds of continental US (for pmtiles edit)
+US_HEADER_CENTER = [-98.5795, 39.8283, 3.0]  # [lon, lat, zoom]
+US_HEADER_BOUNDS = [-125.0, 24.0, -66.0, 50.0]  # [west, south, east, north]
 
 
 def parse_args() -> argparse.Namespace:
@@ -198,7 +201,6 @@ def write_rgba_raster(path: Path, rgba: np.ndarray, transform: Affine, crs: str)
         dtype="uint8",
         crs=crs,
         transform=transform,
-        nodata=0,
     ) as dst:
         for idx in range(4):
             dst.write(rgba[:, :, idx], idx + 1)
@@ -218,7 +220,6 @@ def reproject_to_mercator(src_path: Path, dst_path: Path) -> None:
             transform=dst_transform,
             width=width,
             height=height,
-            nodata=0,
         )
         with rasterio.open(dst_path, "w", **profile) as dst:
             for i in range(1, src.count + 1):
@@ -230,7 +231,6 @@ def reproject_to_mercator(src_path: Path, dst_path: Path) -> None:
                     dst_transform=dst_transform,
                     dst_crs="EPSG:3857",
                     resampling=Resampling.bilinear,
-                    dst_nodata=0,
                 )
 
 
@@ -265,6 +265,39 @@ def export_pmtiles(
     if jobs is not None:
         cmd.extend(["-j", str(jobs)])
     subprocess.run(cmd, check=True)
+
+
+def edit_pmtiles_header(
+    pmtiles_path: Path,
+    header_path: Path,
+    center: list[float],
+    bounds: list[float],
+) -> None:
+    """Set PMTiles header center and bounds via pmtiles edit (e.g. US default view)."""
+    pmtiles_bin = shutil.which("pmtiles")
+    if pmtiles_bin is None:
+        return
+    result = subprocess.run(
+        [pmtiles_bin, "show", str(pmtiles_path), "--header-json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return
+    header = json.loads(result.stdout)
+    header["center"] = center
+    header["bounds"] = bounds
+    header_path.write_text(json.dumps(header))
+    try:
+        subprocess.run(
+            [pmtiles_bin, "edit", str(pmtiles_path), f"--header-json={header_path}"],
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        return
+    finally:
+        header_path.unlink(missing_ok=True)
 
 
 def write_metadata(
@@ -350,6 +383,8 @@ def main() -> None:
             max_zoom,
             args.jobs,
         )
+        header_tmp = tmp_root / f"header_week_{week:02d}_lead_{lead}.json"
+        edit_pmtiles_header(pmtiles_path, header_tmp, US_HEADER_CENTER, US_HEADER_BOUNDS)
 
     if tmp_root.exists():
         shutil.rmtree(tmp_root)
