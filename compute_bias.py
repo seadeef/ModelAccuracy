@@ -102,22 +102,47 @@ def _gfs_transform(lats: np.ndarray, lons: np.ndarray) -> rasterio.Affine:
     return rasterio.transform.from_origin(west, north, lon_res, lat_res)
 
 
-def _reproject_prism_to_gfs(
-    prism_path: Path, gfs_shape: Tuple[int, int], gfs_transform: rasterio.Affine
-) -> np.ndarray:
+def _read_prism_ppt(prism_path: Path) -> Tuple[np.ndarray, rasterio.Affine, str]:
     with rasterio.open(prism_path) as src:
-        dst = np.full(gfs_shape, np.nan, dtype=np.float32)
-        reproject(
-            source=rasterio.band(src, 1),
-            destination=dst,
-            src_transform=src.transform,
-            src_crs=src.crs,
-            dst_transform=gfs_transform,
-            dst_crs="EPSG:4326",
-            resampling=Resampling.average,
-            dst_nodata=np.nan,
-        )
-        return dst
+        data = src.read(1).astype(np.float32)
+        if src.nodata is not None:
+            data = np.where(data == src.nodata, np.nan, data)
+        return data, src.transform, str(src.crs)
+
+
+def _grid_coords_from_transform(
+    transform: rasterio.Affine, height: int, width: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    if transform.b == 0.0 and transform.d == 0.0:
+        lons = transform.c + (np.arange(width) + 0.5) * transform.a
+        lats = transform.f + (np.arange(height) + 0.5) * transform.e
+        return lats.astype(np.float32), lons.astype(np.float32)
+    cols = np.arange(width)
+    rows = np.arange(height)
+    xs, _ = rasterio.transform.xy(transform, rows[0], cols, offset="center")
+    _, ys = rasterio.transform.xy(transform, rows, cols[0], offset="center")
+    return np.array(ys, dtype=np.float32), np.array(xs, dtype=np.float32)
+
+
+def _reproject_gfs_to_prism(
+    gfs_data: np.ndarray,
+    gfs_transform: rasterio.Affine,
+    prism_shape: Tuple[int, int],
+    prism_transform: rasterio.Affine,
+    prism_crs: str,
+) -> np.ndarray:
+    dst = np.full(prism_shape, np.nan, dtype=np.float32)
+    reproject(
+        source=gfs_data,
+        destination=dst,
+        src_transform=gfs_transform,
+        src_crs="EPSG:4326",
+        dst_transform=prism_transform,
+        dst_crs=prism_crs,
+        resampling=Resampling.bilinear,
+        dst_nodata=np.nan,
+    )
+    return dst
 
 
 def _compute_week_lead_stats() -> Tuple[Dict[Tuple[int, int], np.ndarray], Dict[Tuple[int, int], np.ndarray], GridMeta]:
@@ -145,20 +170,40 @@ def _compute_week_lead_stats() -> Tuple[Dict[Tuple[int, int], np.ndarray], Dict[
             if not prism_tif.exists():
                 continue
 
-            gfs_data, lats, lons = _read_gfs_apcp(grib_path)
-            if grid_meta is None:
-                grid_meta = GridMeta(
-                    transform=_gfs_transform(lats, lons),
-                    crs="EPSG:4326",
-                    lats=lats,
-                    lons=lons,
-                )
+            gfs_data, gfs_lats, gfs_lons = _read_gfs_apcp(grib_path)
+            gfs_transform = _gfs_transform(gfs_lats, gfs_lons)
 
-            prism_on_gfs = _reproject_prism_to_gfs(
-                prism_tif, gfs_data.shape, grid_meta.transform
+            prism_data, prism_transform, prism_crs = _read_prism_ppt(prism_tif)
+            if grid_meta is None:
+                prism_lats, prism_lons = _grid_coords_from_transform(
+                    prism_transform, prism_data.shape[0], prism_data.shape[1]
+                )
+                grid_meta = GridMeta(
+                    transform=prism_transform,
+                    crs=prism_crs,
+                    lats=prism_lats,
+                    lons=prism_lons,
+                )
+            else:
+                if (
+                    prism_transform != grid_meta.transform
+                    or prism_crs != grid_meta.crs
+                    or prism_data.shape != (grid_meta.lats.size, grid_meta.lons.size)
+                ):
+                    raise RuntimeError(
+                        f"PRISM grid mismatch for {prism_tif}. "
+                        "Expected consistent PRISM grid across dates."
+                    )
+
+            gfs_on_prism = _reproject_gfs_to_prism(
+                gfs_data,
+                gfs_transform,
+                prism_data.shape,
+                prism_transform,
+                prism_crs,
             )
 
-            diff = gfs_data - prism_on_gfs
+            diff = gfs_on_prism - prism_data
             key = (week, lead_days)
 
             if key not in sum_diff:
@@ -222,6 +267,10 @@ def bias_at_point(lat: float, lon: float, week: int, lead_days: int) -> float:
 
 
 def main() -> None:
+    print(
+        "Computing bias on PRISM grid (higher resolution). "
+        "This increases memory usage and runtime."
+    )
     sum_diff, count, grid_meta = _compute_week_lead_stats()
     _write_tiles(sum_diff, count, grid_meta)
     print(f"Wrote tiles to {OUTPUT_DIR.resolve()}")
