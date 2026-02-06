@@ -1,0 +1,25 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Data and outputs (large or generated)
+model_data/
+prism_data/
+stats/
+tiles_output/
+
+# IDE / OS
+.idea/
+.DS_Store
+*.swp
+*.swo
