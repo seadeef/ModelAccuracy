@@ -9,6 +9,8 @@ from typing import Dict, Tuple
 
 import numpy as np
 
+from bias_query import bias_at_point
+
 try:
     import xarray as xr
 except Exception as exc:  # pragma: no cover - environment dependent
@@ -251,19 +253,6 @@ def _write_tiles(
             sum_diff=s,
             sample_count=c,
         )
-
-
-def bias_at_point(lat: float, lon: float, week: int, lead_days: int) -> float:
-    meta = np.load(OUTPUT_DIR / "metadata.npz", allow_pickle=False)
-    lats = meta["lats"]
-    lons = meta["lons"]
-
-    lat_idx = int(np.argmin(np.abs(lats - lat)))
-    lon_idx = int(np.argmin(np.abs(lons - lon)))
-
-    tile_path = OUTPUT_DIR / f"week_{week:02d}" / f"lead_{lead_days}.npz"
-    tile = np.load(tile_path, allow_pickle=False)
-    return float(tile["bias_mean"][lat_idx, lon_idx])
 
 
 def main() -> None:

@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bias PMTiles Viewer</title>
+    <link
+      href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, sans-serif;
+      }
+      .controls {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        padding: 10px 14px;
+        background: #101418;
+        color: #fff;
+      }
+      .controls label {
+        font-size: 14px;
+      }
+      .controls select {
+        margin-left: 6px;
+      }
+      #map {
+        width: 100%;
+        height: calc(100vh - 48px);
+      }
+      .status {
+        margin-left: auto;
+        font-size: 12px;
+        opacity: 0.85;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="controls">
+      <label>
+        Week
+        <select id="weekSelect"></select>
+      </label>
+      <label>
+        Lead (days)
+        <select id="leadSelect"></select>
+      </label>
+      <div class="status" id="status">Idle</div>
+    </div>
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/pmtiles@3.2.0/dist/index.js"></script>
+    <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+    <script>
+      const BASE_URL = "http://localhost:8080";
+      const API_BASE_URL = "http://localhost:8001";
+      const sourceId = "bias-source";
+      const layerId = "bias-layer";
+      const statusEl = document.getElementById("status");
+
+      const map = new maplibregl.Map({
+        container: "map",
+        style: "https://demotiles.maplibre.org/style.json",
+        center: [-98.5, 39.8],
+        zoom: 3,
+      });
+
+      function tilesetId(week, lead) {
+        const padded = String(week).padStart(2, "0");
+        return `week_${padded}_lead_${lead}`;
+      }
+
+      function setStatus(message) {
+        statusEl.textContent = message;
+      }
+
+      async function loadTileset(week, lead) {
+        const id = tilesetId(week, lead);
+        const tilejsonUrl = `${BASE_URL}/${id}.json`;
+        setStatus(`Loading ${id}...`);
+
+        if (map.getLayer(layerId)) {
+          map.removeLayer(layerId);
+        }
+        if (map.getSource(sourceId)) {
+          map.removeSource(sourceId);
+        }
+
+        map.addSource(sourceId, {
+          type: "raster",
+          url: tilejsonUrl,
+          tileSize: 256,
+        });
+        map.addLayer({
+          id: layerId,
+          type: "raster",
+          source: sourceId,
+          paint: {
+            "raster-opacity": 0.85,
+          },
+        });
+
+        try {
+          const resp = await fetch(tilejsonUrl);
+          if (resp.ok) {
+            const tilejson = await resp.json();
+            if (typeof tilejson.minzoom === "number") {
+              let center = null;
+              if (tilejson.center && tilejson.center.length >= 2) {
+                center = [tilejson.center[0], tilejson.center[1]];
+              } else if (tilejson.bounds && tilejson.bounds.length >= 4) {
+                center = [
+                  (tilejson.bounds[0] + tilejson.bounds[2]) / 2,
+                  (tilejson.bounds[1] + tilejson.bounds[3]) / 2,
+                ];
+              }
+              if (center) {
+                map.jumpTo({ center, zoom: tilejson.minzoom });
+              } else {
+                map.setZoom(tilejson.minzoom);
+              }
+            } else if (tilejson.center && tilejson.center.length >= 2) {
+              map.easeTo({
+                center: [tilejson.center[0], tilejson.center[1]],
+              });
+            } else if (tilejson.bounds) {
+              map.fitBounds(
+                [
+                  [tilejson.bounds[0], tilejson.bounds[1]],
+                  [tilejson.bounds[2], tilejson.bounds[3]],
+                ],
+                { padding: 20 }
+              );
+            }
+          } else {
+            setStatus(`Failed to load ${id} (${resp.status})`);
+            return;
+          }
+        } catch (err) {
+          console.error("TileJSON fetch failed", err);
+          setStatus(`TileJSON fetch failed for ${id}`);
+          return;
+        }
+
+        setStatus(`Showing ${id}`);
+      }
+
+      function populateSelect(selectEl, start, end) {
+        for (let i = start; i <= end; i += 1) {
+          const opt = document.createElement("option");
+          opt.value = String(i);
+          opt.textContent = String(i);
+          selectEl.appendChild(opt);
+        }
+      }
+
+      const weekSelect = document.getElementById("weekSelect");
+      const leadSelect = document.getElementById("leadSelect");
+      populateSelect(weekSelect, 1, 53);
+      populateSelect(leadSelect, 1, 7);
+      weekSelect.value = "1";
+      leadSelect.value = "1";
+
+      function handleChange() {
+        loadTileset(Number(weekSelect.value), Number(leadSelect.value));
+      }
+
+      weekSelect.addEventListener("change", handleChange);
+      leadSelect.addEventListener("change", handleChange);
+
+      map.on("load", () => {
+        handleChange();
+      });
+
+      const popup = new maplibregl.Popup({ closeButton: true });
+
+      map.on("click", async (event) => {
+        const { lng, lat } = event.lngLat;
+        const week = Number(weekSelect.value);
+        const lead = Number(leadSelect.value);
+        const url = `${API_BASE_URL}/api/bias?week=${week}&lead=${lead}&lat=${lat}&lon=${lng}`;
+        let text = "Loading...";
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) {
+            text = `Query failed (${resp.status})`;
+          } else {
+            const data = await resp.json();
+            if (data.no_data) {
+              text = "No data";
+            } else {
+              text = `${data.value.toFixed(2)} mm`;
+            }
+          }
+        } catch (err) {
+          text = "Query error";
+        }
+        popup.setLngLat([lng, lat]).setHTML(text).addTo(map);
+      });
+    </script>
+  </body>
+</html>
