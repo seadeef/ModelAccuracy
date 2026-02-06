@@ -260,6 +260,7 @@ def export_pmtiles(
         "256",
         "-f",
         "PNG",
+        "--exclude-empty-tiles",
     ]
     if jobs is not None:
         cmd.extend(["-j", str(jobs)])
