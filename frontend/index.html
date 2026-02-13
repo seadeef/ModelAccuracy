@@ -30,6 +30,9 @@
       .controls select {
         margin-left: 6px;
       }
+      .controls input[type="range"] {
+        vertical-align: middle;
+      }
       #map {
         width: 100%;
         height: calc(100vh - 48px);
@@ -51,6 +54,31 @@
         Lead (days)
         <select id="leadSelect"></select>
       </label>
+      <label>
+        View
+        <select id="modeSelect">
+          <option value="both">Both</option>
+          <option value="landmarks_only">Landmarks only</option>
+          <option value="weather_only">Weather only</option>
+        </select>
+      </label>
+      <label>
+        Detail
+        <select id="detailSelect">
+          <option value="low">Low</option>
+          <option value="high">High</option>
+        </select>
+      </label>
+      <label>
+        Weather opacity
+        <input id="weatherOpacity" type="range" min="0" max="1" step="0.05" value="0.85" />
+        <span id="weatherOpacityValue">0.85</span>
+      </label>
+      <label>
+        Landmarks opacity
+        <input id="landmarksOpacity" type="range" min="0" max="1" step="0.05" value="0.65" />
+        <span id="landmarksOpacityValue">0.65</span>
+      </label>
       <div class="status" id="status">Idle</div>
     </div>
     <div id="map"></div>
@@ -60,13 +88,27 @@
     <script>
       const BASE_URL = "http://localhost:8080";
       const API_BASE_URL = "http://localhost:8001";
+      const MAPTILER_API_KEY = "";
+      const MAPTILER_STYLE_ID = "streets-v2";
+      const FALLBACK_STYLE_URL = "https://demotiles.maplibre.org/style.json";
+      const MAP_STYLE_URL = MAPTILER_API_KEY
+        ? `https://api.maptiler.com/maps/${MAPTILER_STYLE_ID}/style.json?key=${MAPTILER_API_KEY}`
+        : FALLBACK_STYLE_URL;
+      const DETAIL_ZOOM_LIMITS = { low: 9, high: 14 };
       const sourceId = "bias-source";
       const layerId = "bias-layer";
       const statusEl = document.getElementById("status");
+      const state = {
+        mode: "both",
+        detailMode: "low",
+        weatherOpacity: 0.85,
+        landmarksOpacity: 0.65,
+      };
+      let landmarks = [];
 
       const map = new maplibregl.Map({
         container: "map",
-        style: "https://demotiles.maplibre.org/style.json",
+        style: MAP_STYLE_URL,
         center: [-98.5, 39.8],
         zoom: 3,
       });
@@ -77,6 +119,106 @@
 
       function setStatus(message) {
         statusEl.textContent = message;
+      }
+
+      function cacheLandmarkLayers() {
+        const style = map.getStyle();
+        if (!style || !style.layers) {
+          landmarks = [];
+          return;
+        }
+        landmarks = style.layers
+          .filter((layer) => layer.id !== layerId)
+          .map((layer) => ({
+            id: layer.id,
+            type: layer.type,
+            sourceLayer: layer["source-layer"] || "",
+          }));
+      }
+
+      function isLowDetailHidden(layerInfo) {
+        const text = `${layerInfo.id} ${layerInfo.sourceLayer}`.toLowerCase();
+        const isSymbolLike =
+          layerInfo.type === "symbol" || layerInfo.type === "line";
+        if (!isSymbolLike) {
+          return false;
+        }
+        return [
+          "poi",
+          "transit",
+          "airport",
+          "aeroway",
+          "housenumber",
+          "house_number",
+          "address",
+          "building",
+          "minor_road",
+          "path",
+          "rail",
+        ].some((keyword) => text.includes(keyword));
+      }
+
+      function setLayerVisibility(layerIdValue, visible) {
+        if (!map.getLayer(layerIdValue)) {
+          return;
+        }
+        map.setLayoutProperty(layerIdValue, "visibility", visible ? "visible" : "none");
+      }
+
+      function setLandmarkOpacity(layerInfo, opacity) {
+        if (!map.getLayer(layerInfo.id)) {
+          return;
+        }
+        const type = layerInfo.type;
+        if (type === "fill") {
+          map.setPaintProperty(layerInfo.id, "fill-opacity", opacity);
+        } else if (type === "line") {
+          map.setPaintProperty(layerInfo.id, "line-opacity", opacity);
+        } else if (type === "symbol") {
+          map.setPaintProperty(layerInfo.id, "icon-opacity", opacity);
+          map.setPaintProperty(layerInfo.id, "text-opacity", opacity);
+        } else if (type === "circle") {
+          map.setPaintProperty(layerInfo.id, "circle-opacity", opacity);
+        } else if (type === "raster") {
+          map.setPaintProperty(layerInfo.id, "raster-opacity", opacity);
+        } else if (type === "background") {
+          map.setPaintProperty(layerInfo.id, "background-opacity", opacity);
+        } else if (type === "fill-extrusion") {
+          map.setPaintProperty(layerInfo.id, "fill-extrusion-opacity", opacity);
+        } else if (type === "heatmap") {
+          map.setPaintProperty(layerInfo.id, "heatmap-opacity", opacity);
+        }
+      }
+
+      function applyLayerState() {
+        const zoomCap = DETAIL_ZOOM_LIMITS[state.detailMode];
+        map.setMaxZoom(zoomCap);
+        if (map.getZoom() > zoomCap) {
+          map.setZoom(zoomCap);
+        }
+
+        const weatherVisible = state.mode !== "landmarks_only";
+        if (map.getLayer(layerId)) {
+          setLayerVisibility(layerId, weatherVisible);
+          map.setPaintProperty(layerId, "raster-opacity", state.weatherOpacity);
+        }
+
+        const landmarksVisible = state.mode !== "weather_only";
+        for (const landmark of landmarks) {
+          const hideForLowDetail =
+            state.detailMode === "low" && isLowDetailHidden(landmark);
+          setLayerVisibility(landmark.id, landmarksVisible && !hideForLowDetail);
+          setLandmarkOpacity(landmark, state.landmarksOpacity);
+        }
+      }
+
+      function firstSymbolLayerId() {
+        for (const landmark of landmarks) {
+          if (landmark.type === "symbol" && map.getLayer(landmark.id)) {
+            return landmark.id;
+          }
+        }
+        return undefined;
       }
 
       async function loadTileset(season, lead) {
@@ -96,14 +238,20 @@
           url: tilejsonUrl,
           tileSize: 256,
         });
-        map.addLayer({
+        const weatherLayer = {
           id: layerId,
           type: "raster",
           source: sourceId,
           paint: {
-            "raster-opacity": 0.85,
+            "raster-opacity": state.weatherOpacity,
           },
-        });
+        };
+        const beforeId = firstSymbolLayerId();
+        if (beforeId) {
+          map.addLayer(weatherLayer, beforeId);
+        } else {
+          map.addLayer(weatherLayer);
+        }
 
         try {
           const resp = await fetch(tilejsonUrl);
@@ -147,6 +295,7 @@
           return;
         }
 
+        applyLayerState();
         setStatus(`Showing ${id}`);
       }
 
@@ -192,8 +341,20 @@
 
       const seasonSelect = document.getElementById("seasonSelect");
       const leadSelect = document.getElementById("leadSelect");
+      const modeSelect = document.getElementById("modeSelect");
+      const detailSelect = document.getElementById("detailSelect");
+      const weatherOpacityInput = document.getElementById("weatherOpacity");
+      const landmarksOpacityInput = document.getElementById("landmarksOpacity");
+      const weatherOpacityValue = document.getElementById("weatherOpacityValue");
+      const landmarksOpacityValue = document.getElementById("landmarksOpacityValue");
       populateSeasons(seasonSelect);
       seasonSelect.value = "winter";
+      modeSelect.value = state.mode;
+      detailSelect.value = state.detailMode;
+      weatherOpacityInput.value = String(state.weatherOpacity);
+      landmarksOpacityInput.value = String(state.landmarksOpacity);
+      weatherOpacityValue.textContent = weatherOpacityInput.value;
+      landmarksOpacityValue.textContent = landmarksOpacityInput.value;
 
       function handleChange() {
         loadTileset(seasonSelect.value, Number(leadSelect.value));
@@ -201,8 +362,30 @@
 
       seasonSelect.addEventListener("change", handleChange);
       leadSelect.addEventListener("change", handleChange);
+      modeSelect.addEventListener("change", () => {
+        state.mode = modeSelect.value;
+        applyLayerState();
+      });
+      detailSelect.addEventListener("change", () => {
+        state.detailMode = detailSelect.value;
+        applyLayerState();
+      });
+      weatherOpacityInput.addEventListener("input", () => {
+        state.weatherOpacity = Number(weatherOpacityInput.value);
+        weatherOpacityValue.textContent = weatherOpacityInput.value;
+        applyLayerState();
+      });
+      landmarksOpacityInput.addEventListener("input", () => {
+        state.landmarksOpacity = Number(landmarksOpacityInput.value);
+        landmarksOpacityValue.textContent = landmarksOpacityInput.value;
+        applyLayerState();
+      });
 
       map.on("load", async () => {
+        cacheLandmarkLayers();
+        if (!MAPTILER_API_KEY) {
+          setStatus("Using fallback basemap; set MAPTILER_API_KEY to enable MapTiler.");
+        }
         const leadBounds = await fetchLeadBounds();
         populateLeads(leadSelect, leadBounds.min, leadBounds.max);
         leadSelect.value = String(leadBounds.min);

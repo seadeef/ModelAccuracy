@@ -10,6 +10,13 @@ Set `LEAD_DAYS_MAX = 14` (default) to support leads 1-14 consistently across dow
 
 ## PMTiles viewer (local)
 
+Basemap configuration is in `frontend/index.html`:
+
+- `MAPTILER_API_KEY`
+- `MAPTILER_STYLE_ID`
+
+If `MAPTILER_API_KEY` is empty, the app falls back to a demo MapLibre style.
+
 1. Serve PMTiles as ZXY tiles:
 
 ```
@@ -30,6 +37,19 @@ http://localhost:8000/index.html
 
 The viewer expects PMTiles named `season_<name>_lead_Y.pmtiles` (e.g., `season_winter_lead_1.pmtiles`)
 and fetches TileJSON from `http://localhost:8080/<tileset>.json`.
+
+### Frontend layer controls
+
+The viewer supports:
+
+- **View mode**: `Both`, `Landmarks only`, `Weather only`
+- **Detail mode**: `Low` and `High`
+  - `Low` caps basemap zoom and hides lower-priority landmark layers.
+  - `High` allows higher basemap zoom and full landmark detail.
+- **Opacity controls**: separate sliders for weather and landmarks.
+
+There is no automatic API-credit tracking in the frontend; detail level is user-controlled.
+Remember to keep required attribution for your chosen MapTiler style per MapTiler terms.
 
 ## Bias query API (local)
 
