@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import os
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -37,7 +39,7 @@ GFS_DIR = Path("model_data") / GFS_MODEL / GFS_VAR
 PRISM_DIR = Path("prism_data") / PRISM_VAR
 OUTPUT_DIR = Path("stats") / "bias" / STATS_VAR
 
-GFS_FILE_RE = re.compile(r"f(?P<fhour>\d{3})_(?P<level>[^.]+)\.grib2")
+GFS_FILE_RE = re.compile(r"f(?P<fhour>\d{3})_(?P<level>[^.]+)\.grib2$")
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,15 @@ class GridMeta:
     crs: str
     lats: np.ndarray
     lons: np.ndarray
+
+
+@dataclass(frozen=True)
+class BiasTask:
+    grib_path: Path
+    prism_path: Path
+    season: str
+    lead_days: int
+    valid_date: datetime
 
 
 def _parse_init_date(dir_name: str) -> datetime:
@@ -157,16 +168,30 @@ def _reproject_gfs_to_prism(
     return dst
 
 
-def _compute_season_lead_stats() -> Tuple[Dict[Tuple[str, int], np.ndarray], Dict[Tuple[str, int], np.ndarray], GridMeta]:
-    sum_diff: Dict[Tuple[str, int], np.ndarray] = {}
-    count: Dict[Tuple[str, int], np.ndarray] = {}
-    grid_meta: GridMeta | None = None
+def _affine_to_tuple(transform: rasterio.Affine) -> Tuple[float, float, float, float, float, float]:
+    return (
+        float(transform.a),
+        float(transform.b),
+        float(transform.c),
+        float(transform.d),
+        float(transform.e),
+        float(transform.f),
+    )
+
+
+def _build_bias_tasks() -> Tuple[list[BiasTask], int]:
+    tasks: list[BiasTask] = []
+    skipped_partial_files = 0
 
     for init_dir in _list_gfs_inits():
         init_date = _parse_init_date(init_dir.name)
 
         for grib_path in sorted(init_dir.iterdir()):
             if not grib_path.is_file():
+                continue
+            # Ignore downloader artifacts such as *.grib2.part.
+            if grib_path.name.endswith(".part"):
+                skipped_partial_files += 1
                 continue
             match = GFS_FILE_RE.match(grib_path.name)
             if not match:
@@ -181,55 +206,141 @@ def _compute_season_lead_stats() -> Tuple[Dict[Tuple[str, int], np.ndarray], Dic
             if not prism_tif.exists():
                 continue
             season = _season_from_date(valid_date)
-
-            gfs_data, gfs_lats, gfs_lons = _read_gfs_apcp(grib_path)
-            gfs_transform = _gfs_transform(gfs_lats, gfs_lons)
-
-            prism_data, prism_transform, prism_crs = _read_prism_ppt(prism_tif)
-            if grid_meta is None:
-                prism_lats, prism_lons = _grid_coords_from_transform(
-                    prism_transform, prism_data.shape[0], prism_data.shape[1]
+            tasks.append(
+                BiasTask(
+                    grib_path=grib_path,
+                    prism_path=prism_tif,
+                    season=season,
+                    lead_days=lead_days,
+                    valid_date=valid_date,
                 )
-                grid_meta = GridMeta(
-                    transform=prism_transform,
-                    crs=prism_crs,
-                    lats=prism_lats,
-                    lons=prism_lons,
-                )
-            else:
-                if (
-                    prism_transform != grid_meta.transform
-                    or prism_crs != grid_meta.crs
-                    or prism_data.shape != (grid_meta.lats.size, grid_meta.lons.size)
-                ):
-                    raise RuntimeError(
-                        f"PRISM grid mismatch for {prism_tif}. "
-                        "Expected consistent PRISM grid across dates."
-                    )
-
-            gfs_on_prism = _reproject_gfs_to_prism(
-                gfs_data,
-                gfs_transform,
-                prism_data.shape,
-                prism_transform,
-                prism_crs,
             )
 
-            diff = gfs_on_prism - prism_data
-            key = (season, lead_days)
+    return tasks, skipped_partial_files
 
-            if key not in sum_diff:
-                sum_diff[key] = np.zeros_like(diff, dtype=np.float32)
-                count[key] = np.zeros_like(diff, dtype=np.int32)
 
-            valid_mask = np.isfinite(diff)
-            sum_diff[key][valid_mask] += diff[valid_mask]
-            count[key][valid_mask] += 1
+def _compute_task_locals(
+    task: BiasTask,
+) -> Tuple[
+    Tuple[str, int],
+    np.ndarray,
+    np.ndarray,
+    Tuple[float, float, float, float, float, float],
+    str,
+    Tuple[int, int],
+]:
+    gfs_data, gfs_lats, gfs_lons = _read_gfs_apcp(task.grib_path)
+    gfs_transform = _gfs_transform(gfs_lats, gfs_lons)
+    prism_data, prism_transform, prism_crs = _read_prism_ppt(task.prism_path)
+
+    gfs_on_prism = _reproject_gfs_to_prism(
+        gfs_data,
+        gfs_transform,
+        prism_data.shape,
+        prism_transform,
+        prism_crs,
+    )
+    diff = gfs_on_prism - prism_data
+    valid_mask = np.isfinite(diff)
+
+    local_sum_diff = np.zeros_like(diff, dtype=np.float32)
+    local_sum_diff[valid_mask] = diff[valid_mask]
+    local_count = valid_mask.astype(np.int32)
+
+    return (
+        (task.season, task.lead_days),
+        local_sum_diff,
+        local_count,
+        _affine_to_tuple(prism_transform),
+        prism_crs,
+        prism_data.shape,
+    )
+
+
+def _merge_task_result(
+    result: Tuple[
+        Tuple[str, int],
+        np.ndarray,
+        np.ndarray,
+        Tuple[float, float, float, float, float, float],
+        str,
+        Tuple[int, int],
+    ],
+    sum_diff: Dict[Tuple[str, int], np.ndarray],
+    count: Dict[Tuple[str, int], np.ndarray],
+    grid_meta: GridMeta | None,
+) -> GridMeta:
+    key, local_sum_diff, local_count, transform_tuple, prism_crs, prism_shape = result
+    prism_transform = rasterio.Affine(*transform_tuple)
+
+    if grid_meta is None:
+        prism_lats, prism_lons = _grid_coords_from_transform(
+            prism_transform, prism_shape[0], prism_shape[1]
+        )
+        grid_meta = GridMeta(
+            transform=prism_transform,
+            crs=prism_crs,
+            lats=prism_lats,
+            lons=prism_lons,
+        )
+    else:
+        if (
+            _affine_to_tuple(grid_meta.transform) != transform_tuple
+            or prism_crs != grid_meta.crs
+            or prism_shape != (grid_meta.lats.size, grid_meta.lons.size)
+        ):
+            raise RuntimeError(
+                "PRISM grid mismatch across dates. "
+                "Expected consistent PRISM grid for all tasks."
+            )
+
+    if key not in sum_diff:
+        sum_diff[key] = np.zeros_like(local_sum_diff, dtype=np.float32)
+        count[key] = np.zeros_like(local_count, dtype=np.int32)
+
+    sum_diff[key] += local_sum_diff
+    count[key] += local_count
+    return grid_meta
+
+
+def _compute_season_lead_stats() -> Tuple[
+    Dict[Tuple[str, int], np.ndarray], Dict[Tuple[str, int], np.ndarray], GridMeta, int
+]:
+    sum_diff: Dict[Tuple[str, int], np.ndarray] = {}
+    count: Dict[Tuple[str, int], np.ndarray] = {}
+    grid_meta: GridMeta | None = None
+    tasks, skipped_partial_files = _build_bias_tasks()
+    if not tasks:
+        raise RuntimeError("No GFS/PRISM overlaps found. Check data paths.")
+
+    max_workers = max(1, (os.cpu_count() or 1) - 1)
+    use_parallel = len(tasks) > 1 and max_workers > 1
+
+    if use_parallel:
+        print(f"Processing {len(tasks)} tasks with {max_workers} worker processes...")
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_task = {executor.submit(_compute_task_locals, task): task for task in tasks}
+            total = len(future_to_task)
+            for completed, future in enumerate(as_completed(future_to_task), start=1):
+                task = future_to_task[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed task for {task.grib_path} (valid date {task.valid_date:%Y-%m-%d})"
+                    ) from exc
+                grid_meta = _merge_task_result(result, sum_diff, count, grid_meta)
+                if completed % 50 == 0 or completed == total:
+                    print(f"Completed {completed}/{total} tasks...")
+    else:
+        for task in tasks:
+            result = _compute_task_locals(task)
+            grid_meta = _merge_task_result(result, sum_diff, count, grid_meta)
 
     if grid_meta is None:
         raise RuntimeError("No GFS/PRISM overlaps found. Check data paths.")
 
-    return sum_diff, count, grid_meta
+    return sum_diff, count, grid_meta, skipped_partial_files
 
 
 def _write_tiles(
@@ -270,8 +381,10 @@ def main() -> None:
         "Computing bias on PRISM grid (higher resolution). "
         "This increases memory usage and runtime."
     )
-    sum_diff, count, grid_meta = _compute_season_lead_stats()
+    sum_diff, count, grid_meta, skipped_partial_files = _compute_season_lead_stats()
     _write_tiles(sum_diff, count, grid_meta)
+    if skipped_partial_files:
+        print(f"Skipped {skipped_partial_files} partial GFS files (*.part).")
     print(f"Wrote tiles to {OUTPUT_DIR.resolve()}")
 
 
