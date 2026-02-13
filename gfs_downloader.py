@@ -145,24 +145,22 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
                 time.sleep(1.25 * attempt)
         return task, f"failed: {last_err}"
 
-    def download_period(
+    def download_year_range(
         self,
-        start_date,
-        end_date,
+        start_year: int,
+        end_year: int,
         *,
         forecast_hours: list[int] = [24, 48, 72, 96, 120, 144, 168],
         variables: list[str] = ["APCP"],
         level: str = "surface",
-        sample_frequency: str = "weekly",
     ):
-        start = self._to_dt(start_date)
-        end = self._to_dt(end_date)
+        start = datetime(int(start_year), 1, 1)
+        end = datetime(int(end_year), 12, 31)
         init_dates: list[datetime] = []
         cur = datetime(start.year, start.month, start.day)
         end0 = datetime(end.year, end.month, end.day)
         while cur <= end0:
-            if self._should_download(cur, sample_frequency):
-                init_dates.append(cur)
+            init_dates.append(cur)
             cur += timedelta(days=1)
 
         tasks: list[DownloadTask] = []
@@ -173,7 +171,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
 
         print("\n" + "=" * 70)
         print("Parallel GFS filtered download (idx + Range)")
-        print(f"Period: {start.date()} to {end.date()} | Sampling: {sample_frequency}")
+        print(f"Period: {start.date()} to {end.date()} | Daily")
         print(f"Cycle: {GFS_CYCLE:02d}z")
         print(f"Forecast hours: {forecast_hours}")
         print(f"Variables: {variables} | Level: {level}")
@@ -211,11 +209,10 @@ if __name__ == "__main__":
         timeout_seconds=120,
         polite_delay_seconds=0.0,
     )
-    downloader.download_period(
-        start_date="2022-01-01",
-        end_date="2024-12-31",
+    downloader.download_year_range(
+        start_year=2022,
+        end_year=2024,
         variables=["APCP"],
         level="surface",
         forecast_hours=[24, 48, 72, 96, 120, 144, 168],
-        sample_frequency="weekly",
     )

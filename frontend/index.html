@@ -44,8 +44,8 @@
   <body>
     <div class="controls">
       <label>
-        Week
-        <select id="weekSelect"></select>
+        Season
+        <select id="seasonSelect"></select>
       </label>
       <label>
         Lead (days)
@@ -71,17 +71,16 @@
         zoom: 3,
       });
 
-      function tilesetId(week, lead) {
-        const padded = String(week).padStart(2, "0");
-        return `week_${padded}_lead_${lead}`;
+      function tilesetId(season, lead) {
+        return `season_${season}_lead_${lead}`;
       }
 
       function setStatus(message) {
         statusEl.textContent = message;
       }
 
-      async function loadTileset(week, lead) {
-        const id = tilesetId(week, lead);
+      async function loadTileset(season, lead) {
+        const id = tilesetId(season, lead);
         const tilejsonUrl = `${BASE_URL}/${id}.json`;
         setStatus(`Loading ${id}...`);
 
@@ -151,27 +150,33 @@
         setStatus(`Showing ${id}`);
       }
 
-      function populateSelect(selectEl, start, end) {
-        for (let i = start; i <= end; i += 1) {
+      function populateSeasons(selectEl) {
+        const seasons = ["winter", "spring", "summer", "fall"];
+        for (const season of seasons) {
           const opt = document.createElement("option");
-          opt.value = String(i);
-          opt.textContent = String(i);
+          opt.value = season;
+          opt.textContent = season;
           selectEl.appendChild(opt);
         }
       }
 
-      const weekSelect = document.getElementById("weekSelect");
+      const seasonSelect = document.getElementById("seasonSelect");
       const leadSelect = document.getElementById("leadSelect");
-      populateSelect(weekSelect, 1, 53);
-      populateSelect(leadSelect, 1, 7);
-      weekSelect.value = "1";
+      populateSeasons(seasonSelect);
+      for (let i = 1; i <= 7; i += 1) {
+        const opt = document.createElement("option");
+        opt.value = String(i);
+        opt.textContent = String(i);
+        leadSelect.appendChild(opt);
+      }
+      seasonSelect.value = "winter";
       leadSelect.value = "1";
 
       function handleChange() {
-        loadTileset(Number(weekSelect.value), Number(leadSelect.value));
+        loadTileset(seasonSelect.value, Number(leadSelect.value));
       }
 
-      weekSelect.addEventListener("change", handleChange);
+      seasonSelect.addEventListener("change", handleChange);
       leadSelect.addEventListener("change", handleChange);
 
       map.on("load", () => {
@@ -182,9 +187,9 @@
 
       map.on("click", async (event) => {
         const { lng, lat } = event.lngLat;
-        const week = Number(weekSelect.value);
+        const season = seasonSelect.value;
         const lead = Number(leadSelect.value);
-        const url = `${API_BASE_URL}/api/bias?week=${week}&lead=${lead}&lat=${lat}&lon=${lng}`;
+        const url = `${API_BASE_URL}/api/bias?season=${season}&lead=${lead}&lat=${lat}&lon=${lng}`;
         let text = "Loading...";
         try {
           const resp = await fetch(url);

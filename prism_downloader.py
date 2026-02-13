@@ -132,13 +132,15 @@ class PRISMDownloaderParallel(BaseDownloader):
             current += timedelta(days=1)
         return dates
 
-    def download_date_range(
+    def download_year_range(
         self,
         variables: list[str],
-        start_date: str | datetime,
-        end_date: str | datetime,
+        start_year: int,
+        end_year: int,
         extract: bool = True,
     ) -> None:
+        start_date = datetime(int(start_year), 1, 1)
+        end_date = datetime(int(end_year), 12, 31)
         dates = self._date_list(start_date, end_date)
         tasks: list[PRISMTask] = []
         for var in variables:
@@ -181,9 +183,9 @@ if __name__ == "__main__":
         polite_delay_seconds=0.0,
         remove_zip_after_extract=True,
     )
-    dl.download_date_range(
+    dl.download_year_range(
         variables=["ppt"],
-        start_date="2022-01-01",
-        end_date="2024-12-31",
+        start_year=2022,
+        end_year=2024,
         extract=True
     )

@@ -9,8 +9,6 @@ from typing import Dict, Tuple
 
 import numpy as np
 
-from bias_query import bias_at_point
-
 try:
     import xarray as xr
 except Exception as exc:  # pragma: no cover - environment dependent
@@ -70,6 +68,17 @@ def _get_prism_tif_path(date: datetime) -> Path:
     date_str = date.strftime("%Y%m%d")
     day_dir = PRISM_DIR / str(date.year) / date_str
     return day_dir / "data.tif"
+
+
+def _season_from_date(date: datetime) -> str:
+    month = date.month
+    if month in (12, 1, 2):
+        return "winter"
+    if month in (3, 4, 5):
+        return "spring"
+    if month in (6, 7, 8):
+        return "summer"
+    return "fall"
 
 
 def _read_gfs_apcp(grib_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -147,14 +156,13 @@ def _reproject_gfs_to_prism(
     return dst
 
 
-def _compute_week_lead_stats() -> Tuple[Dict[Tuple[int, int], np.ndarray], Dict[Tuple[int, int], np.ndarray], GridMeta]:
-    sum_diff: Dict[Tuple[int, int], np.ndarray] = {}
-    count: Dict[Tuple[int, int], np.ndarray] = {}
+def _compute_season_lead_stats() -> Tuple[Dict[Tuple[str, int], np.ndarray], Dict[Tuple[str, int], np.ndarray], GridMeta]:
+    sum_diff: Dict[Tuple[str, int], np.ndarray] = {}
+    count: Dict[Tuple[str, int], np.ndarray] = {}
     grid_meta: GridMeta | None = None
 
     for init_dir in _list_gfs_inits():
         init_date = _parse_init_date(init_dir.name)
-        week = int(init_date.isocalendar().week)
 
         for grib_path in sorted(init_dir.iterdir()):
             if not grib_path.is_file():
@@ -171,6 +179,7 @@ def _compute_week_lead_stats() -> Tuple[Dict[Tuple[int, int], np.ndarray], Dict[
             prism_tif = _get_prism_tif_path(valid_date)
             if not prism_tif.exists():
                 continue
+            season = _season_from_date(valid_date)
 
             gfs_data, gfs_lats, gfs_lons = _read_gfs_apcp(grib_path)
             gfs_transform = _gfs_transform(gfs_lats, gfs_lons)
@@ -206,7 +215,7 @@ def _compute_week_lead_stats() -> Tuple[Dict[Tuple[int, int], np.ndarray], Dict[
             )
 
             diff = gfs_on_prism - prism_data
-            key = (week, lead_days)
+            key = (season, lead_days)
 
             if key not in sum_diff:
                 sum_diff[key] = np.zeros_like(diff, dtype=np.float32)
@@ -223,8 +232,8 @@ def _compute_week_lead_stats() -> Tuple[Dict[Tuple[int, int], np.ndarray], Dict[
 
 
 def _write_tiles(
-    sum_diff: Dict[Tuple[int, int], np.ndarray],
-    count: Dict[Tuple[int, int], np.ndarray],
+    sum_diff: Dict[Tuple[str, int], np.ndarray],
+    count: Dict[Tuple[str, int], np.ndarray],
     grid_meta: GridMeta,
 ) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -238,13 +247,13 @@ def _write_tiles(
         crs=grid_meta.crs,
     )
 
-    for (week, lead), s in sum_diff.items():
-        c = count[(week, lead)]
+    for (season, lead), s in sum_diff.items():
+        c = count[(season, lead)]
         bias_mean = np.full_like(s, np.nan, dtype=np.float32)
         valid_mask = c > 0
         bias_mean[valid_mask] = s[valid_mask] / c[valid_mask]
 
-        out_dir = OUTPUT_DIR / f"week_{week:02d}"
+        out_dir = OUTPUT_DIR / f"season_{season}"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"lead_{lead}.npz"
         np.savez_compressed(
@@ -260,7 +269,7 @@ def main() -> None:
         "Computing bias on PRISM grid (higher resolution). "
         "This increases memory usage and runtime."
     )
-    sum_diff, count, grid_meta = _compute_week_lead_stats()
+    sum_diff, count, grid_meta = _compute_season_lead_stats()
     _write_tiles(sum_diff, count, grid_meta)
     print(f"Wrote tiles to {OUTPUT_DIR.resolve()}")
 
