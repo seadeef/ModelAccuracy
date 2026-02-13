@@ -10,12 +10,11 @@ Set `LEAD_DAYS_MAX = 14` (default) to support leads 1-14 consistently across dow
 
 ## PMTiles viewer (local)
 
-Basemap configuration is in `frontend/index.html`:
+Basemap configuration is served by the backend API (`/api/config`) from environment variables:
 
 - `MAPTILER_API_KEY`
-- `MAPTILER_STYLE_ID`
 
-If `MAPTILER_API_KEY` is empty, the app falls back to a demo MapLibre style.
+If `MAPTILER_API_KEY` is empty, the frontend falls back to a demo MapLibre style.
 
 1. Serve PMTiles as ZXY tiles:
 
@@ -57,6 +56,7 @@ The click-to-query popup uses a small API server:
 
 ```
 pip install fastapi uvicorn
+export MAPTILER_API_KEY="your_public_maptiler_key"
 uvicorn bias_api:app --reload --port 8001
 ```
 
@@ -70,4 +70,17 @@ Frontend lead options are discovered from:
 
 ```
 http://localhost:8001/api/config
+```
+
+ZIP lookup endpoint for frontend map centering:
+
+```
+http://localhost:8001/api/zip?zip=80302
+```
+
+By default, ZIP lookups read `zip_lookup.csv` from the project root.
+Override the file path with:
+
+```
+export ZIP_LOOKUP_CSV=/absolute/path/to/zip_lookup.csv
 ```

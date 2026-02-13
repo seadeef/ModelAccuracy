@@ -79,6 +79,11 @@
         <input id="landmarksOpacity" type="range" min="0" max="1" step="0.05" value="0.65" />
         <span id="landmarksOpacityValue">0.65</span>
       </label>
+      <label>
+        ZIP
+        <input id="zipInput" type="text" placeholder="80302" size="8" />
+      </label>
+      <button id="zipGoButton" type="button">Go</button>
       <div class="status" id="status">Idle</div>
     </div>
     <div id="map"></div>
@@ -88,30 +93,33 @@
     <script>
       const BASE_URL = "http://localhost:8080";
       const API_BASE_URL = "http://localhost:8001";
-      const MAPTILER_API_KEY = "";
-      const MAPTILER_STYLE_ID = "streets-v2";
+      const DEFAULT_MAPTILER_STYLE_ID = "streets-v2";
       const FALLBACK_STYLE_URL = "https://demotiles.maplibre.org/style.json";
-      const MAP_STYLE_URL = MAPTILER_API_KEY
-        ? `https://api.maptiler.com/maps/${MAPTILER_STYLE_ID}/style.json?key=${MAPTILER_API_KEY}`
-        : FALLBACK_STYLE_URL;
       const DETAIL_ZOOM_LIMITS = { low: 9, high: 14 };
       const sourceId = "bias-source";
       const layerId = "bias-layer";
       const statusEl = document.getElementById("status");
+      const appConfig = {
+        leadDaysMin: 1,
+        leadDaysMax: 14,
+        maptilerApiKey: "",
+        maptilerStyleId: DEFAULT_MAPTILER_STYLE_ID,
+      };
       const state = {
         mode: "both",
         detailMode: "low",
         weatherOpacity: 0.85,
         landmarksOpacity: 0.65,
       };
+      let map = null;
       let landmarks = [];
 
-      const map = new maplibregl.Map({
-        container: "map",
-        style: MAP_STYLE_URL,
-        center: [-98.5, 39.8],
-        zoom: 3,
-      });
+      function mapStyleUrlFromConfig() {
+        if (!appConfig.maptilerApiKey) {
+          return FALLBACK_STYLE_URL;
+        }
+        return `https://api.maptiler.com/maps/${appConfig.maptilerStyleId}/style.json?key=${appConfig.maptilerApiKey}`;
+      }
 
       function tilesetId(season, lead) {
         return `season_${season}_lead_${lead}`;
@@ -122,6 +130,9 @@
       }
 
       function cacheLandmarkLayers() {
+        if (!map) {
+          return;
+        }
         const style = map.getStyle();
         if (!style || !style.layers) {
           landmarks = [];
@@ -159,6 +170,9 @@
       }
 
       function setLayerVisibility(layerIdValue, visible) {
+        if (!map) {
+          return;
+        }
         if (!map.getLayer(layerIdValue)) {
           return;
         }
@@ -166,6 +180,9 @@
       }
 
       function setLandmarkOpacity(layerInfo, opacity) {
+        if (!map) {
+          return;
+        }
         if (!map.getLayer(layerInfo.id)) {
           return;
         }
@@ -191,6 +208,9 @@
       }
 
       function applyLayerState() {
+        if (!map) {
+          return;
+        }
         const zoomCap = DETAIL_ZOOM_LIMITS[state.detailMode];
         map.setMaxZoom(zoomCap);
         if (map.getZoom() > zoomCap) {
@@ -213,6 +233,9 @@
       }
 
       function firstSymbolLayerId() {
+        if (!map) {
+          return undefined;
+        }
         for (const landmark of landmarks) {
           if (landmark.type === "symbol" && map.getLayer(landmark.id)) {
             return landmark.id;
@@ -222,6 +245,9 @@
       }
 
       async function loadTileset(season, lead) {
+        if (!map) {
+          return;
+        }
         const id = tilesetId(season, lead);
         const tilejsonUrl = `${BASE_URL}/${id}.json`;
         setStatus(`Loading ${id}...`);
@@ -319,24 +345,32 @@
         }
       }
 
-      async function fetchLeadBounds() {
+      async function fetchAppConfig() {
         try {
           const resp = await fetch(`${API_BASE_URL}/api/config`);
           if (!resp.ok) {
-            return { min: 1, max: 14 };
+            return;
           }
           const data = await resp.json();
-          if (
-            typeof data.lead_days_min === "number" &&
-            typeof data.lead_days_max === "number" &&
-            data.lead_days_min <= data.lead_days_max
-          ) {
-            return { min: data.lead_days_min, max: data.lead_days_max };
+          if (typeof data.lead_days_min === "number") {
+            appConfig.leadDaysMin = data.lead_days_min;
+          }
+          if (typeof data.lead_days_max === "number") {
+            appConfig.leadDaysMax = data.lead_days_max;
+          }
+          if (appConfig.leadDaysMin > appConfig.leadDaysMax) {
+            appConfig.leadDaysMin = 1;
+            appConfig.leadDaysMax = 14;
+          }
+          if (typeof data.maptiler_api_key === "string") {
+            appConfig.maptilerApiKey = data.maptiler_api_key;
+          }
+          if (typeof data.maptiler_style_id === "string" && data.maptiler_style_id.trim()) {
+            appConfig.maptilerStyleId = data.maptiler_style_id.trim();
           }
         } catch (err) {
-          // Fall back to a sensible local default if API config is unavailable.
+          // Keep defaults when API config is unavailable.
         }
-        return { min: 1, max: 14 };
       }
 
       const seasonSelect = document.getElementById("seasonSelect");
@@ -347,6 +381,8 @@
       const landmarksOpacityInput = document.getElementById("landmarksOpacity");
       const weatherOpacityValue = document.getElementById("weatherOpacityValue");
       const landmarksOpacityValue = document.getElementById("landmarksOpacityValue");
+      const zipInput = document.getElementById("zipInput");
+      const zipGoButton = document.getElementById("zipGoButton");
       populateSeasons(seasonSelect);
       seasonSelect.value = "winter";
       modeSelect.value = state.mode;
@@ -357,7 +393,53 @@
       landmarksOpacityValue.textContent = landmarksOpacityInput.value;
 
       function handleChange() {
+        if (!map) {
+          return;
+        }
         loadTileset(seasonSelect.value, Number(leadSelect.value));
+      }
+
+      async function goToZip() {
+        if (!map) {
+          return;
+        }
+        const rawZip = zipInput.value.trim();
+        if (!rawZip) {
+          setStatus("Enter a ZIP code.");
+          return;
+        }
+        setStatus(`Looking up ZIP ${rawZip}...`);
+        const url = `${API_BASE_URL}/api/zip?zip=${encodeURIComponent(rawZip)}`;
+        try {
+          const resp = await fetch(url);
+          if (!resp.ok) {
+            setStatus(`ZIP lookup failed (${resp.status})`);
+            return;
+          }
+          const data = await resp.json();
+          if (!data.found) {
+            setStatus(`ZIP not found: ${rawZip}`);
+            return;
+          }
+          if (Array.isArray(data.bounds) && data.bounds.length === 4) {
+            map.fitBounds(
+              [
+                [data.bounds[0], data.bounds[1]],
+                [data.bounds[2], data.bounds[3]],
+              ],
+              { padding: 24, duration: 700 }
+            );
+          } else {
+            map.flyTo({
+              center: [data.lon, data.lat],
+              zoom: 10,
+              duration: 700,
+            });
+          }
+          setStatus(`Centered on ZIP ${data.zip}`);
+        } catch (err) {
+          setStatus("ZIP lookup error");
+        }
       }
 
       seasonSelect.addEventListener("change", handleChange);
@@ -380,43 +462,66 @@
         landmarksOpacityValue.textContent = landmarksOpacityInput.value;
         applyLayerState();
       });
-
-      map.on("load", async () => {
-        cacheLandmarkLayers();
-        if (!MAPTILER_API_KEY) {
-          setStatus("Using fallback basemap; set MAPTILER_API_KEY to enable MapTiler.");
+      zipGoButton.addEventListener("click", () => {
+        goToZip();
+      });
+      zipInput.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          goToZip();
         }
-        const leadBounds = await fetchLeadBounds();
-        populateLeads(leadSelect, leadBounds.min, leadBounds.max);
-        leadSelect.value = String(leadBounds.min);
-        handleChange();
       });
 
       const popup = new maplibregl.Popup({ closeButton: true });
 
-      map.on("click", async (event) => {
-        const { lng, lat } = event.lngLat;
-        const season = seasonSelect.value;
-        const lead = Number(leadSelect.value);
-        const url = `${API_BASE_URL}/api/bias?season=${season}&lead=${lead}&lat=${lat}&lon=${lng}`;
-        let text = "Loading...";
-        try {
-          const resp = await fetch(url);
-          if (!resp.ok) {
-            text = `Query failed (${resp.status})`;
-          } else {
-            const data = await resp.json();
-            if (data.no_data) {
-              text = "No data";
-            } else {
-              text = `${data.value.toFixed(2)} mm`;
-            }
+      function bindMapEvents() {
+        map.on("load", async () => {
+          cacheLandmarkLayers();
+          if (!appConfig.maptilerApiKey) {
+            setStatus("Using fallback basemap; set MAPTILER_API_KEY in backend env to enable MapTiler.");
           }
-        } catch (err) {
-          text = "Query error";
-        }
-        popup.setLngLat([lng, lat]).setHTML(text).addTo(map);
-      });
+          populateLeads(leadSelect, appConfig.leadDaysMin, appConfig.leadDaysMax);
+          leadSelect.value = String(appConfig.leadDaysMin);
+          handleChange();
+        });
+
+        map.on("click", async (event) => {
+          const { lng, lat } = event.lngLat;
+          const season = seasonSelect.value;
+          const lead = Number(leadSelect.value);
+          const url = `${API_BASE_URL}/api/bias?season=${season}&lead=${lead}&lat=${lat}&lon=${lng}`;
+          let text = "Loading...";
+          try {
+            const resp = await fetch(url);
+            if (!resp.ok) {
+              text = `Query failed (${resp.status})`;
+            } else {
+              const data = await resp.json();
+              if (data.no_data) {
+                text = "No data";
+              } else {
+                text = `${data.value.toFixed(2)} mm`;
+              }
+            }
+          } catch (err) {
+            text = "Query error";
+          }
+          popup.setLngLat([lng, lat]).setHTML(text).addTo(map);
+        });
+      }
+
+      async function initMap() {
+        await fetchAppConfig();
+        map = new maplibregl.Map({
+          container: "map",
+          style: mapStyleUrlFromConfig(),
+          center: [-98.5, 39.8],
+          zoom: 3,
+        });
+        bindMapEvents();
+      }
+
+      initMap();
     </script>
   </body>
 </html>
