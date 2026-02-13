@@ -160,17 +160,40 @@
         }
       }
 
+      function populateLeads(selectEl, minLead, maxLead) {
+        selectEl.innerHTML = "";
+        for (let i = minLead; i <= maxLead; i += 1) {
+          const opt = document.createElement("option");
+          opt.value = String(i);
+          opt.textContent = String(i);
+          selectEl.appendChild(opt);
+        }
+      }
+
+      async function fetchLeadBounds() {
+        try {
+          const resp = await fetch(`${API_BASE_URL}/api/config`);
+          if (!resp.ok) {
+            return { min: 1, max: 14 };
+          }
+          const data = await resp.json();
+          if (
+            typeof data.lead_days_min === "number" &&
+            typeof data.lead_days_max === "number" &&
+            data.lead_days_min <= data.lead_days_max
+          ) {
+            return { min: data.lead_days_min, max: data.lead_days_max };
+          }
+        } catch (err) {
+          // Fall back to a sensible local default if API config is unavailable.
+        }
+        return { min: 1, max: 14 };
+      }
+
       const seasonSelect = document.getElementById("seasonSelect");
       const leadSelect = document.getElementById("leadSelect");
       populateSeasons(seasonSelect);
-      for (let i = 1; i <= 7; i += 1) {
-        const opt = document.createElement("option");
-        opt.value = String(i);
-        opt.textContent = String(i);
-        leadSelect.appendChild(opt);
-      }
       seasonSelect.value = "winter";
-      leadSelect.value = "1";
 
       function handleChange() {
         loadTileset(seasonSelect.value, Number(leadSelect.value));
@@ -179,7 +202,10 @@
       seasonSelect.addEventListener("change", handleChange);
       leadSelect.addEventListener("change", handleChange);
 
-      map.on("load", () => {
+      map.on("load", async () => {
+        const leadBounds = await fetchLeadBounds();
+        populateLeads(leadSelect, leadBounds.min, leadBounds.max);
+        leadSelect.value = String(leadBounds.min);
         handleChange();
       });
 

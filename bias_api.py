@@ -8,6 +8,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from bias_query import bias_at_point, DEFAULT_STATS_DIR
+from lead_config import LEAD_DAYS_MAX, LEAD_DAYS_MIN
 
 app = FastAPI(title="Bias Query API")
 
@@ -23,7 +24,7 @@ app.add_middleware(
 @app.get("/api/bias")
 def get_bias(
     season: str = Query(..., pattern="^(winter|spring|summer|fall)$"),
-    lead: int = Query(..., ge=1, le=7),
+    lead: int = Query(..., ge=LEAD_DAYS_MIN, le=LEAD_DAYS_MAX),
     lat: float = Query(..., ge=-90.0, le=90.0),
     lon: float = Query(..., ge=-180.0, le=180.0),
     stats_dir: str | None = None,
@@ -33,3 +34,8 @@ def get_bias(
     if math.isnan(value):
         return {"value": None, "units": "mm", "no_data": True}
     return {"value": value, "units": "mm", "no_data": False}
+
+
+@app.get("/api/config")
+def get_config():
+    return {"lead_days_min": LEAD_DAYS_MIN, "lead_days_max": LEAD_DAYS_MAX}

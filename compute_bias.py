@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import numpy as np
+from lead_config import LEAD_DAYS_MAX, LEAD_DAYS_MIN
 
 try:
     import xarray as xr
@@ -172,7 +173,7 @@ def _compute_season_lead_stats() -> Tuple[Dict[Tuple[str, int], np.ndarray], Dic
                 continue
             fhour = int(match.group("fhour"))
             lead_days = fhour // 24
-            if lead_days < 1 or lead_days > 7:
+            if lead_days < LEAD_DAYS_MIN or lead_days > LEAD_DAYS_MAX:
                 continue
 
             valid_date = init_date + timedelta(days=lead_days)

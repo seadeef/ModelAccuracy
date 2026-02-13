@@ -7,9 +7,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta
 from downloaders.base import BaseDownloader
+from lead_config import FORECAST_HOURS
 
 # Fixed 12z cycle for GFS; used in remote paths and local dir names.
 GFS_CYCLE = 12
+WEEKDAY_NAMES = [
+    "MONDAY",
+    "TUESDAY",
+    "WEDNESDAY",
+    "THURSDAY",
+    "FRIDAY",
+    "SATURDAY",
+    "SUNDAY",
+]
 
 
 @dataclass(frozen=True)
@@ -53,14 +63,15 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         return d
 
     @staticmethod
-    def _should_download(date: datetime, sample_frequency: str) -> bool:
-        if sample_frequency == "daily":
-            return True
-        if sample_frequency == "weekly":
-            return date.weekday() == 0  # Monday
-        if sample_frequency == "twice_weekly":
-            return date.weekday() in (0, 3)  # Monday/Thursday
-        raise ValueError("sample_frequency must be 'daily', 'weekly', or 'twice_weekly'")
+    def _normalize_weekdays(download_weekdays: list[int] | None) -> set[int] | None:
+        if not download_weekdays:
+            return None
+        normalized: set[int] = set()
+        for day in download_weekdays:
+            if day < 0 or day > 6:
+                raise ValueError(f"Weekday integers must be 0..6, got {day}")
+            normalized.add(day)
+        return normalized
 
     def _paths(self, init_date: datetime, fhour: int) -> tuple[str, str, str]:
         date_str = init_date.strftime("%Y%m%d")
@@ -150,18 +161,23 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         start_year: int,
         end_year: int,
         *,
-        forecast_hours: list[int] = [24, 48, 72, 96, 120, 144, 168],
+        forecast_hours: list[int] = FORECAST_HOURS,
         variables: list[str] = ["APCP"],
         level: str = "surface",
+        download_weekdays: list[int] | None = None,
     ):
         start = datetime(int(start_year), 1, 1)
         end = datetime(int(end_year), 12, 31)
+        weekdays = self._normalize_weekdays(download_weekdays)
         init_dates: list[datetime] = []
         cur = datetime(start.year, start.month, start.day)
         end0 = datetime(end.year, end.month, end.day)
         while cur <= end0:
-            init_dates.append(cur)
+            if weekdays is None or cur.weekday() in weekdays:
+                init_dates.append(cur)
             cur += timedelta(days=1)
+        if not init_dates:
+            raise ValueError("No init dates selected. Check start/end years and download_weekdays.")
 
         tasks: list[DownloadTask] = []
         for d in init_dates:
@@ -171,7 +187,12 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
 
         print("\n" + "=" * 70)
         print("Parallel GFS filtered download (idx + Range)")
-        print(f"Period: {start.date()} to {end.date()} | Daily")
+        if weekdays is None:
+            cadence = "Daily"
+        else:
+            selected = ", ".join(WEEKDAY_NAMES[idx] for idx in sorted(weekdays))
+            cadence = f"Selected weekdays: {selected}"
+        print(f"Period: {start.date()} to {end.date()} | {cadence}")
         print(f"Cycle: {GFS_CYCLE:02d}z")
         print(f"Forecast hours: {forecast_hours}")
         print(f"Variables: {variables} | Level: {level}")
@@ -214,5 +235,6 @@ if __name__ == "__main__":
         end_year=2024,
         variables=["APCP"],
         level="surface",
-        forecast_hours=[24, 48, 72, 96, 120, 144, 168],
+        forecast_hours=FORECAST_HOURS,
+        download_weekdays=[0, 3],
     )

@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
+from lead_config import LEAD_DAYS_MAX, LEAD_DAYS_MIN
 
 try:
     import rasterio
@@ -43,7 +44,11 @@ def parse_args() -> argparse.Namespace:
         choices=["winter", "spring", "summer", "fall"],
         help="Optional season filter.",
     )
-    parser.add_argument("--lead", type=int, help="Optional lead filter (1-7).")
+    parser.add_argument(
+        "--lead",
+        type=int,
+        help=f"Optional lead filter ({LEAD_DAYS_MIN}-{LEAD_DAYS_MAX}).",
+    )
     parser.add_argument(
         "--min-zoom",
         type=int,
@@ -342,6 +347,10 @@ def write_metadata(
 
 def main() -> None:
     args = parse_args()
+    if args.lead is not None and not (LEAD_DAYS_MIN <= args.lead <= LEAD_DAYS_MAX):
+        raise ValueError(
+            f"--lead must be between {LEAD_DAYS_MIN} and {LEAD_DAYS_MAX}, got {args.lead}."
+        )
     stats_dir = args.stats_dir
     meta = load_metadata(stats_dir)
     max_zoom = args.max_zoom
