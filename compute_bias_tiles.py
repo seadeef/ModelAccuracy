@@ -36,13 +36,7 @@ def parse_args() -> argparse.Namespace:
         "--stats-dir",
         type=Path,
         default=DEFAULT_STATS_DIR,
-        help="Directory containing season_<name>/lead_Y.npz and metadata.npz",
-    )
-    parser.add_argument(
-        "--season",
-        type=str,
-        choices=["winter", "spring", "summer", "fall"],
-        help="Optional season filter.",
+        help="Directory containing lead_Y.npz and metadata.npz",
     )
     parser.add_argument(
         "--lead",
@@ -99,18 +93,12 @@ def load_metadata(stats_dir: Path) -> dict:
     }
 
 
-def iter_layers(stats_dir: Path, season: str | None, lead: int | None):
-    for season_dir in sorted(p for p in stats_dir.iterdir() if p.is_dir()):
-        if not season_dir.name.startswith("season_"):
+def iter_layers(stats_dir: Path, lead: int | None):
+    for lead_path in sorted(stats_dir.glob("lead_*.npz")):
+        lead_num = int(lead_path.stem.split("_")[1])
+        if lead is not None and lead_num != lead:
             continue
-        season_name = season_dir.name.replace("season_", "", 1)
-        if season is not None and season_name != season:
-            continue
-        for lead_path in sorted(season_dir.glob("lead_*.npz")):
-            lead_num = int(lead_path.stem.split("_")[1])
-            if lead is not None and lead_num != lead:
-                continue
-            yield season_name, lead_num, lead_path
+        yield lead_num, lead_path
 
 
 def symmetric_range(values: np.ndarray, percentile: float) -> tuple[float, float]:
@@ -312,7 +300,6 @@ def edit_pmtiles_header(
 
 def write_metadata(
     out_dir: Path,
-    season: str,
     lead: int,
     vmin: float,
     vmax: float,
@@ -322,7 +309,6 @@ def write_metadata(
     max_zoom: int,
 ) -> None:
     metadata = {
-        "season": season,
         "lead_days": lead,
         "units": "mm",
         "nodata": None,
@@ -341,7 +327,7 @@ def write_metadata(
         "zoom": {"min": min_zoom, "max": max_zoom},
     }
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"season_{season}_lead_{lead}.json"
+    out_path = out_dir / f"lead_{lead}.json"
     out_path.write_text(json.dumps(metadata, indent=2))
 
 
@@ -359,7 +345,7 @@ def main() -> None:
     metadata_root = args.output_dir / "metadata"
     tmp_root = args.output_dir / "tmp"
 
-    for season, lead, npz_path in iter_layers(stats_dir, args.season, args.lead):
+    for lead, npz_path in iter_layers(stats_dir, args.lead):
         layer = np.load(npz_path)
         bias_mean = layer["bias_mean"]
         vmin, vmax = symmetric_range(bias_mean, args.percentile)
@@ -372,15 +358,14 @@ def main() -> None:
             rgba, meta["transform"], meta["lats"]
         )
 
-        rgba_path = tmp_root / f"season_{season}_lead_{lead}_4326_rgba.tif"
-        merc_path = tmp_root / f"season_{season}_lead_{lead}_3857_rgba.tif"
-        pmtiles_path = pmtiles_root / f"season_{season}_lead_{lead}.pmtiles"
+        rgba_path = tmp_root / f"lead_{lead}_4326_rgba.tif"
+        merc_path = tmp_root / f"lead_{lead}_3857_rgba.tif"
+        pmtiles_path = pmtiles_root / f"lead_{lead}.pmtiles"
         write_rgba_raster(rgba_path, rgba, write_transform, meta["crs"])
         reproject_to_mercator(rgba_path, merc_path)
 
         write_metadata(
             metadata_root,
-            season,
             lead,
             vmin,
             vmax,
@@ -397,7 +382,7 @@ def main() -> None:
             max_zoom,
             args.jobs,
         )
-        header_tmp = tmp_root / f"header_season_{season}_lead_{lead}.json"
+        header_tmp = tmp_root / f"header_lead_{lead}.json"
         edit_pmtiles_header(pmtiles_path, header_tmp, US_HEADER_CENTER, US_HEADER_BOUNDS)
 
     if tmp_root.exists():

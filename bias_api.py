@@ -65,14 +65,13 @@ def _load_zip_lookup(path_str: str) -> dict[str, dict[str, float]]:
 
 @app.get("/api/bias")
 def get_bias(
-    season: str = Query(..., pattern="^(winter|spring|summer|fall)$"),
     lead: int = Query(..., ge=LEAD_DAYS_MIN, le=LEAD_DAYS_MAX),
     lat: float = Query(..., ge=-90.0, le=90.0),
     lon: float = Query(..., ge=-180.0, le=180.0),
     stats_dir: str | None = None,
 ):
     stats_path = Path(stats_dir) if stats_dir else DEFAULT_STATS_DIR
-    value = bias_at_point(lat, lon, season, lead, stats_dir=stats_path)
+    value = bias_at_point(lat, lon, lead, stats_dir=stats_path)
     if math.isnan(value):
         return {"value": None, "units": "mm", "no_data": True}
     return {"value": value, "units": "mm", "no_data": False}

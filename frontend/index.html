@@ -47,10 +47,6 @@
   <body>
     <div class="controls">
       <label>
-        Season
-        <select id="seasonSelect"></select>
-      </label>
-      <label>
         Lead (days)
         <select id="leadSelect"></select>
       </label>
@@ -121,8 +117,8 @@
         return `https://api.maptiler.com/maps/${appConfig.maptilerStyleId}/style.json?key=${appConfig.maptilerApiKey}`;
       }
 
-      function tilesetId(season, lead) {
-        return `season_${season}_lead_${lead}`;
+      function tilesetId(lead) {
+        return `lead_${lead}`;
       }
 
       function setStatus(message) {
@@ -244,11 +240,11 @@
         return undefined;
       }
 
-      async function loadTileset(season, lead) {
+      async function loadTileset(lead) {
         if (!map) {
           return;
         }
-        const id = tilesetId(season, lead);
+        const id = tilesetId(lead);
         const tilejsonUrl = `${BASE_URL}/${id}.json`;
         setStatus(`Loading ${id}...`);
 
@@ -325,16 +321,6 @@
         setStatus(`Showing ${id}`);
       }
 
-      function populateSeasons(selectEl) {
-        const seasons = ["winter", "spring", "summer", "fall"];
-        for (const season of seasons) {
-          const opt = document.createElement("option");
-          opt.value = season;
-          opt.textContent = season;
-          selectEl.appendChild(opt);
-        }
-      }
-
       function populateLeads(selectEl, minLead, maxLead) {
         selectEl.innerHTML = "";
         for (let i = minLead; i <= maxLead; i += 1) {
@@ -373,7 +359,6 @@
         }
       }
 
-      const seasonSelect = document.getElementById("seasonSelect");
       const leadSelect = document.getElementById("leadSelect");
       const modeSelect = document.getElementById("modeSelect");
       const detailSelect = document.getElementById("detailSelect");
@@ -383,8 +368,6 @@
       const landmarksOpacityValue = document.getElementById("landmarksOpacityValue");
       const zipInput = document.getElementById("zipInput");
       const zipGoButton = document.getElementById("zipGoButton");
-      populateSeasons(seasonSelect);
-      seasonSelect.value = "winter";
       modeSelect.value = state.mode;
       detailSelect.value = state.detailMode;
       weatherOpacityInput.value = String(state.weatherOpacity);
@@ -396,7 +379,7 @@
         if (!map) {
           return;
         }
-        loadTileset(seasonSelect.value, Number(leadSelect.value));
+        loadTileset(Number(leadSelect.value));
       }
 
       async function goToZip() {
@@ -442,7 +425,6 @@
         }
       }
 
-      seasonSelect.addEventListener("change", handleChange);
       leadSelect.addEventListener("change", handleChange);
       modeSelect.addEventListener("change", () => {
         state.mode = modeSelect.value;
@@ -487,9 +469,8 @@
 
         map.on("click", async (event) => {
           const { lng, lat } = event.lngLat;
-          const season = seasonSelect.value;
           const lead = Number(leadSelect.value);
-          const url = `${API_BASE_URL}/api/bias?season=${season}&lead=${lead}&lat=${lat}&lon=${lng}`;
+          const url = `${API_BASE_URL}/api/bias?lead=${lead}&lat=${lat}&lon=${lng}`;
           let text = "Loading...";
           try {
             const resp = await fetch(url);

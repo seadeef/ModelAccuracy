@@ -51,7 +51,6 @@ class GridMeta:
 class BiasTask:
     grib_path: Path
     prism_path: Path
-    season: str
     lead_days: int
     valid_date: datetime
 
@@ -77,17 +76,6 @@ def _get_prism_tif_path(date: datetime) -> Path:
     date_str = date.strftime("%Y%m%d")
     day_dir = PRISM_DIR / str(date.year) / date_str
     return day_dir / "data.tif"
-
-
-def _season_from_date(date: datetime) -> str:
-    month = date.month
-    if month in (12, 1, 2):
-        return "winter"
-    if month in (3, 4, 5):
-        return "spring"
-    if month in (6, 7, 8):
-        return "summer"
-    return "fall"
 
 
 def _read_gfs_apcp(grib_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -202,12 +190,10 @@ def _build_bias_tasks() -> Tuple[list[BiasTask], int]:
             prism_tif = _get_prism_tif_path(valid_date)
             if not prism_tif.exists():
                 continue
-            season = _season_from_date(valid_date)
             tasks.append(
                 BiasTask(
                     grib_path=grib_path,
                     prism_path=prism_tif,
-                    season=season,
                     lead_days=lead_days,
                     valid_date=valid_date,
                 )
@@ -219,7 +205,7 @@ def _build_bias_tasks() -> Tuple[list[BiasTask], int]:
 def _compute_task_locals(
     task: BiasTask,
 ) -> Tuple[
-    Tuple[str, int],
+    int,
     np.ndarray,
     np.ndarray,
     Tuple[float, float, float, float, float, float],
@@ -245,7 +231,7 @@ def _compute_task_locals(
     local_count = valid_mask.astype(np.int32)
 
     return (
-        (task.season, task.lead_days),
+        task.lead_days,
         local_sum_diff,
         local_count,
         _affine_to_tuple(prism_transform),
@@ -256,15 +242,15 @@ def _compute_task_locals(
 
 def _merge_task_result(
     result: Tuple[
-        Tuple[str, int],
+        int,
         np.ndarray,
         np.ndarray,
         Tuple[float, float, float, float, float, float],
         str,
         Tuple[int, int],
     ],
-    sum_diff: Dict[Tuple[str, int], np.ndarray],
-    count: Dict[Tuple[str, int], np.ndarray],
+    sum_diff: Dict[int, np.ndarray],
+    count: Dict[int, np.ndarray],
     grid_meta: GridMeta | None,
 ) -> GridMeta:
     key, local_sum_diff, local_count, transform_tuple, prism_crs, prism_shape = result
@@ -300,11 +286,11 @@ def _merge_task_result(
     return grid_meta
 
 
-def _compute_season_lead_stats() -> Tuple[
-    Dict[Tuple[str, int], np.ndarray], Dict[Tuple[str, int], np.ndarray], GridMeta, int
+def _compute_lead_stats() -> Tuple[
+    Dict[int, np.ndarray], Dict[int, np.ndarray], GridMeta, int
 ]:
-    sum_diff: Dict[Tuple[str, int], np.ndarray] = {}
-    count: Dict[Tuple[str, int], np.ndarray] = {}
+    sum_diff: Dict[int, np.ndarray] = {}
+    count: Dict[int, np.ndarray] = {}
     grid_meta: GridMeta | None = None
     tasks, skipped_partial_files = _build_bias_tasks()
     if not tasks:
@@ -341,8 +327,8 @@ def _compute_season_lead_stats() -> Tuple[
 
 
 def _write_tiles(
-    sum_diff: Dict[Tuple[str, int], np.ndarray],
-    count: Dict[Tuple[str, int], np.ndarray],
+    sum_diff: Dict[int, np.ndarray],
+    count: Dict[int, np.ndarray],
     grid_meta: GridMeta,
 ) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -356,15 +342,13 @@ def _write_tiles(
         crs=grid_meta.crs,
     )
 
-    for (season, lead), s in sum_diff.items():
-        c = count[(season, lead)]
+    for lead, s in sum_diff.items():
+        c = count[lead]
         bias_mean = np.full_like(s, np.nan, dtype=np.float32)
         valid_mask = c > 0
         bias_mean[valid_mask] = s[valid_mask] / c[valid_mask]
 
-        out_dir = OUTPUT_DIR / f"season_{season}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"lead_{lead}.npz"
+        out_path = OUTPUT_DIR / f"lead_{lead}.npz"
         np.savez_compressed(
             out_path,
             bias_mean=bias_mean,
@@ -378,7 +362,7 @@ def main() -> None:
         "Computing bias on PRISM grid (higher resolution). "
         "This increases memory usage and runtime."
     )
-    sum_diff, count, grid_meta, skipped_partial_files = _compute_season_lead_stats()
+    sum_diff, count, grid_meta, skipped_partial_files = _compute_lead_stats()
     _write_tiles(sum_diff, count, grid_meta)
     if skipped_partial_files:
         print(f"Skipped {skipped_partial_files} partial GFS files (*.part).")
