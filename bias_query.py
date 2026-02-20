@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-DEFAULT_STATS_DIR = Path("stats") / "bias" / "ppt"
+DEFAULT_STATS_DIR = Path("stats") / "bias"
 
 
 @lru_cache(maxsize=1)

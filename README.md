@@ -60,10 +60,10 @@ export MAPTILER_API_KEY="your_public_maptiler_key"
 uvicorn bias_api:app --reload --port 8001
 ```
 
-It reads bias stats from `stats/bias/ppt`. You can override with:
+It reads bias stats from `stats/bias`. You can override with:
 
 ```
-http://localhost:8001/api/bias?season=winter&lead=14&lat=40.0&lon=-100.0&stats_dir=/path/to/stats/bias/ppt
+http://localhost:8001/api/bias?season=winter&lead=14&lat=40.0&lon=-100.0&stats_dir=/path/to/stats/bias
 ```
 
 Frontend lead options are discovered from:

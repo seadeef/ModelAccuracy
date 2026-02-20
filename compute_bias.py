@@ -31,13 +31,10 @@ except Exception as exc:  # pragma: no cover - environment dependent
 
 
 GFS_MODEL = "gfs"
-GFS_VAR = "APCP"
-PRISM_VAR = "ppt"
-STATS_VAR = PRISM_VAR
 
-GFS_DIR = Path("model_data") / GFS_MODEL / GFS_VAR
-PRISM_DIR = Path("prism_data") / PRISM_VAR
-OUTPUT_DIR = Path("stats") / "bias" / STATS_VAR
+GFS_DIR = Path("model_data") / GFS_MODEL
+PRISM_DIR = Path("prism_data")
+OUTPUT_DIR = Path("stats") / "bias"
 
 GFS_FILE_RE = re.compile(r"f(?P<fhour>\d{3})_(?P<level>[^.]+)\.grib2$")
 

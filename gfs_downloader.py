@@ -11,22 +11,13 @@ from lead_config import FORECAST_HOURS
 
 # Fixed 12z cycle for GFS; used in remote paths and local dir names.
 GFS_CYCLE = 12
-WEEKDAY_NAMES = [
-    "MONDAY",
-    "TUESDAY",
-    "WEDNESDAY",
-    "THURSDAY",
-    "FRIDAY",
-    "SATURDAY",
-    "SUNDAY",
-]
+GFS_VARIABLE = "APCP"
 
 
 @dataclass(frozen=True)
 class DownloadTask:
     init_date: datetime
     fhour: int
-    variable: str
     level: str
 
 
@@ -62,17 +53,6 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             return datetime.strptime(d, "%Y-%m-%d")
         return d
 
-    @staticmethod
-    def _normalize_weekdays(download_weekdays: list[int] | None) -> set[int] | None:
-        if not download_weekdays:
-            return None
-        normalized: set[int] = set()
-        for day in download_weekdays:
-            if day < 0 or day > 6:
-                raise ValueError(f"Weekday integers must be 0..6, got {day}")
-            normalized.add(day)
-        return normalized
-
     def _paths(self, init_date: datetime, fhour: int) -> tuple[str, str, str]:
         date_str = init_date.strftime("%Y%m%d")
         cycle_str = f"{GFS_CYCLE:02d}"
@@ -82,15 +62,15 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         idx_path = f"gfs.{date_str}/{cycle_str}/atmos/{idx_filename}"
         return grib_filename, grib_path, idx_path
 
-    def _output_file(self, init_date: datetime, fhour: int, variable: str, level: str) -> Path:
+    def _output_file(self, init_date: datetime, fhour: int, level: str) -> Path:
         date_str = init_date.strftime("%Y%m%d")
         cycle_str = f"{GFS_CYCLE:02d}"
         safe_level = level.replace(" ", "_")
-        out_dir = self.output_dir / str(variable) / str(init_date.year) / f"{date_str}_{cycle_str}z"
+        out_dir = self.output_dir / str(init_date.year) / f"{date_str}_{cycle_str}z"
         out_dir.mkdir(parents=True, exist_ok=True)
         return out_dir / f"f{fhour:03d}_{safe_level}.grib2"
 
-    def _find_byte_range(self, idx_text: str, variable: str, level: str):
+    def _find_byte_range(self, idx_text: str, level: str):
         lines = idx_text.strip().split("\n")
         start_byte = None
         end_byte = None
@@ -100,7 +80,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
                 continue
             var_code = parts[3].strip()
             lvl_desc = parts[4].strip()
-            if var_code == variable and lvl_desc == level:
+            if var_code == GFS_VARIABLE and lvl_desc == level:
                 start_byte = int(parts[1])
                 if i + 1 < len(lines):
                     next_parts = lines[i + 1].split(":")
@@ -109,13 +89,12 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         return start_byte, end_byte
 
     def _download_task(self, task: DownloadTask) -> tuple[DownloadTask, str]:
-        init_date, fhour, variable, level = (
+        init_date, fhour, level = (
             task.init_date,
             task.fhour,
-            task.variable,
             task.level,
         )
-        out_file = self._output_file(init_date, fhour, variable, level)
+        out_file = self._output_file(init_date, fhour, level)
         if out_file.exists():
             return task, "exists"
 
@@ -134,7 +113,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
                 if idx_resp.status_code == 404:
                     return task, "not_found_idx"
                 idx_resp.raise_for_status()
-                start_byte, end_byte = self._find_byte_range(idx_resp.text, variable, level)
+                start_byte, end_byte = self._find_byte_range(idx_resp.text, level)
                 if start_byte is None:
                     return task, "not_found_var"
                 headers = {"Range": f"bytes={start_byte}-{end_byte}"} if end_byte is not None else {"Range": f"bytes={start_byte}-"}
@@ -162,40 +141,30 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         end_year: int,
         *,
         forecast_hours: list[int] = FORECAST_HOURS,
-        variables: list[str] = ["APCP"],
         level: str = "surface",
-        download_weekdays: list[int] | None = None,
     ):
         start = datetime(int(start_year), 1, 1)
         end = datetime(int(end_year), 12, 31)
-        weekdays = self._normalize_weekdays(download_weekdays)
         init_dates: list[datetime] = []
         cur = datetime(start.year, start.month, start.day)
         end0 = datetime(end.year, end.month, end.day)
         while cur <= end0:
-            if weekdays is None or cur.weekday() in weekdays:
-                init_dates.append(cur)
+            init_dates.append(cur)
             cur += timedelta(days=1)
         if not init_dates:
-            raise ValueError("No init dates selected. Check start/end years and download_weekdays.")
+            raise ValueError("No init dates selected. Check start/end years.")
 
         tasks: list[DownloadTask] = []
         for d in init_dates:
             for fh in forecast_hours:
-                for var in variables:
-                    tasks.append(DownloadTask(d, int(fh), str(var), str(level)))
+                tasks.append(DownloadTask(d, int(fh), str(level)))
 
         print("\n" + "=" * 70)
         print("Parallel GFS filtered download (idx + Range)")
-        if weekdays is None:
-            cadence = "Daily"
-        else:
-            selected = ", ".join(WEEKDAY_NAMES[idx] for idx in sorted(weekdays))
-            cadence = f"Selected weekdays: {selected}"
-        print(f"Period: {start.date()} to {end.date()} | {cadence}")
+        print(f"Period: {start.date()} to {end.date()} | Daily")
         print(f"Cycle: {GFS_CYCLE:02d}z")
         print(f"Forecast hours: {forecast_hours}")
-        print(f"Variables: {variables} | Level: {level}")
+        print(f"Variable: {GFS_VARIABLE} | Level: {level}")
         print(f"Workers: {self.max_workers} | Retries: {self.max_retries}")
         print(f"Output: {self.output_dir.resolve()}")
         print("=" * 70)
@@ -212,9 +181,9 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             if status == "not_found_idx" and len(examples) < 5:
                 examples.append(f"Missing idx: {task.init_date:%Y-%m-%d} {GFS_CYCLE:02d}z f{task.fhour:03d}")
             elif status == "not_found_var" and len(examples) < 5:
-                examples.append(f"Var not found: {task.variable} @ {task.level} in {task.init_date:%Y-%m-%d} {GFS_CYCLE:02d}z f{task.fhour:03d}")
+                examples.append(f"Var not found: {GFS_VARIABLE} @ {task.level} in {task.init_date:%Y-%m-%d} {GFS_CYCLE:02d}z f{task.fhour:03d}")
             elif status.startswith("failed") and len(examples) < 5:
-                examples.append(f"Failed: {task.init_date:%Y-%m-%d} {GFS_CYCLE:02d}z f{task.fhour:03d} ({task.variable}@{task.level}) -> {status}")
+                examples.append(f"Failed: {task.init_date:%Y-%m-%d} {GFS_CYCLE:02d}z f{task.fhour:03d} ({GFS_VARIABLE}@{task.level}) -> {status}")
         if examples:
             print("Examples:")
             for e in examples:
@@ -233,8 +202,6 @@ if __name__ == "__main__":
     downloader.download_year_range(
         start_year=2022,
         end_year=2024,
-        variables=["APCP"],
         level="surface",
         forecast_hours=FORECAST_HOURS,
-        download_weekdays=[0, 3],
     )

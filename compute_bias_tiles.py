@@ -20,7 +20,7 @@ except Exception as exc:  # pragma: no cover - environment dependent
         "rasterio is required. Install with: pip install rasterio"
     ) from exc
 
-DEFAULT_STATS_DIR = Path("stats") / "bias" / "ppt"
+DEFAULT_STATS_DIR = Path("stats") / "bias"
 # Web Mercator (EPSG:3857) is only valid for |lat| <= this (degrees)
 WEB_MERCATOR_MAX_LAT = 85.05112878
 # Default PMTiles header: center and bounds of continental US (for pmtiles edit)
