@@ -132,21 +132,21 @@ def _grid_coords_from_transform(
     return np.array(ys, dtype=np.float32), np.array(xs, dtype=np.float32)
 
 
-def _reproject_gfs_to_prism(
-    gfs_data: np.ndarray,
-    gfs_transform: rasterio.Affine,
-    prism_shape: Tuple[int, int],
+def _reproject_prism_to_gfs(
+    prism_data: np.ndarray,
     prism_transform: rasterio.Affine,
     prism_crs: str,
+    gfs_shape: Tuple[int, int],
+    gfs_transform: rasterio.Affine,
 ) -> np.ndarray:
-    dst = np.full(prism_shape, np.nan, dtype=np.float32)
+    dst = np.full(gfs_shape, np.nan, dtype=np.float32)
     reproject(
-        source=gfs_data,
+        source=prism_data,
         destination=dst,
-        src_transform=gfs_transform,
-        src_crs="EPSG:4326",
-        dst_transform=prism_transform,
-        dst_crs=prism_crs,
+        src_transform=prism_transform,
+        src_crs=prism_crs,
+        dst_transform=gfs_transform,
+        dst_crs="EPSG:4326",
         resampling=Resampling.bilinear,
         dst_nodata=np.nan,
     )
@@ -216,14 +216,14 @@ def _compute_task_locals(
     gfs_transform = _gfs_transform(gfs_lats, gfs_lons)
     prism_data, prism_transform, prism_crs = _read_prism_ppt(task.prism_path)
 
-    gfs_on_prism = _reproject_gfs_to_prism(
-        gfs_data,
-        gfs_transform,
-        prism_data.shape,
+    prism_on_gfs = _reproject_prism_to_gfs(
+        prism_data,
         prism_transform,
         prism_crs,
+        gfs_data.shape,
+        gfs_transform,
     )
-    diff = gfs_on_prism - prism_data
+    diff = gfs_data - prism_on_gfs
     valid_mask = np.isfinite(diff)
 
     local_sum_diff = np.zeros_like(diff, dtype=np.float32)
@@ -234,9 +234,9 @@ def _compute_task_locals(
         task.lead_days,
         local_sum_diff,
         local_count,
-        _affine_to_tuple(prism_transform),
-        prism_crs,
-        prism_data.shape,
+        _affine_to_tuple(gfs_transform),
+        "EPSG:4326",
+        gfs_data.shape,
     )
 
 
@@ -253,28 +253,28 @@ def _merge_task_result(
     count: Dict[int, np.ndarray],
     grid_meta: GridMeta | None,
 ) -> GridMeta:
-    key, local_sum_diff, local_count, transform_tuple, prism_crs, prism_shape = result
-    prism_transform = rasterio.Affine(*transform_tuple)
+    key, local_sum_diff, local_count, transform_tuple, grid_crs, grid_shape = result
+    grid_transform = rasterio.Affine(*transform_tuple)
 
     if grid_meta is None:
-        prism_lats, prism_lons = _grid_coords_from_transform(
-            prism_transform, prism_shape[0], prism_shape[1]
+        grid_lats, grid_lons = _grid_coords_from_transform(
+            grid_transform, grid_shape[0], grid_shape[1]
         )
         grid_meta = GridMeta(
-            transform=prism_transform,
-            crs=prism_crs,
-            lats=prism_lats,
-            lons=prism_lons,
+            transform=grid_transform,
+            crs=grid_crs,
+            lats=grid_lats,
+            lons=grid_lons,
         )
     else:
         if (
             _affine_to_tuple(grid_meta.transform) != transform_tuple
-            or prism_crs != grid_meta.crs
-            or prism_shape != (grid_meta.lats.size, grid_meta.lons.size)
+            or grid_crs != grid_meta.crs
+            or grid_shape != (grid_meta.lats.size, grid_meta.lons.size)
         ):
             raise RuntimeError(
-                "PRISM grid mismatch across dates. "
-                "Expected consistent PRISM grid for all tasks."
+                "GFS grid mismatch across dates. "
+                "Expected consistent GFS grid for all tasks."
             )
 
     if key not in sum_diff:
@@ -359,8 +359,8 @@ def _write_tiles(
 
 def main() -> None:
     print(
-        "Computing bias on PRISM grid (higher resolution). "
-        "This increases memory usage and runtime."
+        "Computing bias on native GFS grid. "
+        "PRISM is reprojected to GFS to avoid upscaling GFS and reduce compute cost."
     )
     sum_diff, count, grid_meta, skipped_partial_files = _compute_lead_stats()
     _write_tiles(sum_diff, count, grid_meta)
