@@ -39,7 +39,6 @@ GFS_GRID_LATS_PATH = GFS_DIR / "grid_lats.npy"
 GFS_GRID_LONS_PATH = GFS_DIR / "grid_lons.npy"
 PRISM_DIR = Path("prism_data")
 OUTPUT_ROOT = Path("stats")
-TASKS_PER_CHUNK = 64
 
 GFS_FILE_RE = re.compile(r"f(?P<fhour>\d{3})_(?P<level>[^.]+)\.grib2$")
 PRISM_CACHE_MAX_ITEMS = 32
@@ -257,24 +256,6 @@ def _build_stats_tasks() -> Tuple[list[StatsTask], int]:
     return tasks, skipped_partial_files
 
 
-def _chunk_tasks(tasks: list[StatsTask], chunk_size: int) -> list[list[StatsTask]]:
-    return [tasks[i : i + chunk_size] for i in range(0, len(tasks), chunk_size)]
-
-
-def _merge_accumulator_maps(
-    target: Dict[int, Dict[str, Dict[str, np.ndarray]]],
-    source: Dict[int, Dict[str, Dict[str, np.ndarray]]],
-) -> None:
-    for lead, source_stats in source.items():
-        target_stats = target.setdefault(lead, {})
-        for stat_name, source_acc in source_stats.items():
-            if stat_name not in target_stats:
-                target_stats[stat_name] = {
-                    key: np.zeros_like(value) for key, value in source_acc.items()
-                }
-            for key, value in source_acc.items():
-                target_stats[stat_name][key] += value
-
 
 def _validate_or_build_grid_meta(
     grid_meta: GridMeta | None,
@@ -305,65 +286,6 @@ def _validate_or_build_grid_meta(
         )
     return grid_meta
 
-
-def _compute_chunk_locals(
-    chunk: list[StatsTask],
-) -> Tuple[
-    Dict[int, Dict[str, Dict[str, np.ndarray]]],
-    Tuple[float, float, float, float, float, float],
-    str,
-    Tuple[int, int],
-]:
-    chunk_accumulators: Dict[int, Dict[str, Dict[str, np.ndarray]]] = {}
-    chunk_grid_tuple: Tuple[float, float, float, float, float, float] | None = None
-    chunk_grid_crs: str | None = None
-    chunk_grid_shape: Tuple[int, int] | None = None
-
-    for task in chunk:
-        gfs_data, gfs_lats, gfs_lons = _read_gfs_apcp(task.grib_path)
-        gfs_transform = _gfs_transform(gfs_lats, gfs_lons)
-        prism_on_gfs = _reproject_prism_cached(
-            task.prism_path, gfs_data.shape, gfs_transform,
-        )
-        valid_mask = np.isfinite(gfs_data) & np.isfinite(prism_on_gfs)
-        diff = gfs_data - prism_on_gfs
-        derived = {
-            "diff": diff,
-            "abs_diff": np.abs(diff),
-            "sq_diff": diff * diff,
-        }
-
-        lead_stats = chunk_accumulators.setdefault(task.lead_days, {})
-        for plugin in ENABLED_STATISTICS:
-            stat_name = plugin.spec.name
-            if stat_name not in lead_stats:
-                lead_stats[stat_name] = plugin.init_accumulator(gfs_data.shape)
-            plugin.update(
-                lead_stats[stat_name],
-                gfs_data,
-                prism_on_gfs,
-                valid_mask,
-                derived=derived,
-            )
-
-        transform_tuple = _affine_to_tuple(gfs_transform)
-        if chunk_grid_tuple is None:
-            chunk_grid_tuple = transform_tuple
-            chunk_grid_crs = "EPSG:4326"
-            chunk_grid_shape = gfs_data.shape
-        else:
-            if (
-                transform_tuple != chunk_grid_tuple
-                or chunk_grid_crs != "EPSG:4326"
-                or chunk_grid_shape != gfs_data.shape
-            ):
-                raise RuntimeError(
-                    "GFS grid mismatch within chunk. Expected consistent grid."
-                )
-
-    if chunk_grid_tuple is None or chunk_grid_crs is None or chunk_grid_shape is None:
-        raise RuntimeError("Chunk produced no tasks.")
-    return chunk_accumulators, chunk_grid_tuple, chunk_grid_crs, chunk_grid_shape
 
 
 def _compute_lead_stats() -> Tuple[
