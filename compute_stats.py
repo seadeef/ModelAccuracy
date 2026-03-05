@@ -375,44 +375,45 @@ def _compute_lead_stats() -> Tuple[
     if not tasks:
         raise RuntimeError("No GFS/PRISM overlaps found. Check data paths.")
 
-    max_workers = max(1, (os.cpu_count() or 1) - 1)
-    use_parallel = len(tasks) > 1 and max_workers > 1
+    total = len(tasks)
+    print(f"Processing {total} tasks in a single process...")
 
-    task_chunks = _chunk_tasks(tasks, TASKS_PER_CHUNK)
+    for i, task in enumerate(tasks, start=1):
+        gfs_data, gfs_lats, gfs_lons = _read_gfs_apcp(task.grib_path)
+        gfs_tf = _gfs_transform(gfs_lats, gfs_lons)
 
-    if use_parallel:
-        print(
-            f"Processing {len(tasks)} tasks in {len(task_chunks)} chunks "
-            f"with {max_workers} worker processes..."
+        # Validate grid consistency
+        transform_tuple = _affine_to_tuple(gfs_tf)
+        grid_meta = _validate_or_build_grid_meta(
+            grid_meta, transform_tuple, "EPSG:4326", gfs_data.shape
         )
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_to_chunk = {
-                executor.submit(_compute_chunk_locals, chunk): chunk for chunk in task_chunks
-            }
-            total = len(future_to_chunk)
-            for completed, future in enumerate(as_completed(future_to_chunk), start=1):
-                chunk = future_to_chunk[future]
-                try:
-                    chunk_accumulators, transform_tuple, grid_crs, grid_shape = future.result()
-                except Exception as exc:
-                    sample_task = chunk[0]
-                    raise RuntimeError(
-                        f"Failed chunk starting at {sample_task.grib_path} "
-                        f"(valid date {sample_task.valid_date:%Y-%m-%d})"
-                    ) from exc
-                grid_meta = _validate_or_build_grid_meta(
-                    grid_meta, transform_tuple, grid_crs, grid_shape
-                )
-                _merge_accumulator_maps(accumulators, chunk_accumulators)
-                if completed % 5 == 0 or completed == total:
-                    print(f"Completed {completed}/{total} chunks...")
-    else:
-        for chunk in task_chunks:
-            chunk_accumulators, transform_tuple, grid_crs, grid_shape = _compute_chunk_locals(chunk)
-            grid_meta = _validate_or_build_grid_meta(
-                grid_meta, transform_tuple, grid_crs, grid_shape
+
+        prism_on_gfs = _reproject_prism_cached(
+            task.prism_path, gfs_data.shape, gfs_tf,
+        )
+        valid_mask = np.isfinite(gfs_data) & np.isfinite(prism_on_gfs)
+        diff = gfs_data - prism_on_gfs
+        derived = {
+            "diff": diff,
+            "abs_diff": np.abs(diff),
+            "sq_diff": diff * diff,
+        }
+
+        lead_stats = accumulators.setdefault(task.lead_days, {})
+        for plugin in ENABLED_STATISTICS:
+            stat_name = plugin.spec.name
+            if stat_name not in lead_stats:
+                lead_stats[stat_name] = plugin.init_accumulator(gfs_data.shape)
+            plugin.update(
+                lead_stats[stat_name],
+                gfs_data,
+                prism_on_gfs,
+                valid_mask,
+                derived=derived,
             )
-            _merge_accumulator_maps(accumulators, chunk_accumulators)
+
+        if i % 500 == 0 or i == total:
+            print(f"  Progress: {i}/{total} tasks...")
 
     if grid_meta is None:
         raise RuntimeError("No GFS/PRISM overlaps found. Check data paths.")
