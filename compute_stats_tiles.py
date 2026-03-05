@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -388,6 +390,75 @@ def write_metadata(
     out_path.write_text(json.dumps(metadata, indent=2))
 
 
+def _process_layer(
+    lead_key: str,
+    npz_path: Path,
+    field: str,
+    global_vmin: float,
+    global_vmax: float,
+    transform_tuple: tuple,
+    lats: np.ndarray,
+    crs: str,
+    stat_name: str,
+    units: str,
+    tmp_root: Path,
+    pmtiles_root: Path,
+    metadata_root: Path,
+    min_zoom: int,
+    max_zoom: int,
+    rio_jobs: int | None,
+    colormap: str,
+    merc_transform_tuple: tuple,
+    merc_width: int,
+    merc_height: int,
+) -> str:
+    """Process a single (statistic, lead) layer. Designed for use in a process pool."""
+    transform = Affine(*transform_tuple[:6])
+    merc_transform = Affine(*merc_transform_tuple[:6])
+
+    with np.load(npz_path) as layer:
+        if field not in layer:
+            raise KeyError(f"Missing field '{field}' in {npz_path}.")
+        values = layer[field]
+
+    vmin, vmax = global_vmin, global_vmax
+    quant, scale, offset = quantize_to_int16(values, vmin, vmax)
+    valid = np.isfinite(values)
+    dequant = np.full_like(values, np.nan, dtype=np.float32)
+    dequant[valid] = quant[valid].astype(np.float32) * scale + offset
+    rgba = diverging_colormap(dequant, vmin, vmax, valid)
+    rgba, write_transform = clip_to_web_mercator_lat(rgba, transform, lats)
+
+    rgba_path = tmp_root / stat_name / f"lead_{lead_key}_4326_rgba.tif"
+    merc_path = tmp_root / stat_name / f"lead_{lead_key}_3857_rgba.tif"
+    pmtiles_path = pmtiles_root / stat_name / f"lead_{lead_key}.pmtiles"
+    metadata_path = metadata_root / stat_name / f"lead_{lead_key}.json"
+
+    write_rgba_raster(rgba_path, rgba, write_transform, crs)
+    reproject_to_mercator(rgba_path, merc_path, merc_transform, merc_width, merc_height)
+
+    write_metadata(
+        metadata_path,
+        stat_name,
+        units,
+        lead_key,
+        vmin,
+        vmax,
+        scale,
+        offset,
+        min_zoom,
+        max_zoom,
+        colormap,
+    )
+
+    export_pmtiles(merc_path, pmtiles_path, min_zoom, max_zoom, rio_jobs)
+
+    header_tmp = tmp_root / stat_name / f"header_lead_{lead_key}.json"
+    edit_pmtiles_header(pmtiles_path, header_tmp, US_HEADER_CENTER, US_HEADER_BOUNDS)
+
+    return f"{stat_name}/lead_{lead_key}"
+
+
 def main() -> None:
     args = parse_args()
     selected_lead_key = normalize_lead_key(args.lead) if args.lead is not None else None
@@ -396,6 +467,14 @@ def main() -> None:
     pmtiles_root = args.output_dir / "pmtiles"
     metadata_root = args.output_dir / "metadata"
     tmp_root = args.output_dir / "tmp"
+
+    # Determine parallelism: outer pool always uses CPU count; rio pmtiles
+    # uses --jobs if provided, otherwise its own default.
+    outer_workers = os.cpu_count() or 1
+    rio_jobs = args.jobs  # None means rio pmtiles picks its own default
+
+    # Collect all (stat, lead) tasks up-front so we can submit them in bulk.
+    tasks: list[dict] = []
 
     for plugin in selected_plugins:
         stat_name = plugin.spec.name
@@ -439,53 +518,52 @@ def main() -> None:
             ),
         )
 
+        # Serialize Affine objects as tuples so they pickle safely across processes.
+        transform_tuple = tuple(meta["transform"])[:6]
+        merc_transform_tuple = tuple(merc_transform)[:6]
+
         for lead_key, npz_path in layers:
-            with np.load(npz_path) as layer:
-                if field not in layer:
-                    raise KeyError(f"Missing field '{field}' in {npz_path}.")
-                values = layer[field]
-            vmin, vmax = global_vmin, global_vmax
-            quant, scale, offset = quantize_to_int16(values, vmin, vmax)
-            valid = np.isfinite(values)
-            dequant = np.full_like(values, np.nan, dtype=np.float32)
-            dequant[valid] = quant[valid].astype(np.float32) * scale + offset
-            rgba = diverging_colormap(dequant, vmin, vmax, valid)
-            rgba, write_transform = clip_to_web_mercator_lat(
-                rgba, meta["transform"], meta["lats"]
-            )
+            tasks.append(dict(
+                lead_key=lead_key,
+                npz_path=npz_path,
+                field=field,
+                global_vmin=global_vmin,
+                global_vmax=global_vmax,
+                transform_tuple=transform_tuple,
+                lats=meta["lats"],
+                crs=meta["crs"],
+                stat_name=stat_name,
+                units=plugin.spec.units,
+                tmp_root=tmp_root,
+                pmtiles_root=pmtiles_root,
+                metadata_root=metadata_root,
+                min_zoom=args.min_zoom,
+                max_zoom=args.max_zoom,
+                rio_jobs=rio_jobs,
+                colormap=SHARED_COLORMAP,
+                merc_transform_tuple=merc_transform_tuple,
+                merc_width=merc_width,
+                merc_height=merc_height,
+            ))
 
-            rgba_path = tmp_root / stat_name / f"lead_{lead_key}_4326_rgba.tif"
-            merc_path = tmp_root / stat_name / f"lead_{lead_key}_3857_rgba.tif"
-            pmtiles_path = pmtiles_root / stat_name / f"lead_{lead_key}.pmtiles"
-            metadata_path = metadata_root / stat_name / f"lead_{lead_key}.json"
-            write_rgba_raster(rgba_path, rgba, write_transform, meta["crs"])
-            reproject_to_mercator(
-                rgba_path, merc_path, merc_transform, merc_width, merc_height
-            )
-
-            write_metadata(
-                metadata_path,
-                stat_name,
-                plugin.spec.units,
-                lead_key,
-                vmin,
-                vmax,
-                scale,
-                offset,
-                args.min_zoom,
-                args.max_zoom,
-                SHARED_COLORMAP,
-            )
-
-            export_pmtiles(
-                merc_path,
-                pmtiles_path,
-                args.min_zoom,
-                args.max_zoom,
-                args.jobs,
-            )
-            header_tmp = tmp_root / stat_name / f"header_lead_{lead_key}.json"
-            edit_pmtiles_header(pmtiles_path, header_tmp, US_HEADER_CENTER, US_HEADER_BOUNDS)
+    total = len(tasks)
+    if total == 0:
+        print("No layers to process.")
+    else:
+        print(f"Processing {total} layer(s) with up to {outer_workers} workers …")
+        completed = 0
+        with ProcessPoolExecutor(max_workers=outer_workers) as pool:
+            futures = {pool.submit(_process_layer, **t): t for t in tasks}
+            for future in as_completed(futures):
+                task_info = futures[future]
+                label = f"{task_info['stat_name']}/lead_{task_info['lead_key']}"
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"FAILED {label}: {exc}")
+                    raise
+                completed += 1
+                print(f"  [{completed}/{total}] {label}")
 
     if tmp_root.exists():
         shutil.rmtree(tmp_root)

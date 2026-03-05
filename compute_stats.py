@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -34,6 +35,8 @@ except Exception as exc:  # pragma: no cover - environment dependent
 
 GFS_MODEL = "gfs"
 GFS_DIR = Path("model_data") / GFS_MODEL
+GFS_GRID_LATS_PATH = GFS_DIR / "grid_lats.npy"
+GFS_GRID_LONS_PATH = GFS_DIR / "grid_lons.npy"
 PRISM_DIR = Path("prism_data")
 OUTPUT_ROOT = Path("stats")
 TASKS_PER_CHUNK = 64
@@ -87,6 +90,13 @@ def _get_prism_tif_path(date: datetime) -> Path:
 
 
 def _read_gfs_apcp(grib_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    npy_path = grib_path.with_suffix(".npy")
+    if npy_path.exists() and GFS_GRID_LATS_PATH.exists() and GFS_GRID_LONS_PATH.exists():
+        data = np.load(npy_path)
+        lats = np.load(GFS_GRID_LATS_PATH)
+        lons = np.load(GFS_GRID_LONS_PATH)
+        return data, lats, lons
+
     ds = xr.open_dataset(grib_path, engine="cfgrib")
     if not ds.data_vars:
         raise ValueError(f"No variables found in {grib_path}")
@@ -460,6 +470,66 @@ def _write_stats(
             np.savez_compressed(stat_dir / f"lead_{window_key}.npz", **outputs)
 
 
+def _convert_single_grib(grib_path: Path) -> bool:
+    """Convert a single GRIB2 file to .npy. Returns True if converted, False if skipped."""
+    npy_path = grib_path.with_suffix(".npy")
+    if npy_path.exists():
+        return False
+    data, _lats, _lons = _read_gfs_apcp(grib_path)
+    np.save(npy_path, data)
+    return True
+
+
+def preconvert_grib2_to_npy() -> None:
+    """Convert all GFS GRIB2 files to .npy for fast reading."""
+    print("Scanning for GRIB2 files to convert...")
+    grib_paths: list[Path] = []
+    for init_dir in _list_gfs_inits():
+        for f in sorted(init_dir.iterdir()):
+            if f.is_file() and GFS_FILE_RE.match(f.name):
+                grib_paths.append(f)
+
+    if not grib_paths:
+        print("No GRIB2 files found.")
+        return
+
+    print(f"Found {len(grib_paths)} GRIB2 files.")
+
+    # Save grid lats/lons from the first file (grid is constant across all files).
+    if not GFS_GRID_LATS_PATH.exists() or not GFS_GRID_LONS_PATH.exists():
+        print("Saving grid coordinates from first file...")
+        _data, lats, lons = _read_gfs_apcp(grib_paths[0])
+        np.save(GFS_GRID_LATS_PATH, lats)
+        np.save(GFS_GRID_LONS_PATH, lons)
+        print(f"  Saved {GFS_GRID_LATS_PATH} and {GFS_GRID_LONS_PATH}")
+
+    max_workers = max(1, (os.cpu_count() or 1) - 1)
+    converted = 0
+    skipped = 0
+
+    print(f"Converting with {max_workers} worker processes...")
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {
+            executor.submit(_convert_single_grib, p): p for p in grib_paths
+        }
+        total = len(future_to_path)
+        for i, future in enumerate(as_completed(future_to_path), start=1):
+            path = future_to_path[future]
+            try:
+                was_converted = future.result()
+            except Exception as exc:
+                print(f"  ERROR converting {path}: {exc}")
+                continue
+            if was_converted:
+                converted += 1
+            else:
+                skipped += 1
+            if i % 500 == 0 or i == total:
+                print(f"  Progress: {i}/{total} ({converted} converted, {skipped} skipped)")
+
+    print(f"Done. Converted {converted} files, skipped {skipped} (already existed).")
+
+
 def main() -> None:
     stat_names = ", ".join(plugin.spec.name for plugin in ENABLED_STATISTICS)
     print(
@@ -474,4 +544,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if "--preconvert" in sys.argv:
+        preconvert_grib2_to_npy()
+    else:
+        main()
