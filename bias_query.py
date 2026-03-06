@@ -1,34 +1,25 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-from functools import lru_cache
 from pathlib import Path
 
-import numpy as np
+from stats_query import DEFAULT_STATS_ROOT, stats_at_point
 
-DEFAULT_STATS_DIR = Path("stats") / "bias"
-
-
-@lru_cache(maxsize=1)
-def _load_metadata(stats_dir_str: str) -> tuple[np.ndarray, np.ndarray]:
-    stats_dir = Path(stats_dir_str)
-    meta = np.load(stats_dir / "metadata.npz", allow_pickle=False)
-    return meta["lats"], meta["lons"]
+DEFAULT_STATS_ROOT_DIR = DEFAULT_STATS_ROOT
 
 
-@lru_cache(maxsize=64)
-def _load_bias(stats_dir_str: str, lead_days: int) -> np.ndarray:
-    stats_dir = Path(stats_dir_str)
-    tile_path = stats_dir / f"lead_{lead_days}.npz"
-    tile = np.load(tile_path, allow_pickle=False)
-    return tile["bias_mean"]
-
-
+# Backward-compatible helper for callers that still import bias_at_point.
 def bias_at_point(
-    lat: float, lon: float, lead_days: int, stats_dir: Path = DEFAULT_STATS_DIR
+    lat: float, lon: float, lead_days: int, stats_root: Path = DEFAULT_STATS_ROOT_DIR
 ) -> float:
-    lats, lons = _load_metadata(str(stats_dir))
-    lat_idx = int(np.argmin(np.abs(lats - lat)))
-    lon_idx = int(np.argmin(np.abs(lons - lon)))
-    bias = _load_bias(str(stats_dir), lead_days)
-    return float(bias[lat_idx, lon_idx])
+    values = stats_at_point(
+        lat,
+        lon,
+        lead_days,
+        stats_root=stats_root,
+        stat_names=["bias"],
+    )
+    value = values["bias"]["value"]
+    if value is None:
+        raise ValueError("No bias value at this location/lead.")
+    return float(value)

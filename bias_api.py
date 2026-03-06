@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import csv
-import math
 import os
 import re
 from functools import lru_cache
@@ -11,14 +10,16 @@ from pathlib import Path
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from bias_query import bias_at_point, DEFAULT_STATS_DIR
+from lead_windows import build_lead_options, normalize_lead_key
 from lead_config import LEAD_DAYS_MAX, LEAD_DAYS_MIN
+from statistics_plugins.registry import STATISTICS_BY_NAME
+from stats_query import DEFAULT_STATS_ROOT, stats_at_point
 
 MAPTILER_API_KEY = os.getenv("MAPTILER_API_KEY", "")
 MAPTILER_STYLE_ID = "streets-v2"
 ZIP_LOOKUP_CSV = Path(os.getenv("ZIP_LOOKUP_CSV", "zip_lookup.csv"))
 
-app = FastAPI(title="Bias Query API")
+app = FastAPI(title="Model Statistics Query API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,18 +64,22 @@ def _load_zip_lookup(path_str: str) -> dict[str, dict[str, float]]:
     return lookup
 
 
-@app.get("/api/bias")
-def get_bias(
-    lead: int = Query(..., ge=LEAD_DAYS_MIN, le=LEAD_DAYS_MAX),
+@app.get("/api/stats")
+def get_stats(
+    lead: str = Query(..., pattern=r"^\d+([_-]\d+)?$"),
     lat: float = Query(..., ge=-90.0, le=90.0),
     lon: float = Query(..., ge=-180.0, le=180.0),
-    stats_dir: str | None = None,
+    stats_root: str | None = None,
 ):
-    stats_path = Path(stats_dir) if stats_dir else DEFAULT_STATS_DIR
-    value = bias_at_point(lat, lon, lead, stats_dir=stats_path)
-    if math.isnan(value):
-        return {"value": None, "units": "mm", "no_data": True}
-    return {"value": value, "units": "mm", "no_data": False}
+    lead_key = normalize_lead_key(lead)
+    stats_path = Path(stats_root) if stats_root else DEFAULT_STATS_ROOT
+    values = stats_at_point(lat, lon, lead_key, stats_root=stats_path)
+    return {
+        "lead": lead_key,
+        "lat": lat,
+        "lon": lon,
+        "stats": values,
+    }
 
 
 @app.get("/api/config")
@@ -84,6 +89,9 @@ def get_config():
         "lead_days_max": LEAD_DAYS_MAX,
         "maptiler_api_key": MAPTILER_API_KEY,
         "maptiler_style_id": MAPTILER_STYLE_ID,
+        "statistics": sorted(STATISTICS_BY_NAME),
+        "default_statistic": "bias",
+        "lead_options": build_lead_options(LEAD_DAYS_MIN, LEAD_DAYS_MAX),
     }
 
 
