@@ -26,12 +26,11 @@ DEFAULT_STATS_ROOT = Path("stats")
 WEB_MERCATOR_MAX_LAT = 85.05112878
 US_HEADER_CENTER = [-98.5795, 39.8283, 3.0]
 US_HEADER_BOUNDS = [-125.0, 24.0, -66.0, 50.0]
-SHARED_COLORMAP = "diverging"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate PMTiles for configured statistics (via rio-pmtiles)."
+        description="Generate tiles (PNG images or PMTiles) for configured statistics."
     )
     parser.add_argument(
         "--stats-root",
@@ -54,9 +53,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-zoom",
         type=int,
-        required=True,
+        default=None,
         metavar="Z",
-        help="Maximum zoom to render (required).",
+        help="Maximum zoom for PMTiles rendering. Required when any statistic uses pmtiles tile_mode.",
     )
     parser.add_argument(
         "--output-dir",
@@ -171,58 +170,40 @@ def value_range_from_layers(
     return value_range(merged, percentile, colormap, fixed_range)
 
 
-def quantize_to_int16(values: np.ndarray, vmin: float, vmax: float) -> tuple[np.ndarray, float, float]:
-    if vmax <= vmin:
-        vmax = vmin + 1.0
-    scale = (vmax - vmin) / 65535.0
-    offset = vmin + 32768.0 * scale
-    quant = np.zeros(values.shape, dtype=np.int16)
-    valid = np.isfinite(values)
-    quant_vals = np.round((values[valid] - offset) / scale)
-    quant_vals = np.clip(quant_vals, -32768, 32767).astype(np.int16)
-    quant[valid] = quant_vals
-    return quant, float(scale), float(offset)
-
-
 def diverging_colormap(
-    data: np.ndarray, vmin: float, vmax: float, mask: np.ndarray, gamma: float = 0.7,
+    data: np.ndarray, vmin: float, vmax: float, mask: np.ndarray,
 ) -> np.ndarray:
     blue = np.array([44, 123, 182], dtype=np.float32)
     white = np.array([255, 255, 255], dtype=np.float32)
     red = np.array([215, 25, 28], dtype=np.float32)
+
     valid = mask & np.isfinite(data)
     denom = vmax - vmin if vmax != vmin else 1.0
     t = np.clip((data - vmin) / denom, 0.0, 1.0)
 
-    # Apply gamma symmetrically around the midpoint so small deviations
-    # from zero get more color separation while preserving the scale.
-    dist = np.abs(t - 0.5) * 2.0
-    mapped = np.power(dist, gamma)
-    t = np.where(t <= 0.5, 0.5 - 0.5 * mapped, 0.5 + 0.5 * mapped)
-
-    rgb = np.zeros((data.shape[0], data.shape[1], 3), dtype=np.float32)
-    lower = (t <= 0.5) & valid
-    upper = (~(t <= 0.5)) & valid
-    if np.any(lower):
-        t_low = (t[lower] / 0.5).reshape(-1, 1)
-        rgb[lower] = (blue + (white - blue) * t_low).reshape((-1, 3))
-    if np.any(upper):
-        t_high = ((t[upper] - 0.5) / 0.5).reshape(-1, 1)
-        rgb[upper] = (white + (red - white) * t_high).reshape((-1, 3))
+    rgb = np.zeros((data.shape[0], data.shape[1], 3), dtype=np.uint8)
+    low = t <= 0.5
+    high = ~low
+    low_valid = valid & low
+    high_valid = valid & high
+    frac_low = (t[low_valid] / 0.5)[:, None]
+    frac_high = ((t[high_valid] - 0.5) / 0.5)[:, None]
+    rgb[low_valid] = np.clip(blue + (white - blue) * frac_low, 0, 255).astype(np.uint8)
+    rgb[high_valid] = np.clip(white + (red - white) * frac_high, 0, 255).astype(np.uint8)
     alpha = np.where(valid, 255, 0).astype(np.uint8)
-    return np.dstack([rgb.astype(np.uint8), alpha])
+    return np.dstack([rgb, alpha])
 
 
 def sequential_colormap(data: np.ndarray, vmin: float, vmax: float, mask: np.ndarray) -> np.ndarray:
     white = np.array([255, 255, 255], dtype=np.float32)
-    green = np.array([33, 145, 140], dtype=np.float32)
+    red = np.array([215, 25, 28], dtype=np.float32)
     valid = mask & np.isfinite(data)
     denom = vmax - vmin if vmax != vmin else 1.0
     t = np.clip((data - vmin) / denom, 0.0, 1.0)
     rgb = np.zeros((data.shape[0], data.shape[1], 3), dtype=np.float32)
     if np.any(valid):
         tv = t[valid].reshape(-1, 1)
-        rgb[valid] = (white + (green - white) * tv).reshape((-1, 3))
+        rgb[valid] = (white + (red - white) * tv).reshape((-1, 3))
     alpha = np.where(valid, 255, 0).astype(np.uint8)
     return np.dstack([rgb.astype(np.uint8), alpha])
 
@@ -368,36 +349,30 @@ def edit_pmtiles_header(
         header_path.unlink(missing_ok=True)
 
 
-def write_metadata(
-    out_path: Path,
-    stat_name: str,
-    units: str,
-    lead_key: str,
+def _render_rgba(
+    npz_path: Path,
+    field: str,
     vmin: float,
     vmax: float,
-    scale: float,
-    offset: float,
-    min_zoom: int,
-    max_zoom: int,
-    colormap: str,
-) -> None:
-    metadata = {
-        "statistic": stat_name,
-        "lead": lead_key,
-        "units": units,
-        "nodata": None,
-        "vmin": vmin,
-        "vmax": vmax,
-        "scale": scale,
-        "offset": offset,
-        "colormap": {"type": colormap},
-        "zoom": {"min": min_zoom, "max": max_zoom},
-    }
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(json.dumps(metadata, indent=2))
+    transform: Affine,
+    lats: np.ndarray,
+    colormap: str = "diverging",
+) -> tuple[np.ndarray, Affine]:
+    """Load values, apply colormap, clip to web mercator. Returns (rgba, clipped_transform)."""
+    with np.load(npz_path) as layer:
+        if field not in layer:
+            raise KeyError(f"Missing field '{field}' in {npz_path}.")
+        values = layer[field]
+
+    valid = np.isfinite(values)
+    colormap_fn = sequential_colormap if colormap == "sequential" else diverging_colormap
+    rgba = colormap_fn(values, vmin, vmax, valid)
+    rgba, clipped_transform = clip_to_web_mercator_lat(rgba, transform, lats)
+    return rgba, clipped_transform
 
 
-def _process_layer(
+
+def _process_layer_image(
     lead_key: str,
     npz_path: Path,
     field: str,
@@ -407,57 +382,91 @@ def _process_layer(
     lats: np.ndarray,
     crs: str,
     stat_name: str,
-    units: str,
+    images_root: Path,
     tmp_root: Path,
-    pmtiles_root: Path,
-    metadata_root: Path,
-    min_zoom: int,
-    max_zoom: int,
-    rio_jobs: int | None,
-    colormap: str,
-    merc_transform_tuple: tuple,
-    merc_width: int,
-    merc_height: int,
+    colormap: str = "diverging",
 ) -> str:
-    """Process a single (statistic, lead) layer. Designed for use in a process pool."""
+    """Render a single layer as a mercator-reprojected PNG, cropped to US."""
+    from PIL import Image
+
     transform = Affine(*transform_tuple[:6])
-    merc_transform = Affine(*merc_transform_tuple[:6])
 
     with np.load(npz_path) as layer:
         if field not in layer:
             raise KeyError(f"Missing field '{field}' in {npz_path}.")
         values = layer[field]
 
-    vmin, vmax = global_vmin, global_vmax
-    quant, scale, offset = quantize_to_int16(values, vmin, vmax)
-    valid = np.isfinite(values)
-    dequant = np.full_like(values, np.nan, dtype=np.float32)
-    dequant[valid] = quant[valid].astype(np.float32) * scale + offset
-    rgba = diverging_colormap(dequant, vmin, vmax, valid)
-    rgba, write_transform = clip_to_web_mercator_lat(rgba, transform, lats)
+    # Crop to US in source grid before colormapping.
+    west, south, east, north = US_HEADER_BOUNDS
+    lat_res = abs(transform.e)
+    lon_res = abs(transform.a)
+    row_start = max(0, int((transform.f - north) / lat_res))
+    row_end = min(values.shape[0], int((transform.f - south) / lat_res) + 1)
+    col_start = max(0, int((west - transform.c) / lon_res))
+    col_end = min(values.shape[1], int((east - transform.c) / lon_res) + 1)
+
+    cropped = values[row_start:row_end, col_start:col_end]
+    crop_transform = Affine(
+        transform.a, transform.b, transform.c + col_start * lon_res,
+        transform.d, transform.e, transform.f - row_start * lat_res,
+    )
+
+    valid = np.isfinite(cropped)
+    colormap_fn = sequential_colormap if colormap == "sequential" else diverging_colormap
+    rgba = colormap_fn(cropped, global_vmin, global_vmax, valid)
+
+    # Write as 4326 GeoTIFF, reproject to 3857, then save as PNG.
+    tif_4326 = tmp_root / stat_name / f"lead_{lead_key}_img_4326.tif"
+    tif_3857 = tmp_root / stat_name / f"lead_{lead_key}_img_3857.tif"
+    write_rgba_raster(tif_4326, rgba, crop_transform, crs)
+    reproject_to_mercator(tif_4326, tif_3857)
+
+    # Read the reprojected raster and save as PNG.
+    with rasterio.open(tif_3857) as src:
+        merc_rgba = np.stack([src.read(i) for i in range(1, 5)], axis=-1)
+
+    out_dir = images_root / stat_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    png_path = out_dir / f"lead_{lead_key}.png"
+    Image.fromarray(merc_rgba, "RGBA").save(png_path, optimize=True)
+
+    return f"{stat_name}/lead_{lead_key}"
+
+
+def _process_layer_pmtiles(
+    lead_key: str,
+    npz_path: Path,
+    field: str,
+    global_vmin: float,
+    global_vmax: float,
+    transform_tuple: tuple,
+    lats: np.ndarray,
+    crs: str,
+    stat_name: str,
+    tmp_root: Path,
+    pmtiles_root: Path,
+    min_zoom: int,
+    max_zoom: int,
+    rio_jobs: int | None,
+    merc_transform_tuple: tuple,
+    merc_width: int,
+    merc_height: int,
+    colormap: str = "diverging",
+) -> str:
+    """Render a single layer as PMTiles (pmtiles mode)."""
+    transform = Affine(*transform_tuple[:6])
+    merc_transform = Affine(*merc_transform_tuple[:6])
+
+    rgba, write_transform = _render_rgba(
+        npz_path, field, global_vmin, global_vmax, transform, lats, colormap,
+    )
 
     rgba_path = tmp_root / stat_name / f"lead_{lead_key}_4326_rgba.tif"
     merc_path = tmp_root / stat_name / f"lead_{lead_key}_3857_rgba.tif"
     pmtiles_path = pmtiles_root / stat_name / f"lead_{lead_key}.pmtiles"
-    metadata_path = metadata_root / stat_name / f"lead_{lead_key}.json"
 
     write_rgba_raster(rgba_path, rgba, write_transform, crs)
     reproject_to_mercator(rgba_path, merc_path, merc_transform, merc_width, merc_height)
-
-    write_metadata(
-        metadata_path,
-        stat_name,
-        units,
-        lead_key,
-        vmin,
-        vmax,
-        scale,
-        offset,
-        min_zoom,
-        max_zoom,
-        colormap,
-    )
-
     export_pmtiles(merc_path, pmtiles_path, min_zoom, max_zoom, rio_jobs)
 
     header_tmp = tmp_root / stat_name / f"header_lead_{lead_key}.json"
@@ -472,16 +481,17 @@ def main() -> None:
 
     selected_plugins = resolve_statistics(args.stats)
     pmtiles_root = args.output_dir / "pmtiles"
-    metadata_root = args.output_dir / "metadata"
+    images_root = args.output_dir / "images"
     tmp_root = args.output_dir / "tmp"
 
     rio_jobs = args.jobs
 
-    # Collect all (stat, lead) tasks up-front so we can submit them in bulk.
-    tasks: list[dict] = []
+    # Collect all (stat, lead) tasks up-front.
+    tasks: list[tuple[str, dict]] = []  # (tile_mode, kwargs)
 
     for plugin in selected_plugins:
         stat_name = plugin.spec.name
+        tile_mode = plugin.spec.tile_mode
         stats_dir = args.stats_root / stat_name
         if not stats_dir.exists():
             print(f"Skipping statistic '{stat_name}' (missing {stats_dir}).")
@@ -494,75 +504,98 @@ def main() -> None:
             continue
         field = plugin.spec.render_field
         layer_paths = [npz_path for _, npz_path in layers]
+        colormap = plugin.spec.colormap
         global_vmin, global_vmax = value_range_from_layers(
             layer_paths,
             field,
             args.percentile,
-            SHARED_COLORMAP,
+            colormap,
             plugin.spec.fixed_range,
         )
 
-        # Pre-compute the clipped transform (identical for all leads sharing
-        # the same grid) so we can derive the EPSG:3857 reprojection params
-        # once and reuse them for every lead layer.
-        _clip_dummy = np.zeros(
-            (len(meta["lats"]), len(meta["lons"]), 4), dtype=np.uint8
-        )
-        _clipped_dummy, clipped_transform = clip_to_web_mercator_lat(
-            _clip_dummy, meta["transform"], meta["lats"]
-        )
-        clipped_height, clipped_width = _clipped_dummy.shape[:2]
-
-        merc_transform, merc_width, merc_height = compute_mercator_transform(
-            meta["crs"],
-            clipped_width,
-            clipped_height,
-            rasterio.transform.array_bounds(
-                clipped_height, clipped_width, clipped_transform
-            ),
-        )
-
-        # Serialize Affine objects as tuples so they pickle safely across processes.
         transform_tuple = tuple(meta["transform"])[:6]
-        merc_transform_tuple = tuple(merc_transform)[:6]
+
+        # PMTiles mode needs pre-computed mercator transform and --max-zoom.
+        merc_transform_tuple = None
+        merc_width = None
+        merc_height = None
+        if tile_mode == "pmtiles":
+            if args.max_zoom is None:
+                raise SystemExit(
+                    f"Error: --max-zoom is required because statistic '{stat_name}' "
+                    "uses pmtiles tile_mode."
+                )
+            _clip_dummy = np.zeros(
+                (len(meta["lats"]), len(meta["lons"]), 4), dtype=np.uint8
+            )
+            _clipped_dummy, clipped_transform = clip_to_web_mercator_lat(
+                _clip_dummy, meta["transform"], meta["lats"]
+            )
+            clipped_height, clipped_width = _clipped_dummy.shape[:2]
+            merc_transform, merc_width, merc_height = compute_mercator_transform(
+                meta["crs"],
+                clipped_width,
+                clipped_height,
+                rasterio.transform.array_bounds(
+                    clipped_height, clipped_width, clipped_transform
+                ),
+            )
+            merc_transform_tuple = tuple(merc_transform)[:6]
 
         for lead_key, npz_path in layers:
-            tasks.append(dict(
-                lead_key=lead_key,
-                npz_path=npz_path,
-                field=field,
-                global_vmin=global_vmin,
-                global_vmax=global_vmax,
-                transform_tuple=transform_tuple,
-                lats=meta["lats"],
-                crs=meta["crs"],
-                stat_name=stat_name,
-                units=plugin.spec.units,
-                tmp_root=tmp_root,
-                pmtiles_root=pmtiles_root,
-                metadata_root=metadata_root,
-                min_zoom=args.min_zoom,
-                max_zoom=args.max_zoom,
-                rio_jobs=rio_jobs,
-                colormap=SHARED_COLORMAP,
-                merc_transform_tuple=merc_transform_tuple,
-                merc_width=merc_width,
-                merc_height=merc_height,
-            ))
+            if tile_mode == "image":
+                tasks.append(("image", dict(
+                    lead_key=lead_key,
+                    npz_path=npz_path,
+                    field=field,
+                    global_vmin=global_vmin,
+                    global_vmax=global_vmax,
+                    transform_tuple=transform_tuple,
+                    lats=meta["lats"],
+                    crs=meta["crs"],
+                    stat_name=stat_name,
+                    images_root=images_root,
+                    tmp_root=tmp_root,
+                    colormap=colormap,
+                )))
+            else:
+                tasks.append(("pmtiles", dict(
+                    lead_key=lead_key,
+                    npz_path=npz_path,
+                    field=field,
+                    global_vmin=global_vmin,
+                    global_vmax=global_vmax,
+                    transform_tuple=transform_tuple,
+                    lats=meta["lats"],
+                    crs=meta["crs"],
+                    stat_name=stat_name,
+                    tmp_root=tmp_root,
+                    pmtiles_root=pmtiles_root,
+                    min_zoom=args.min_zoom,
+                    max_zoom=args.max_zoom,
+                    rio_jobs=rio_jobs,
+                    merc_transform_tuple=merc_transform_tuple,
+                    merc_width=merc_width,
+                    merc_height=merc_height,
+                    colormap=colormap,
+                )))
 
     total = len(tasks)
     if total == 0:
         print("No layers to process.")
     else:
-        print(f"Processing {total} layer(s) sequentially (rio pmtiles handles parallelism) …")
-        for i, t in enumerate(tasks, start=1):
-            label = f"{t['stat_name']}/lead_{t['lead_key']}"
+        print(f"Processing {total} layer(s) …")
+        for i, (mode, kwargs) in enumerate(tasks, start=1):
+            label = f"{kwargs['stat_name']}/lead_{kwargs['lead_key']} [{mode}]"
             print(f"  [{i}/{total}] {label} …", flush=True)
-            _process_layer(**t)
+            if mode == "image":
+                _process_layer_image(**kwargs)
+            else:
+                _process_layer_pmtiles(**kwargs)
 
     if tmp_root.exists():
         shutil.rmtree(tmp_root)
-    print(f"PMTiles written to {(args.output_dir / 'pmtiles').resolve()}")
+    print(f"Output written to {args.output_dir.resolve()}")
 
 
 if __name__ == "__main__":

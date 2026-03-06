@@ -96,6 +96,7 @@
       const DEFAULT_MAPTILER_STYLE_ID = "streets-v2";
       const FALLBACK_STYLE_URL = "https://demotiles.maplibre.org/style.json";
       const DETAIL_ZOOM_LIMITS = { low: 9, high: 14 };
+      const US_BOUNDS = [-125.0, 24.0, -66.0, 50.0]; // [west, south, east, north]
       const sourceId = "bias-source";
       const layerId = "bias-layer";
       const statusEl = document.getElementById("status");
@@ -105,8 +106,10 @@
         leadOptions: [],
         maptilerApiKey: "",
         maptilerStyleId: DEFAULT_MAPTILER_STYLE_ID,
-        statistics: ["bias"],
+        statistics: {},  // { name: { tile_mode } }
         defaultStatistic: "bias",
+        imageBounds: US_BOUNDS,
+        forecastInitDate: null,
       };
       const state = {
         statistic: "bias",
@@ -248,33 +251,18 @@
         return undefined;
       }
 
-      async function loadTileset(statistic, lead) {
-        if (!map) {
-          return;
-        }
-        const id = tilesetId(statistic, lead);
-        const tilejsonUrl = `${BASE_URL}/${id}.json`;
-        setStatus(`Loading ${id}...`);
+      function removeBiasLayer() {
+        if (!map) return;
+        if (map.getLayer(layerId)) map.removeLayer(layerId);
+        if (map.getSource(sourceId)) map.removeSource(sourceId);
+      }
 
-        if (map.getLayer(layerId)) {
-          map.removeLayer(layerId);
-        }
-        if (map.getSource(sourceId)) {
-          map.removeSource(sourceId);
-        }
-
-        map.addSource(sourceId, {
-          type: "raster",
-          url: tilejsonUrl,
-          tileSize: 256,
-        });
+      function addRasterLayer() {
         const weatherLayer = {
           id: layerId,
           type: "raster",
           source: sourceId,
-          paint: {
-            "raster-opacity": state.weatherOpacity,
-          },
+          paint: { "raster-opacity": state.weatherOpacity },
         };
         const beforeId = firstSymbolLayerId();
         if (beforeId) {
@@ -282,6 +270,49 @@
         } else {
           map.addLayer(weatherLayer);
         }
+      }
+
+      async function loadTilesetImage(statistic, lead) {
+        const id = tilesetId(statistic, lead);
+        const imageUrl = `${API_BASE_URL}/images/${statistic}/lead_${lead}.png`;
+        setStatus(`Loading ${id} (image)...`);
+
+        removeBiasLayer();
+
+        const [west, south, east, north] = appConfig.imageBounds;
+        map.addSource(sourceId, {
+          type: "image",
+          url: imageUrl,
+          coordinates: [
+            [west, north],
+            [east, north],
+            [east, south],
+            [west, south],
+          ],
+        });
+        addRasterLayer();
+        applyLayerState();
+
+        map.fitBounds(
+          [[west, south], [east, north]],
+          { padding: 20 }
+        );
+        setStatus(`Showing ${id}`);
+      }
+
+      async function loadTilesetPmtiles(statistic, lead) {
+        const id = tilesetId(statistic, lead);
+        const tilejsonUrl = `${BASE_URL}/${id}.json`;
+        setStatus(`Loading ${id} (pmtiles)...`);
+
+        removeBiasLayer();
+
+        map.addSource(sourceId, {
+          type: "raster",
+          url: tilejsonUrl,
+          tileSize: 256,
+        });
+        addRasterLayer();
 
         try {
           const resp = await fetch(tilejsonUrl);
@@ -329,19 +360,52 @@
         setStatus(`Showing ${id}`);
       }
 
-      function populateLeads(selectEl, options) {
+      async function loadTileset(statistic, lead) {
+        if (!map) return;
+        const statInfo = appConfig.statistics[statistic] || {};
+        const tileMode = statInfo.tile_mode || "pmtiles";
+        if (tileMode === "image") {
+          await loadTilesetImage(statistic, lead);
+        } else {
+          await loadTilesetPmtiles(statistic, lead);
+        }
+      }
+
+      function populateLeads(selectEl, options, statistic) {
         selectEl.innerHTML = "";
+        const initDate = (statistic === "forecast" && appConfig.forecastInitDate)
+          ? new Date(appConfig.forecastInitDate + "T12:00:00Z")
+          : null;
         for (const option of options) {
           const opt = document.createElement("option");
           opt.value = option.key;
-          opt.textContent = option.label;
+          if (initDate && /^\d+$/.test(option.key)) {
+            const d = new Date(initDate);
+            d.setUTCDate(d.getUTCDate() + parseInt(option.key));
+            const mon = d.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
+            const day = d.getUTCDate();
+            opt.textContent = `${option.label} (${mon} ${day})`;
+          } else if (initDate && option.key.includes("_")) {
+            const [start, end] = option.key.split("_").map(Number);
+            const d1 = new Date(initDate);
+            d1.setUTCDate(d1.getUTCDate() + start);
+            const d2 = new Date(initDate);
+            d2.setUTCDate(d2.getUTCDate() + end);
+            const fmt = (d) => {
+              const mon = d.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
+              return `${mon} ${d.getUTCDate()}`;
+            };
+            opt.textContent = `${option.label} (${fmt(d1)}-${fmt(d2)})`;
+          } else {
+            opt.textContent = option.label;
+          }
           selectEl.appendChild(opt);
         }
       }
 
       function populateStatistics(selectEl, statistics) {
         selectEl.innerHTML = "";
-        for (const statName of statistics) {
+        for (const statName of Object.keys(statistics).sort()) {
           const opt = document.createElement("option");
           opt.value = statName;
           opt.textContent = statName;
@@ -372,17 +436,23 @@
           if (typeof data.maptiler_style_id === "string" && data.maptiler_style_id.trim()) {
             appConfig.maptilerStyleId = data.maptiler_style_id.trim();
           }
-          if (Array.isArray(data.statistics) && data.statistics.length > 0) {
-            appConfig.statistics = data.statistics.map(String);
+          if (data.statistics && typeof data.statistics === "object" && !Array.isArray(data.statistics)) {
+            appConfig.statistics = data.statistics;
           }
           if (
             typeof data.default_statistic === "string" &&
-            appConfig.statistics.includes(data.default_statistic)
+            data.default_statistic in appConfig.statistics
           ) {
             appConfig.defaultStatistic = data.default_statistic;
           }
           if (Array.isArray(data.lead_options) && data.lead_options.length > 0) {
             appConfig.leadOptions = data.lead_options;
+          }
+          if (Array.isArray(data.image_bounds) && data.image_bounds.length === 4) {
+            appConfig.imageBounds = data.image_bounds;
+          }
+          if (typeof data.forecast_init_date === "string") {
+            appConfig.forecastInitDate = data.forecast_init_date;
           }
         } catch (err) {
           // Keep defaults when API config is unavailable.
@@ -459,6 +529,8 @@
 
       statSelect.addEventListener("change", () => {
         state.statistic = statSelect.value;
+        populateLeads(leadSelect, appConfig.leadOptions, state.statistic);
+        leadSelect.value = appConfig.leadOptions[0].key;
         handleChange();
       });
       leadSelect.addEventListener("change", handleChange);
@@ -507,7 +579,7 @@
               appConfig.leadOptions.push({ key: String(i), label: String(i) });
             }
           }
-          populateLeads(leadSelect, appConfig.leadOptions);
+          populateLeads(leadSelect, appConfig.leadOptions, state.statistic);
           leadSelect.value = appConfig.leadOptions[0].key;
           handleChange();
         });

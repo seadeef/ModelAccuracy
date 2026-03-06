@@ -7,8 +7,11 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
+import numpy as np
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from lead_windows import build_lead_options, normalize_lead_key
 from lead_config import LEAD_DAYS_MAX, LEAD_DAYS_MIN
@@ -18,6 +21,8 @@ from stats_query import DEFAULT_STATS_ROOT, stats_at_point
 MAPTILER_API_KEY = os.getenv("MAPTILER_API_KEY", "")
 MAPTILER_STYLE_ID = "streets-v2"
 ZIP_LOOKUP_CSV = Path(os.getenv("ZIP_LOOKUP_CSV", "zip_lookup.csv"))
+TILES_OUTPUT = Path(os.getenv("TILES_OUTPUT", "tiles_output"))
+US_CROP_BOUNDS = [-125.125, 23.875, -65.875, 50.125]  # pixel-snapped to 0.25° GFS grid
 
 app = FastAPI(title="Model Statistics Query API")
 
@@ -28,6 +33,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve pre-rendered PNG images for image-mode statistics.
+_images_dir = TILES_OUTPUT / "images"
+if _images_dir.exists():
+    app.mount("/images", StaticFiles(directory=str(_images_dir)), name="images")
 
 
 def _normalize_zip(zip_code: str) -> str | None:
@@ -64,6 +74,17 @@ def _load_zip_lookup(path_str: str) -> dict[str, dict[str, float]]:
     return lookup
 
 
+def _get_forecast_init_date() -> str | None:
+    meta_path = DEFAULT_STATS_ROOT / "forecast" / "metadata.npz"
+    if not meta_path.exists():
+        return None
+    try:
+        meta = np.load(meta_path, allow_pickle=True)
+        return str(meta["init_date"])
+    except (KeyError, Exception):
+        return None
+
+
 @app.get("/api/stats")
 def get_stats(
     lead: str = Query(..., pattern=r"^\d+([_-]\d+)?$"),
@@ -84,14 +105,23 @@ def get_stats(
 
 @app.get("/api/config")
 def get_config():
+    stat_info = {}
+    for name, plugin in sorted(STATISTICS_BY_NAME.items()):
+        info: dict = {"tile_mode": plugin.spec.tile_mode}
+        stat_info[name] = info
+
+    forecast_init_date = _get_forecast_init_date()
+
     return {
         "lead_days_min": LEAD_DAYS_MIN,
         "lead_days_max": LEAD_DAYS_MAX,
         "maptiler_api_key": MAPTILER_API_KEY,
         "maptiler_style_id": MAPTILER_STYLE_ID,
-        "statistics": sorted(STATISTICS_BY_NAME),
+        "statistics": stat_info,
         "default_statistic": "bias",
         "lead_options": build_lead_options(LEAD_DAYS_MIN, LEAD_DAYS_MAX),
+        "image_bounds": US_CROP_BOUNDS,
+        "forecast_init_date": forecast_init_date,
     }
 
 
