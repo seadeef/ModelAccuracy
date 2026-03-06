@@ -6,13 +6,18 @@ Downloads only PRISM ppt; output under prism_data/<year>/<YYYYMMDD>/.
 
 from __future__ import annotations
 
+import sys
 import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta
 
-from downloaders.base import BaseDownloader
+_this_dir = Path(__file__).resolve().parent
+sys.path.insert(0, str(_this_dir.parent))
+sys.path.insert(0, str(_this_dir))
+
+from base import BaseDownloader
 
 PRISM_VARIABLE = "ppt"
 

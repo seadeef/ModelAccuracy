@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta
-from downloaders.base import BaseDownloader
+
+_this_dir = Path(__file__).resolve().parent
+sys.path.insert(0, str(_this_dir.parent))
+sys.path.insert(0, str(_this_dir))
+
+from base import BaseDownloader
 from lead_config import FORECAST_HOURS
 
 # Fixed 12z cycle for GFS; used in remote paths and local dir names.
