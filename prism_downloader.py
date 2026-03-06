@@ -27,7 +27,7 @@ class PRISMDownloaderParallel(BaseDownloader):
     def __init__(
         self,
         output_dir: str | Path = "prism_data",
-        max_workers: int = 6,
+        max_workers: int = 12,
         max_retries: int = 3,
         timeout_seconds: int = 60,
         polite_delay_seconds: float = 0.0,
@@ -94,7 +94,7 @@ class PRISMDownloaderParallel(BaseDownloader):
                     total_size = int(r.headers.get("content-length", 0))
                     downloaded = 0
                     with open(tmp, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=1024 * 64):
+                        for chunk in r.iter_content(chunk_size=1024 * 256):
                             if chunk:
                                 f.write(chunk)
                                 downloaded += len(chunk)
@@ -174,7 +174,7 @@ class PRISMDownloaderParallel(BaseDownloader):
 if __name__ == "__main__":
     dl = PRISMDownloaderParallel(
         output_dir="prism_data",
-        max_workers=6,
+        max_workers=12,
         max_retries=3,
         timeout_seconds=60,
         polite_delay_seconds=0.0,

@@ -25,7 +25,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
     def __init__(
         self,
         output_dir: str = "model_data/gfs",
-        max_workers: int = 8,
+        max_workers: int = 16,
         max_retries: int = 3,
         timeout_seconds: int = 120,
         polite_delay_seconds: float = 0.0,
@@ -120,7 +120,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
                 resp = self.session.get(grib_url, headers=headers, stream=True, timeout=self.timeout_seconds)
                 resp.raise_for_status()
                 with open(part, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=1024 * 64):
+                    for chunk in resp.iter_content(chunk_size=1024 * 256):
                         if chunk:
                             f.write(chunk)
                 part.replace(out_file)
@@ -194,7 +194,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
 if __name__ == "__main__":
     downloader = GFSFilteredDownloaderParallel(
         output_dir="model_data/gfs",
-        max_workers=8,
+        max_workers=16,
         max_retries=3,
         timeout_seconds=120,
         polite_delay_seconds=0.0,

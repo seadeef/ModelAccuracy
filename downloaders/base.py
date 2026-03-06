@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 import requests
+from requests.adapters import HTTPAdapter
 
 T = TypeVar("T")
 
@@ -35,6 +36,11 @@ class BaseDownloader:
         self.polite_delay_seconds = polite_delay_seconds
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": user_agent})
+        # Match adapter pool size to worker concurrency so requests aren't serialized by small pools.
+        pool_size = max(16, self.max_workers * 4)
+        adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size, max_retries=0)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
     def _status_key(self, status: str) -> str:
         """Map raw status string to a count key. Override in subclasses."""
