@@ -37,7 +37,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             timeout_seconds=timeout_seconds,
             polite_delay_seconds=polite_delay_seconds,
             base_url="https://noaa-gfs-bdp-pds.s3.amazonaws.com",
-            user_agent="GFSFilteredDownloaderParallel/1.0 (+https://chatgpt.com)",
+            user_agent="GFSFilteredDownloaderParallel/1.0",
         )
 
     def _status_key(self, status: str) -> str:
@@ -135,6 +135,18 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
                 time.sleep(1.25 * attempt)
         return task, f"failed: {last_err}"
 
+    def download_date_range(
+        self,
+        start_date: str | datetime,
+        end_date: str | datetime,
+        *,
+        forecast_hours: list[int] = FORECAST_HOURS,
+        level: str = "surface",
+    ):
+        start = self._to_dt(start_date)
+        end = self._to_dt(end_date)
+        return self._download(start, end, forecast_hours=forecast_hours, level=level)
+
     def download_year_range(
         self,
         start_year: int,
@@ -145,6 +157,16 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
     ):
         start = datetime(int(start_year), 1, 1)
         end = datetime(int(end_year), 12, 31)
+        return self._download(start, end, forecast_hours=forecast_hours, level=level)
+
+    def _download(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        forecast_hours: list[int] = FORECAST_HOURS,
+        level: str = "surface",
+    ):
         init_dates: list[datetime] = []
         cur = datetime(start.year, start.month, start.day)
         end0 = datetime(end.year, end.month, end.day)
@@ -152,7 +174,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             init_dates.append(cur)
             cur += timedelta(days=1)
         if not init_dates:
-            raise ValueError("No init dates selected. Check start/end years.")
+            raise ValueError("No init dates selected. Check start/end dates.")
 
         tasks: list[DownloadTask] = []
         for d in init_dates:
@@ -192,16 +214,38 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Download GFS APCP forecasts")
+    parser.add_argument("--start-date", help="Start date (YYYY-MM-DD). Defaults to today.")
+    parser.add_argument("--end-date", help="End date (YYYY-MM-DD). Defaults to start date.")
+    parser.add_argument("--start-year", type=int, help="Start year (downloads full years)")
+    parser.add_argument("--end-year", type=int, help="End year (downloads full years)")
+    parser.add_argument("--level", default="surface")
+    parser.add_argument("--workers", type=int, default=16)
+    args = parser.parse_args()
+
     downloader = GFSFilteredDownloaderParallel(
         output_dir="model_data/gfs",
-        max_workers=16,
+        max_workers=args.workers,
         max_retries=3,
         timeout_seconds=120,
         polite_delay_seconds=0.0,
     )
-    downloader.download_year_range(
-        start_year=2022,
-        end_year=2024,
-        level="surface",
-        forecast_hours=FORECAST_HOURS,
-    )
+
+    if args.start_year:
+        downloader.download_year_range(
+            start_year=args.start_year,
+            end_year=args.end_year or args.start_year,
+            level=args.level,
+            forecast_hours=FORECAST_HOURS,
+        )
+    else:
+        start = args.start_date or datetime.utcnow().strftime("%Y-%m-%d")
+        end = args.end_date or start
+        downloader.download_date_range(
+            start_date=start,
+            end_date=end,
+            level=args.level,
+            forecast_hours=FORECAST_HOURS,
+        )

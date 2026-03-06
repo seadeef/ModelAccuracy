@@ -40,7 +40,7 @@ class PRISMDownloaderParallel(BaseDownloader):
             timeout_seconds=timeout_seconds,
             polite_delay_seconds=polite_delay_seconds,
             base_url="https://ftp.prism.oregonstate.edu/time_series/us/an/4km",
-            user_agent="PRISMDownloaderParallel/1.0 (+https://chatgpt.com)",
+            user_agent="PRISMDownloaderParallel/1.0",
         )
         self.remove_zip_after_extract = bool(remove_zip_after_extract)
 
@@ -133,6 +133,14 @@ class PRISMDownloaderParallel(BaseDownloader):
             current += timedelta(days=1)
         return dates
 
+    def download_date_range(
+        self,
+        start_date: str | datetime,
+        end_date: str | datetime,
+        extract: bool = True,
+    ) -> None:
+        self._download(self._date_list(start_date, end_date), extract=extract)
+
     def download_year_range(
         self,
         start_year: int,
@@ -141,7 +149,11 @@ class PRISMDownloaderParallel(BaseDownloader):
     ) -> None:
         start_date = datetime(int(start_year), 1, 1)
         end_date = datetime(int(end_year), 12, 31)
-        dates = self._date_list(start_date, end_date)
+        self._download(self._date_list(start_date, end_date), extract=extract)
+
+    def _download(self, dates: list[datetime], extract: bool = True) -> None:
+        if not dates:
+            raise ValueError("No dates selected.")
         tasks = [PRISMTask(date=d, extract=extract) for d in dates]
 
         print("\n" + "=" * 70)
@@ -172,16 +184,38 @@ class PRISMDownloaderParallel(BaseDownloader):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Download PRISM daily precipitation")
+    parser.add_argument("--start-date", help="Start date (YYYY-MM-DD). Defaults to today.")
+    parser.add_argument("--end-date", help="End date (YYYY-MM-DD). Defaults to start date.")
+    parser.add_argument("--start-year", type=int, help="Start year (downloads full years)")
+    parser.add_argument("--end-year", type=int, help="End year (downloads full years)")
+    parser.add_argument("--no-extract", action="store_true", help="Skip zip extraction")
+    parser.add_argument("--workers", type=int, default=12)
+    args = parser.parse_args()
+
     dl = PRISMDownloaderParallel(
         output_dir="prism_data",
-        max_workers=12,
+        max_workers=args.workers,
         max_retries=3,
         timeout_seconds=60,
         polite_delay_seconds=0.0,
         remove_zip_after_extract=True,
     )
-    dl.download_year_range(
-        start_year=2022,
-        end_year=2024,
-        extract=True
-    )
+
+    extract = not args.no_extract
+    if args.start_year:
+        dl.download_year_range(
+            start_year=args.start_year,
+            end_year=args.end_year or args.start_year,
+            extract=extract,
+        )
+    else:
+        start = args.start_date or datetime.utcnow().strftime("%Y-%m-%d")
+        end = args.end_date or start
+        dl.download_date_range(
+            start_date=start,
+            end_date=end,
+            extract=extract,
+        )
