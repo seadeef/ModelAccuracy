@@ -4,11 +4,12 @@ from __future__ import annotations
 import os
 import re
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from lead_windows import LEAD_WINDOWS, window_to_key
@@ -41,13 +42,54 @@ PRISM_DIR = Path("prism_data")
 OUTPUT_ROOT = Path("stats")
 
 GFS_FILE_RE = re.compile(r"f(?P<fhour>\d{3})_(?P<level>[^.]+)\.grib2$")
-PRISM_CACHE_MAX_ITEMS = 32
-_PRISM_CACHE: dict[str, tuple[np.ndarray, rasterio.Affine, str]] = {}
-_PRISM_CACHE_ORDER: list[str] = []
 
-REPROJECTED_CACHE_MAX_ITEMS = 32
-_REPROJECTED_CACHE: dict[str, np.ndarray] = {}
-_REPROJECTED_CACHE_ORDER: list[str] = []
+THREADS_PER_PROCESS = 4
+CACHE_MAX_ITEMS = 32
+
+
+class _ReprojectionCache:
+    """Per-process LRU cache for PRISM reads and reprojections."""
+
+    def __init__(self, max_items: int = CACHE_MAX_ITEMS):
+        self._max_items = max_items
+        self._prism_cache: dict[str, tuple[np.ndarray, rasterio.Affine, str]] = {}
+        self._prism_order: list[str] = []
+        self._reproj_cache: dict[str, np.ndarray] = {}
+        self._reproj_order: list[str] = []
+
+    def read_prism(self, prism_path: Path) -> tuple[np.ndarray, rasterio.Affine, str]:
+        key = str(prism_path)
+        cached = self._prism_cache.get(key)
+        if cached is not None:
+            return cached
+        value = _read_prism_ppt(prism_path)
+        self._prism_cache[key] = value
+        self._prism_order.append(key)
+        if len(self._prism_order) > self._max_items:
+            old_key = self._prism_order.pop(0)
+            self._prism_cache.pop(old_key, None)
+        return value
+
+    def reproject_prism(
+        self,
+        prism_path: Path,
+        gfs_shape: Tuple[int, int],
+        gfs_transform: rasterio.Affine,
+    ) -> np.ndarray:
+        key = str(prism_path)
+        cached = self._reproj_cache.get(key)
+        if cached is not None:
+            return cached
+        prism_data, prism_transform, prism_crs = self.read_prism(prism_path)
+        reprojected = _reproject_prism_to_gfs(
+            prism_data, prism_transform, prism_crs, gfs_shape, gfs_transform,
+        )
+        self._reproj_cache[key] = reprojected
+        self._reproj_order.append(key)
+        if len(self._reproj_order) > self._max_items:
+            old_key = self._reproj_order.pop(0)
+            self._reproj_cache.pop(old_key, None)
+        return reprojected
 
 
 @dataclass(frozen=True)
@@ -80,6 +122,23 @@ def _list_gfs_inits() -> list[Path]:
             if init_dir.is_dir() and init_dir.name.endswith("_12z"):
                 init_dirs.append(init_dir)
     return init_dirs
+
+
+def _group_inits_by_year(init_dirs: list[Path]) -> dict[int, list[Path]]:
+    by_year: dict[int, list[Path]] = defaultdict(list)
+    for d in init_dirs:
+        year = int(d.parent.name)
+        by_year[year].append(d)
+    return dict(sorted(by_year.items()))
+
+
+def _distribute_years(
+    year_items: list[tuple[int, list[Path]]], num_chunks: int
+) -> list[list[tuple[int, list[Path]]]]:
+    chunks: list[list[tuple[int, list[Path]]]] = [[] for _ in range(num_chunks)]
+    for i, item in enumerate(year_items):
+        chunks[i % num_chunks].append(item)
+    return [c for c in chunks if c]
 
 
 def _get_prism_tif_path(date: datetime) -> Path:
@@ -133,46 +192,6 @@ def _read_prism_ppt(prism_path: Path) -> Tuple[np.ndarray, rasterio.Affine, str]
         return data, src.transform, str(src.crs)
 
 
-def _read_prism_ppt_cached(prism_path: Path) -> Tuple[np.ndarray, rasterio.Affine, str]:
-    key = str(prism_path)
-    cached = _PRISM_CACHE.get(key)
-    if cached is not None:
-        return cached
-    value = _read_prism_ppt(prism_path)
-    _PRISM_CACHE[key] = value
-    _PRISM_CACHE_ORDER.append(key)
-    if len(_PRISM_CACHE_ORDER) > PRISM_CACHE_MAX_ITEMS:
-        old_key = _PRISM_CACHE_ORDER.pop(0)
-        _PRISM_CACHE.pop(old_key, None)
-    return value
-
-
-def _reproject_prism_cached(
-    prism_path: Path,
-    gfs_shape: Tuple[int, int],
-    gfs_transform: rasterio.Affine,
-) -> np.ndarray:
-    """Read and reproject PRISM to the GFS grid, caching by PRISM file path.
-
-    The GFS grid is identical across all tasks, so the PRISM file path is a
-    sufficient cache key.
-    """
-    key = str(prism_path)
-    cached = _REPROJECTED_CACHE.get(key)
-    if cached is not None:
-        return cached
-    prism_data, prism_transform, prism_crs = _read_prism_ppt_cached(prism_path)
-    reprojected = _reproject_prism_to_gfs(
-        prism_data, prism_transform, prism_crs, gfs_shape, gfs_transform,
-    )
-    _REPROJECTED_CACHE[key] = reprojected
-    _REPROJECTED_CACHE_ORDER.append(key)
-    if len(_REPROJECTED_CACHE_ORDER) > REPROJECTED_CACHE_MAX_ITEMS:
-        old_key = _REPROJECTED_CACHE_ORDER.pop(0)
-        _REPROJECTED_CACHE.pop(old_key, None)
-    return reprojected
-
-
 def _grid_coords_from_transform(
     transform: rasterio.Affine, height: int, width: int
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -219,11 +238,41 @@ def _affine_to_tuple(transform: rasterio.Affine) -> Tuple[float, float, float, f
     )
 
 
-def _build_stats_tasks() -> Tuple[list[StatsTask], int]:
+def _validate_or_build_grid_meta(
+    grid_meta: GridMeta | None,
+    transform_tuple: Tuple[float, float, float, float, float, float],
+    grid_crs: str,
+    grid_shape: Tuple[int, int],
+) -> GridMeta:
+    grid_transform = rasterio.Affine(*transform_tuple)
+    if grid_meta is None:
+        grid_lats, grid_lons = _grid_coords_from_transform(
+            grid_transform, grid_shape[0], grid_shape[1]
+        )
+        return GridMeta(
+            transform=grid_transform,
+            crs=grid_crs,
+            lats=grid_lats,
+            lons=grid_lons,
+        )
+
+    if (
+        _affine_to_tuple(grid_meta.transform) != transform_tuple
+        or grid_crs != grid_meta.crs
+        or grid_shape != (grid_meta.lats.size, grid_meta.lons.size)
+    ):
+        raise RuntimeError(
+            "GFS grid mismatch across dates. "
+            "Expected consistent GFS grid for all tasks."
+        )
+    return grid_meta
+
+
+def _build_tasks_for_inits(init_dirs: list[Path]) -> Tuple[list[StatsTask], int]:
     tasks: list[StatsTask] = []
     skipped_partial_files = 0
 
-    for init_dir in _list_gfs_inits():
+    for init_dir in init_dirs:
         init_date = _parse_init_date(init_dir.name)
 
         for grib_path in sorted(init_dir.iterdir()):
@@ -256,91 +305,217 @@ def _build_stats_tasks() -> Tuple[list[StatsTask], int]:
     return tasks, skipped_partial_files
 
 
+def _process_single_task(
+    task: StatsTask,
+    cache: _ReprojectionCache,
+) -> Tuple[
+    int,
+    Dict[str, Dict[str, np.ndarray]],
+    Tuple[float, float, float, float, float, float],
+    Tuple[int, int],
+]:
+    """Process one task and return per-lead accumulator deltas.
 
-def _validate_or_build_grid_meta(
-    grid_meta: GridMeta | None,
-    transform_tuple: Tuple[float, float, float, float, float, float],
-    grid_crs: str,
-    grid_shape: Tuple[int, int],
-) -> GridMeta:
-    grid_transform = rasterio.Affine(*transform_tuple)
-    if grid_meta is None:
-        grid_lats, grid_lons = _grid_coords_from_transform(
-            grid_transform, grid_shape[0], grid_shape[1]
-        )
-        return GridMeta(
-            transform=grid_transform,
-            crs=grid_crs,
-            lats=grid_lats,
-            lons=grid_lons,
-        )
+    Returns (lead_days, stat_accumulators, transform_tuple, grid_shape).
+    The accumulators contain one sample's contribution so the caller can merge.
+    """
+    gfs_data, gfs_lats, gfs_lons = _read_gfs_apcp(task.grib_path)
+    gfs_tf = _gfs_transform(gfs_lats, gfs_lons)
+    transform_tuple = _affine_to_tuple(gfs_tf)
 
-    if (
-        _affine_to_tuple(grid_meta.transform) != transform_tuple
-        or grid_crs != grid_meta.crs
-        or grid_shape != (grid_meta.lats.size, grid_meta.lons.size)
-    ):
-        raise RuntimeError(
-            "GFS grid mismatch across dates. "
-            "Expected consistent GFS grid for all tasks."
-        )
-    return grid_meta
+    prism_on_gfs = cache.reproject_prism(
+        task.prism_path, gfs_data.shape, gfs_tf,
+    )
+    valid_mask = np.isfinite(gfs_data) & np.isfinite(prism_on_gfs)
+    diff = gfs_data - prism_on_gfs
+    derived = {
+        "diff": diff,
+        "abs_diff": np.abs(diff),
+        "sq_diff": diff * diff,
+    }
 
+    stat_accs: Dict[str, Dict[str, np.ndarray]] = {}
+    for plugin in ENABLED_STATISTICS:
+        acc = plugin.init_accumulator(gfs_data.shape)
+        plugin.update(acc, gfs_data, prism_on_gfs, valid_mask, derived=derived)
+        stat_accs[plugin.spec.name] = acc
+
+    return task.lead_days, stat_accs, transform_tuple, gfs_data.shape
+
+
+def _merge_task_result(
+    accumulators: Dict[int, Dict[str, Dict[str, np.ndarray]]],
+    lead_days: int,
+    stat_accs: Dict[str, Dict[str, np.ndarray]],
+) -> None:
+    """Merge a single task's accumulator deltas into the running totals."""
+    lead_stats = accumulators.get(lead_days)
+    if lead_stats is None:
+        # First time seeing this lead — take ownership of the arrays.
+        accumulators[lead_days] = {
+            stat: {k: v.copy() for k, v in acc.items()}
+            for stat, acc in stat_accs.items()
+        }
+        return
+    for stat, acc in stat_accs.items():
+        existing = lead_stats.get(stat)
+        if existing is None:
+            lead_stats[stat] = {k: v.copy() for k, v in acc.items()}
+        else:
+            for key, arr in acc.items():
+                existing[key] += arr
+
+
+def _compute_years_chunk(
+    year_init_dirs: list[tuple[int, list[Path]]],
+) -> Tuple[
+    Dict[int, Dict[str, Dict[str, np.ndarray]]],
+    Tuple[float, float, float, float, float, float] | None,
+    Tuple[int, int] | None,
+    int,
+    int,
+]:
+    """Process a chunk of years. Runs in a child process.
+
+    Uses a ThreadPoolExecutor internally to overlap I/O (rasterio reproject
+    releases the GIL). The reprojection cache is local to this process and
+    shared safely across threads under CPython's GIL.
+
+    Returns (accumulators, transform_tuple, grid_shape, task_count, skipped).
+    """
+    cache = _ReprojectionCache()
+    accumulators: Dict[int, Dict[str, Dict[str, np.ndarray]]] = {}
+    grid_transform_tuple: Tuple[float, float, float, float, float, float] | None = None
+    grid_shape: Tuple[int, int] | None = None
+    total_tasks = 0
+    total_skipped = 0
+
+    # Collect all tasks across years in this chunk, preserving date order.
+    all_tasks: list[StatsTask] = []
+    for _year, init_dirs in year_init_dirs:
+        tasks, skipped = _build_tasks_for_inits(init_dirs)
+        all_tasks.extend(tasks)
+        total_skipped += skipped
+
+    if not all_tasks:
+        return accumulators, grid_transform_tuple, grid_shape, 0, total_skipped
+
+    def process_task(task: StatsTask):
+        return _process_single_task(task, cache)
+
+    with ThreadPoolExecutor(max_workers=THREADS_PER_PROCESS) as executor:
+        futures = {executor.submit(process_task, t): t for t in all_tasks}
+        for future in as_completed(futures):
+            task = futures[future]
+            try:
+                lead_days, stat_accs, t_tuple, shape = future.result()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed task for {task.grib_path} "
+                    f"(valid date {task.valid_date:%Y-%m-%d})"
+                ) from exc
+
+            # Validate grid consistency.
+            if grid_transform_tuple is None:
+                grid_transform_tuple = t_tuple
+                grid_shape = shape
+            elif grid_transform_tuple != t_tuple or grid_shape != shape:
+                raise RuntimeError(
+                    "GFS grid mismatch across dates within process."
+                )
+
+            _merge_task_result(accumulators, lead_days, stat_accs)
+            total_tasks += 1
+
+    return accumulators, grid_transform_tuple, grid_shape, total_tasks, total_skipped
+
+
+def _merge_chunk_accumulators(
+    results: list[Dict[int, Dict[str, Dict[str, np.ndarray]]]],
+) -> Dict[int, Dict[str, Dict[str, np.ndarray]]]:
+    """Merge accumulators from multiple process chunks by summing arrays."""
+    merged: Dict[int, Dict[str, Dict[str, np.ndarray]]] = {}
+    for chunk_acc in results:
+        for lead, stats in chunk_acc.items():
+            if lead not in merged:
+                merged[lead] = {
+                    stat: {k: v.copy() for k, v in acc.items()}
+                    for stat, acc in stats.items()
+                }
+            else:
+                for stat, acc in stats.items():
+                    if stat not in merged[lead]:
+                        merged[lead][stat] = {k: v.copy() for k, v in acc.items()}
+                    else:
+                        for key, arr in acc.items():
+                            merged[lead][stat][key] += arr
+    return merged
 
 
 def _compute_lead_stats() -> Tuple[
     Dict[int, Dict[str, Dict[str, np.ndarray]]], GridMeta, int
 ]:
-    accumulators: Dict[int, Dict[str, Dict[str, np.ndarray]]] = {}
-    grid_meta: GridMeta | None = None
-    tasks, skipped_partial_files = _build_stats_tasks()
-    if not tasks:
-        raise RuntimeError("No GFS/PRISM overlaps found. Check data paths.")
+    init_dirs = _list_gfs_inits()
+    if not init_dirs:
+        raise RuntimeError("No GFS init dirs found. Check data paths.")
 
-    total = len(tasks)
-    print(f"Processing {total} tasks in a single process...")
+    by_year = _group_inits_by_year(init_dirs)
+    year_items = list(by_year.items())
+    num_workers = min(len(year_items), max(1, os.cpu_count() or 1))
+    chunks = _distribute_years(year_items, num_workers)
 
-    for i, task in enumerate(tasks, start=1):
-        gfs_data, gfs_lats, gfs_lons = _read_gfs_apcp(task.grib_path)
-        gfs_tf = _gfs_transform(gfs_lats, gfs_lons)
+    print(
+        f"Found {len(year_items)} year(s) of data, "
+        f"dispatching to {len(chunks)} process(es) "
+        f"with {THREADS_PER_PROCESS} threads each..."
+    )
+    for chunk in chunks:
+        years_str = ", ".join(str(y) for y, _ in chunk)
+        print(f"  Process chunk: years [{years_str}]")
 
-        # Validate grid consistency
-        transform_tuple = _affine_to_tuple(gfs_tf)
-        grid_meta = _validate_or_build_grid_meta(
-            grid_meta, transform_tuple, "EPSG:4326", gfs_data.shape
-        )
+    total_tasks = 0
+    total_skipped = 0
+    chunk_accumulators: list[Dict[int, Dict[str, Dict[str, np.ndarray]]]] = []
+    grid_transform_tuple: Tuple[float, float, float, float, float, float] | None = None
+    grid_shape: Tuple[int, int] | None = None
 
-        prism_on_gfs = _reproject_prism_cached(
-            task.prism_path, gfs_data.shape, gfs_tf,
-        )
-        valid_mask = np.isfinite(gfs_data) & np.isfinite(prism_on_gfs)
-        diff = gfs_data - prism_on_gfs
-        derived = {
-            "diff": diff,
-            "abs_diff": np.abs(diff),
-            "sq_diff": diff * diff,
+    with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
+        futures = {
+            pool.submit(_compute_years_chunk, chunk): i
+            for i, chunk in enumerate(chunks)
         }
+        for future in as_completed(futures):
+            chunk_idx = futures[future]
+            acc, t_tuple, shape, task_count, skipped = future.result()
+            total_tasks += task_count
+            total_skipped += skipped
 
-        lead_stats = accumulators.setdefault(task.lead_days, {})
-        for plugin in ENABLED_STATISTICS:
-            stat_name = plugin.spec.name
-            if stat_name not in lead_stats:
-                lead_stats[stat_name] = plugin.init_accumulator(gfs_data.shape)
-            plugin.update(
-                lead_stats[stat_name],
-                gfs_data,
-                prism_on_gfs,
-                valid_mask,
-                derived=derived,
+            if task_count > 0:
+                chunk_accumulators.append(acc)
+                if grid_transform_tuple is None:
+                    grid_transform_tuple = t_tuple
+                    grid_shape = shape
+                elif grid_transform_tuple != t_tuple or grid_shape != shape:
+                    raise RuntimeError(
+                        "GFS grid mismatch across processes."
+                    )
+
+            chunk_years = ", ".join(
+                str(y) for y, _ in chunks[chunk_idx]
             )
+            print(f"  Chunk [{chunk_years}] done: {task_count} tasks")
 
-        if i % 500 == 0 or i == total:
-            print(f"  Progress: {i}/{total} tasks...")
-
-    if grid_meta is None:
+    if grid_transform_tuple is None or grid_shape is None:
         raise RuntimeError("No GFS/PRISM overlaps found. Check data paths.")
 
-    return accumulators, grid_meta, skipped_partial_files
+    print(f"Total tasks processed: {total_tasks}")
+
+    merged = _merge_chunk_accumulators(chunk_accumulators)
+    grid_meta = _validate_or_build_grid_meta(
+        None, grid_transform_tuple, "EPSG:4326", grid_shape
+    )
+
+    return merged, grid_meta, total_skipped
 
 
 def _write_stats(
