@@ -24,3 +24,4 @@ tiles_output/
 *.swp
 *.swo
 .claude
+.cursor
