@@ -20,10 +20,10 @@ def _load_metadata(stats_root_str: str, stat_name: str) -> tuple[np.ndarray, np.
 
 
 @lru_cache(maxsize=256)
-def _load_stat_values(stats_root_str: str, stat_name: str, lead_key: str) -> np.ndarray:
+def _load_stat_values(stats_root_str: str, stat_name: str, lead_key: str, field: str) -> np.ndarray:
     stats_dir = Path(stats_root_str) / stat_name
     tile = np.load(stats_dir / f"lead_{lead_key}.npz", allow_pickle=False)
-    return tile["value"]
+    return tile[field]
 
 
 def stats_at_point(
@@ -42,7 +42,16 @@ def stats_at_point(
         lats, lons = _load_metadata(str(stats_root), stat_name)
         lat_idx = int(np.argmin(np.abs(lats - lat)))
         lon_idx = int(np.argmin(np.abs(lons - lon)))
-        values = _load_stat_values(str(stats_root), stat_name, lead_key)
+        field = plugin.spec.render_field
+        try:
+            values = _load_stat_values(str(stats_root), stat_name, lead_key, field)
+        except (FileNotFoundError, KeyError):
+            result[stat_name] = {
+                "value": None,
+                "units": plugin.spec.units,
+                "no_data": True,
+            }
+            continue
         value = float(values[lat_idx, lon_idx])
 
         if np.isnan(value):

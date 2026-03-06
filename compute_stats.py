@@ -14,7 +14,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 from lead_windows import LEAD_WINDOWS, window_to_key
 from lead_config import LEAD_DAYS_MAX, LEAD_DAYS_MIN
-from statistics_plugins.registry import ENABLED_STATISTICS
+from statistics_plugins.registry import VERIFICATION_STATISTICS
 
 try:
     import xarray as xr
@@ -335,7 +335,7 @@ def _process_single_task(
     }
 
     stat_accs: Dict[str, Dict[str, np.ndarray]] = {}
-    for plugin in ENABLED_STATISTICS:
+    for plugin in VERIFICATION_STATISTICS:
         acc = plugin.init_accumulator(gfs_data.shape)
         plugin.update(acc, gfs_data, prism_on_gfs, valid_mask, derived=derived)
         stat_accs[plugin.spec.name] = acc
@@ -524,7 +524,7 @@ def _write_stats(
 ) -> None:
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    for plugin in ENABLED_STATISTICS:
+    for plugin in VERIFICATION_STATISTICS:
         stat_dir = OUTPUT_ROOT / plugin.spec.name
         stat_dir.mkdir(parents=True, exist_ok=True)
         np.savez_compressed(
@@ -629,7 +629,7 @@ def preconvert_grib2_to_npy() -> None:
 
 
 def main() -> None:
-    stat_names = ", ".join(plugin.spec.name for plugin in ENABLED_STATISTICS)
+    stat_names = ", ".join(plugin.spec.name for plugin in VERIFICATION_STATISTICS)
     print(
         "Computing statistics on native GFS grid. "
         f"Enabled statistics: {stat_names}"
