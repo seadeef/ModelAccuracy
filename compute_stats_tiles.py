@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import subprocess
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -185,13 +184,21 @@ def quantize_to_int16(values: np.ndarray, vmin: float, vmax: float) -> tuple[np.
     return quant, float(scale), float(offset)
 
 
-def diverging_colormap(data: np.ndarray, vmin: float, vmax: float, mask: np.ndarray) -> np.ndarray:
+def diverging_colormap(
+    data: np.ndarray, vmin: float, vmax: float, mask: np.ndarray, gamma: float = 0.7,
+) -> np.ndarray:
     blue = np.array([44, 123, 182], dtype=np.float32)
     white = np.array([255, 255, 255], dtype=np.float32)
     red = np.array([215, 25, 28], dtype=np.float32)
     valid = mask & np.isfinite(data)
     denom = vmax - vmin if vmax != vmin else 1.0
     t = np.clip((data - vmin) / denom, 0.0, 1.0)
+
+    # Apply gamma symmetrically around the midpoint so small deviations
+    # from zero get more color separation while preserving the scale.
+    dist = np.abs(t - 0.5) * 2.0
+    mapped = np.power(dist, gamma)
+    t = np.where(t <= 0.5, 0.5 - 0.5 * mapped, 0.5 + 0.5 * mapped)
 
     rgb = np.zeros((data.shape[0], data.shape[1], 3), dtype=np.float32)
     lower = (t <= 0.5) & valid
@@ -326,7 +333,7 @@ def export_pmtiles(
     ]
     if jobs is not None:
         cmd.extend(["-j", str(jobs)])
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def edit_pmtiles_header(
@@ -468,10 +475,7 @@ def main() -> None:
     metadata_root = args.output_dir / "metadata"
     tmp_root = args.output_dir / "tmp"
 
-    # Determine parallelism: outer pool always uses CPU count; rio pmtiles
-    # uses --jobs if provided, otherwise its own default.
-    outer_workers = os.cpu_count() or 1
-    rio_jobs = args.jobs  # None means rio pmtiles picks its own default
+    rio_jobs = args.jobs
 
     # Collect all (stat, lead) tasks up-front so we can submit them in bulk.
     tasks: list[dict] = []
@@ -550,20 +554,11 @@ def main() -> None:
     if total == 0:
         print("No layers to process.")
     else:
-        print(f"Processing {total} layer(s) with up to {outer_workers} workers …")
-        completed = 0
-        with ProcessPoolExecutor(max_workers=outer_workers) as pool:
-            futures = {pool.submit(_process_layer, **t): t for t in tasks}
-            for future in as_completed(futures):
-                task_info = futures[future]
-                label = f"{task_info['stat_name']}/lead_{task_info['lead_key']}"
-                try:
-                    future.result()
-                except Exception as exc:
-                    print(f"FAILED {label}: {exc}")
-                    raise
-                completed += 1
-                print(f"  [{completed}/{total}] {label}")
+        print(f"Processing {total} layer(s) sequentially (rio pmtiles handles parallelism) …")
+        for i, t in enumerate(tasks, start=1):
+            label = f"{t['stat_name']}/lead_{t['lead_key']}"
+            print(f"  [{i}/{total}] {label} …", flush=True)
+            _process_layer(**t)
 
     if tmp_root.exists():
         shutil.rmtree(tmp_root)

@@ -202,7 +202,7 @@ def _reproject_prism_to_gfs(
         src_crs=prism_crs,
         dst_transform=gfs_transform,
         dst_crs="EPSG:4326",
-        resampling=Resampling.bilinear,
+        resampling=Resampling.nearest,
         dst_nodata=np.nan,
     )
     return dst
