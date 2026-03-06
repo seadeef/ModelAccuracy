@@ -47,6 +47,10 @@
   <body>
     <div class="controls">
       <label>
+        Statistic
+        <select id="statSelect"></select>
+      </label>
+      <label>
         Lead (days)
         <select id="leadSelect"></select>
       </label>
@@ -98,10 +102,14 @@
       const appConfig = {
         leadDaysMin: 1,
         leadDaysMax: 14,
+        leadOptions: [],
         maptilerApiKey: "",
         maptilerStyleId: DEFAULT_MAPTILER_STYLE_ID,
+        statistics: ["bias"],
+        defaultStatistic: "bias",
       };
       const state = {
+        statistic: "bias",
         mode: "both",
         detailMode: "low",
         weatherOpacity: 0.85,
@@ -117,8 +125,8 @@
         return `https://api.maptiler.com/maps/${appConfig.maptilerStyleId}/style.json?key=${appConfig.maptilerApiKey}`;
       }
 
-      function tilesetId(lead) {
-        return `lead_${lead}`;
+      function tilesetId(statistic, lead) {
+        return `${statistic}/lead_${lead}`;
       }
 
       function setStatus(message) {
@@ -240,11 +248,11 @@
         return undefined;
       }
 
-      async function loadTileset(lead) {
+      async function loadTileset(statistic, lead) {
         if (!map) {
           return;
         }
-        const id = tilesetId(lead);
+        const id = tilesetId(statistic, lead);
         const tilejsonUrl = `${BASE_URL}/${id}.json`;
         setStatus(`Loading ${id}...`);
 
@@ -321,12 +329,22 @@
         setStatus(`Showing ${id}`);
       }
 
-      function populateLeads(selectEl, minLead, maxLead) {
+      function populateLeads(selectEl, options) {
         selectEl.innerHTML = "";
-        for (let i = minLead; i <= maxLead; i += 1) {
+        for (const option of options) {
           const opt = document.createElement("option");
-          opt.value = String(i);
-          opt.textContent = String(i);
+          opt.value = option.key;
+          opt.textContent = option.label;
+          selectEl.appendChild(opt);
+        }
+      }
+
+      function populateStatistics(selectEl, statistics) {
+        selectEl.innerHTML = "";
+        for (const statName of statistics) {
+          const opt = document.createElement("option");
+          opt.value = statName;
+          opt.textContent = statName;
           selectEl.appendChild(opt);
         }
       }
@@ -354,11 +372,24 @@
           if (typeof data.maptiler_style_id === "string" && data.maptiler_style_id.trim()) {
             appConfig.maptilerStyleId = data.maptiler_style_id.trim();
           }
+          if (Array.isArray(data.statistics) && data.statistics.length > 0) {
+            appConfig.statistics = data.statistics.map(String);
+          }
+          if (
+            typeof data.default_statistic === "string" &&
+            appConfig.statistics.includes(data.default_statistic)
+          ) {
+            appConfig.defaultStatistic = data.default_statistic;
+          }
+          if (Array.isArray(data.lead_options) && data.lead_options.length > 0) {
+            appConfig.leadOptions = data.lead_options;
+          }
         } catch (err) {
           // Keep defaults when API config is unavailable.
         }
       }
 
+      const statSelect = document.getElementById("statSelect");
       const leadSelect = document.getElementById("leadSelect");
       const modeSelect = document.getElementById("modeSelect");
       const detailSelect = document.getElementById("detailSelect");
@@ -368,6 +399,7 @@
       const landmarksOpacityValue = document.getElementById("landmarksOpacityValue");
       const zipInput = document.getElementById("zipInput");
       const zipGoButton = document.getElementById("zipGoButton");
+      statSelect.value = state.statistic;
       modeSelect.value = state.mode;
       detailSelect.value = state.detailMode;
       weatherOpacityInput.value = String(state.weatherOpacity);
@@ -379,7 +411,7 @@
         if (!map) {
           return;
         }
-        loadTileset(Number(leadSelect.value));
+        loadTileset(state.statistic, leadSelect.value);
       }
 
       async function goToZip() {
@@ -425,6 +457,10 @@
         }
       }
 
+      statSelect.addEventListener("change", () => {
+        state.statistic = statSelect.value;
+        handleChange();
+      });
       leadSelect.addEventListener("change", handleChange);
       modeSelect.addEventListener("change", () => {
         state.mode = modeSelect.value;
@@ -462,15 +498,24 @@
           if (!appConfig.maptilerApiKey) {
             setStatus("Using fallback basemap; set MAPTILER_API_KEY in backend env to enable MapTiler.");
           }
-          populateLeads(leadSelect, appConfig.leadDaysMin, appConfig.leadDaysMax);
-          leadSelect.value = String(appConfig.leadDaysMin);
+          populateStatistics(statSelect, appConfig.statistics);
+          state.statistic = appConfig.defaultStatistic;
+          statSelect.value = state.statistic;
+          if (appConfig.leadOptions.length === 0) {
+            appConfig.leadOptions = [];
+            for (let i = appConfig.leadDaysMin; i <= appConfig.leadDaysMax; i += 1) {
+              appConfig.leadOptions.push({ key: String(i), label: String(i) });
+            }
+          }
+          populateLeads(leadSelect, appConfig.leadOptions);
+          leadSelect.value = appConfig.leadOptions[0].key;
           handleChange();
         });
 
         map.on("click", async (event) => {
           const { lng, lat } = event.lngLat;
-          const lead = Number(leadSelect.value);
-          const url = `${API_BASE_URL}/api/bias?lead=${lead}&lat=${lat}&lon=${lng}`;
+          const lead = leadSelect.value;
+          const url = `${API_BASE_URL}/api/stats?lead=${encodeURIComponent(lead)}&lat=${lat}&lon=${lng}`;
           let text = "Loading...";
           try {
             const resp = await fetch(url);
@@ -478,10 +523,18 @@
               text = `Query failed (${resp.status})`;
             } else {
               const data = await resp.json();
-              if (data.no_data) {
+              const stats = data.stats || {};
+              const entries = Object.entries(stats);
+              if (entries.length === 0) {
                 text = "No data";
               } else {
-                text = `${data.value.toFixed(2)} mm`;
+                const lines = entries.map(([name, stat]) => {
+                  if (stat.no_data || stat.value === null) {
+                    return `${name}: No data`;
+                  }
+                  return `${name}: ${Number(stat.value).toFixed(2)} ${stat.units}`;
+                });
+                text = lines.join("<br />");
               }
             }
           } catch (err) {
