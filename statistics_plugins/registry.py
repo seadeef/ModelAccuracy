@@ -22,6 +22,7 @@ DISPLAY_STATISTICS: list[StatisticPlugin] = [
 ]
 
 # All statistics (used by tile generator, API, frontend).
-ENABLED_STATISTICS: list[StatisticPlugin] = VERIFICATION_STATISTICS + DISPLAY_STATISTICS
+# Forecast first so it's the default in the UI.
+ENABLED_STATISTICS: list[StatisticPlugin] = DISPLAY_STATISTICS + VERIFICATION_STATISTICS
 
 STATISTICS_BY_NAME = {plugin.spec.name: plugin for plugin in ENABLED_STATISTICS}
