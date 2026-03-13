@@ -13,10 +13,9 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from lead_windows import build_lead_options, normalize_lead_key
-from lead_config import LEAD_DAYS_MAX, LEAD_DAYS_MIN
+from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from statistics_plugins.registry import STATISTICS_BY_NAME
-from stats_query import DEFAULT_STATS_ROOT, stats_at_point
+from stats_query import stats_at_point
 
 MAPTILER_API_KEY = os.getenv("MAPTILER_API_KEY", "")
 MAPTILER_STYLE_ID = "streets-v2"
@@ -74,8 +73,11 @@ def _load_zip_lookup(path_str: str) -> dict[str, dict[str, float]]:
     return lookup
 
 
-def _get_forecast_init_date() -> str | None:
-    meta_path = DEFAULT_STATS_ROOT / "forecast" / "metadata.npz"
+STATS_ROOT = Path("stats")
+
+
+def _get_forecast_init_date(model_key: str) -> str | None:
+    meta_path = STATS_ROOT / model_key / "forecast" / "metadata.npz"
     if not meta_path.exists():
         return None
     try:
@@ -87,15 +89,18 @@ def _get_forecast_init_date() -> str | None:
 
 @app.get("/api/stats")
 def get_stats(
+    model: str = Query(DEFAULT_MODEL),
     lead: str = Query(..., pattern=r"^\d+([_-]\d+)?$"),
     lat: float = Query(..., ge=-90.0, le=90.0),
     lon: float = Query(..., ge=-180.0, le=180.0),
-    stats_root: str | None = None,
 ):
-    lead_key = normalize_lead_key(lead)
-    stats_path = Path(stats_root) if stats_root else DEFAULT_STATS_ROOT
+    if model not in MODEL_REGISTRY:
+        return {"error": f"Unknown model: {model}"}
+    lead_key = lead
+    stats_path = STATS_ROOT / model
     values = stats_at_point(lat, lon, lead_key, stats_root=stats_path)
     return {
+        "model": model,
         "lead": lead_key,
         "lat": lat,
         "lon": lon,
@@ -110,18 +115,29 @@ def get_config():
         info: dict = {"tile_mode": plugin.spec.tile_mode}
         stat_info[name] = info
 
-    forecast_init_date = _get_forecast_init_date()
+    models = []
+    forecast_init_dates = {}
+    for key, config in sorted(MODEL_REGISTRY.items()):
+        models.append({
+            "key": config.key,
+            "label": config.label,
+            "lead_days_min": config.lead_days_min,
+            "lead_days_max": config.lead_days_max,
+            "lead_windows": [list(w) for w in config.lead_windows],
+        })
+        init_date = _get_forecast_init_date(key)
+        if init_date is not None:
+            forecast_init_dates[key] = init_date
 
     return {
-        "lead_days_min": LEAD_DAYS_MIN,
-        "lead_days_max": LEAD_DAYS_MAX,
+        "models": models,
+        "default_model": DEFAULT_MODEL,
         "maptiler_api_key": MAPTILER_API_KEY,
         "maptiler_style_id": MAPTILER_STYLE_ID,
         "statistics": stat_info,
         "default_statistic": "bias",
-        "lead_options": build_lead_options(LEAD_DAYS_MIN, LEAD_DAYS_MAX),
         "image_bounds": US_CROP_BOUNDS,
-        "forecast_init_date": forecast_init_date,
+        "forecast_init_date": forecast_init_dates,
     }
 
 
