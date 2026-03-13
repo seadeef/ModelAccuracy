@@ -661,14 +661,19 @@ if __name__ == "__main__":
     import argparse as _argparse
 
     _parser = _argparse.ArgumentParser(description="Compute verification statistics")
-    _parser.add_argument("--model", default=DEFAULT_MODEL, choices=list(MODEL_REGISTRY),
-                         help="Model to compute statistics for")
+    _group = _parser.add_mutually_exclusive_group()
+    _group.add_argument("--model", default=None, choices=list(MODEL_REGISTRY),
+                        help="Model to compute statistics for")
+    _group.add_argument("--all", action="store_true",
+                        help="Compute statistics for all registered models")
     _parser.add_argument("--preconvert", action="store_true",
                          help="Convert GRIB2 files to .npy for fast reading")
     _args = _parser.parse_args()
 
-    if _args.preconvert:
-        _configure_for_model(_args.model)
-        preconvert_grib2_to_npy()
-    else:
-        main(_args.model)
+    _models = list(MODEL_REGISTRY) if _args.all else [_args.model or DEFAULT_MODEL]
+    for _model_key in _models:
+        if _args.preconvert:
+            _configure_for_model(_model_key)
+            preconvert_grib2_to_npy()
+        else:
+            main(_model_key)

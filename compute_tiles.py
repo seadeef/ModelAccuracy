@@ -31,11 +31,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate tiles (PNG images or PMTiles) for configured statistics."
     )
-    parser.add_argument(
+    model_group = parser.add_mutually_exclusive_group()
+    model_group.add_argument(
         "--model",
-        default=DEFAULT_MODEL,
+        default=None,
         choices=list(MODEL_REGISTRY),
         help="Model to generate tiles for.",
+    )
+    model_group.add_argument(
+        "--all",
+        action="store_true",
+        help="Generate tiles for all registered models.",
     )
     parser.add_argument(
         "--stats-root",
@@ -480,10 +486,8 @@ def _process_layer_pmtiles(
     return f"{stat_name}/lead_{lead_key}"
 
 
-def main() -> None:
-    args = parse_args()
+def _run_for_model(model_key: str, args: argparse.Namespace) -> None:
     selected_lead_key = args.lead.strip().replace("-", "_") if args.lead is not None else None
-    model_key = args.model
     stats_root = args.stats_root if args.stats_root is not None else Path("stats_output") / model_key
 
     selected_plugins = resolve_statistics(args.stats)
@@ -603,6 +607,14 @@ def main() -> None:
     if tmp_root.exists():
         shutil.rmtree(tmp_root)
     print(f"Output written to {args.output_dir.resolve()}")
+
+
+def main() -> None:
+    args = parse_args()
+    models = list(MODEL_REGISTRY) if args.all else [args.model or DEFAULT_MODEL]
+    for model_key in models:
+        print(f"\n=== Generating tiles for model '{model_key}' ===")
+        _run_for_model(model_key, args)
 
 
 if __name__ == "__main__":
