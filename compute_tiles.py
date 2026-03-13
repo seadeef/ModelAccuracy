@@ -5,12 +5,11 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
 import numpy as np
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
-from statistics_plugins.registry import ENABLED_STATISTICS, STATISTICS_BY_NAME
+from statistics_plugins.registry import ENABLED_STATISTICS
 
 try:
     import rasterio
@@ -22,85 +21,25 @@ except Exception as exc:  # pragma: no cover - environment dependent
         "rasterio is required. Install with: pip install rasterio"
     ) from exc
 
-WEB_MERCATOR_MAX_LAT = 85.05112878
-US_HEADER_CENTER = [-98.5795, 39.8283, 3.0]
 US_HEADER_BOUNDS = [-125.0, 24.0, -66.0, 50.0]
+
+SEASONS = {"djf": (12, 1, 2), "mam": (3, 4, 5), "jja": (6, 7, 8), "son": (9, 10, 11)}
+
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate tiles (PNG images or PMTiles) for configured statistics."
+        description="Generate tile images (PNGs) for configured statistics."
     )
-    model_group = parser.add_mutually_exclusive_group()
-    model_group.add_argument(
+    parser.add_argument(
         "--model",
         default=None,
         choices=list(MODEL_REGISTRY),
-        help="Model to generate tiles for.",
-    )
-    model_group.add_argument(
-        "--all",
-        action="store_true",
-        help="Generate tiles for all registered models.",
-    )
-    parser.add_argument(
-        "--stats-root",
-        type=Path,
-        default=None,
-        help="Root directory containing <stat_name>/ subdirectories. Defaults to stats/<model>/.",
-    )
-    parser.add_argument(
-        "--stat",
-        action="append",
-        dest="stats",
-        help="Statistic name to process. Repeat for multiple values.",
-    )
-    parser.add_argument(
-        "--lead",
-        type=str,
-        help="Optional lead filter (single lead like '7' or range key like '1_7'/'1-7').",
-    )
-    parser.add_argument("--min-zoom", type=int, default=0, help="Minimum zoom to render.")
-    parser.add_argument(
-        "--max-zoom",
-        type=int,
-        default=None,
-        metavar="Z",
-        help="Maximum zoom for PMTiles rendering. Required when any statistic uses pmtiles tile_mode.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("tiles_output"),
-        help="Output directory for pmtiles and metadata.",
-    )
-    parser.add_argument(
-        "--percentile",
-        type=float,
-        default=98.0,
-        help="Upper percentile for value range scaling.",
-    )
-    parser.add_argument(
-        "-j",
-        "--jobs",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Number of parallel workers for rio pmtiles (default: CPU count).",
+        help="Model to generate tiles for (default: all models).",
     )
     return parser.parse_args()
 
 
-def resolve_statistics(selected: list[str] | None) -> list:
-    if not selected:
-        return ENABLED_STATISTICS
-    unknown = [name for name in selected if name not in STATISTICS_BY_NAME]
-    if unknown:
-        raise ValueError(
-            f"Unknown statistic(s): {', '.join(sorted(unknown))}. "
-            f"Available: {', '.join(sorted(STATISTICS_BY_NAME))}"
-        )
-    return [STATISTICS_BY_NAME[name] for name in selected]
 
 
 def load_metadata(stats_dir: Path) -> dict:
@@ -117,11 +56,12 @@ def load_metadata(stats_dir: Path) -> dict:
     }
 
 
-def iter_layers(stats_dir: Path, lead_key: str | None):
-    for lead_path in sorted(stats_dir.glob("lead_*.npz")):
+def iter_layers(stats_dir: Path, subdir: str | None = None):
+    source_dir = stats_dir / subdir if subdir else stats_dir
+    if not source_dir.exists():
+        return
+    for lead_path in sorted(source_dir.glob("lead_*.npz")):
         key = lead_path.stem.replace("lead_", "", 1)
-        if lead_key is not None and key != lead_key:
-            continue
         yield key, lead_path
 
 
@@ -134,10 +74,11 @@ def value_range(
     if fixed_range is not None:
         return fixed_range
     finite = values[np.isfinite(values)]
+    is_diverging = colormap in ("diverging", "diverging_reversed")
     if finite.size == 0:
-        return (-1.0, 1.0) if colormap == "diverging" else (0.0, 1.0)
+        return (-1.0, 1.0) if is_diverging else (0.0, 1.0)
 
-    if colormap == "diverging":
+    if is_diverging:
         lower = 100.0 - percentile
         low, high = np.nanpercentile(finite, [lower, percentile])
         low_f = float(low)
@@ -162,7 +103,7 @@ def value_range_from_layers(
     if fixed_range is not None:
         return fixed_range
     if not layer_paths:
-        return (-1.0, 1.0) if colormap == "diverging" else (0.0, 1.0)
+        return (-1.0, 1.0) if colormap in ("diverging", "diverging_reversed") else (0.0, 1.0)
 
     finite_parts: list[np.ndarray] = []
     for layer_path in layer_paths:
@@ -205,32 +146,43 @@ def diverging_colormap(
     return np.dstack([rgb, alpha])
 
 
+def diverging_reversed_colormap(
+    data: np.ndarray, vmin: float, vmax: float, mask: np.ndarray,
+) -> np.ndarray:
+    """Red (low) → White (mid) → Blue (high)."""
+    red = np.array([215, 25, 28], dtype=np.float32)
+    white = np.array([255, 255, 255], dtype=np.float32)
+    blue = np.array([44, 123, 182], dtype=np.float32)
+
+    valid = mask & np.isfinite(data)
+    denom = vmax - vmin if vmax != vmin else 1.0
+    t = np.clip((data - vmin) / denom, 0.0, 1.0)
+
+    rgb = np.zeros((data.shape[0], data.shape[1], 3), dtype=np.uint8)
+    low = t <= 0.5
+    high = ~low
+    low_valid = valid & low
+    high_valid = valid & high
+    frac_low = (t[low_valid] / 0.5)[:, None]
+    frac_high = ((t[high_valid] - 0.5) / 0.5)[:, None]
+    rgb[low_valid] = np.clip(red + (white - red) * frac_low, 0, 255).astype(np.uint8)
+    rgb[high_valid] = np.clip(white + (blue - white) * frac_high, 0, 255).astype(np.uint8)
+    alpha = np.where(valid, 255, 0).astype(np.uint8)
+    return np.dstack([rgb, alpha])
+
+
 def sequential_colormap(data: np.ndarray, vmin: float, vmax: float, mask: np.ndarray) -> np.ndarray:
     white = np.array([255, 255, 255], dtype=np.float32)
-    red = np.array([215, 25, 28], dtype=np.float32)
+    blue = np.array([44, 123, 182], dtype=np.float32)
     valid = mask & np.isfinite(data)
     denom = vmax - vmin if vmax != vmin else 1.0
     t = np.clip((data - vmin) / denom, 0.0, 1.0)
     rgb = np.zeros((data.shape[0], data.shape[1], 3), dtype=np.float32)
     if np.any(valid):
         tv = t[valid].reshape(-1, 1)
-        rgb[valid] = (white + (red - white) * tv).reshape((-1, 3))
+        rgb[valid] = (white + (blue - white) * tv).reshape((-1, 3))
     alpha = np.where(valid, 255, 0).astype(np.uint8)
     return np.dstack([rgb.astype(np.uint8), alpha])
-
-
-def clip_to_web_mercator_lat(
-    rgba: np.ndarray, transform: Affine, lats: np.ndarray
-) -> tuple[np.ndarray, Affine]:
-    valid = (lats >= -WEB_MERCATOR_MAX_LAT) & (lats <= WEB_MERCATOR_MAX_LAT)
-    if not np.any(valid):
-        return rgba, transform
-    row_indices = np.where(valid)[0]
-    i_min, i_max = int(row_indices.min()), int(row_indices.max())
-    rgba_clip = rgba[i_min : i_max + 1, :, :].copy()
-    t = transform
-    new_f = t.f + i_min * t.e
-    return rgba_clip, Affine(t.a, t.b, t.c, t.d, t.e, new_f)
 
 
 def write_rgba_raster(path: Path, rgba: np.ndarray, transform: Affine, crs: str) -> None:
@@ -250,32 +202,15 @@ def write_rgba_raster(path: Path, rgba: np.ndarray, transform: Affine, crs: str)
             dst.write(rgba[:, :, idx], idx + 1)
 
 
-def compute_mercator_transform(
-    src_crs: str,
-    src_width: int,
-    src_height: int,
-    src_bounds: tuple[float, float, float, float],
-) -> tuple[Affine, int, int]:
-    """Compute the EPSG:3857 destination transform, width, and height once."""
-    dst_transform, width, height = calculate_default_transform(
-        src_crs, "EPSG:3857", src_width, src_height, *src_bounds
-    )
-    return dst_transform, width, height
-
-
 def reproject_to_mercator(
     src_path: Path,
     dst_path: Path,
-    dst_transform: Affine | None = None,
-    dst_width: int | None = None,
-    dst_height: int | None = None,
 ) -> None:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(src_path) as src:
-        if dst_transform is None or dst_width is None or dst_height is None:
-            dst_transform, dst_width, dst_height = calculate_default_transform(
-                src.crs, "EPSG:3857", src.width, src.height, *src.bounds
-            )
+        dst_transform, dst_width, dst_height = calculate_default_transform(
+            src.crs, "EPSG:3857", src.width, src.height, *src.bounds
+        )
         profile = src.profile.copy()
         profile.update(
             crs="EPSG:3857",
@@ -294,93 +229,6 @@ def reproject_to_mercator(
                     dst_crs="EPSG:3857",
                     resampling=Resampling.bilinear,
                 )
-
-
-def export_pmtiles(
-    source_path: Path,
-    pmtiles_path: Path,
-    min_zoom: int,
-    max_zoom: int,
-    jobs: int | None = None,
-) -> None:
-    rio = shutil.which("rio")
-    if rio is None:
-        raise RuntimeError(
-            "rio CLI not found. Install rasterio and rio-pmtiles: pip install rasterio rio-pmtiles"
-        )
-    pmtiles_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        rio,
-        "pmtiles",
-        str(source_path),
-        str(pmtiles_path),
-        "--rgba",
-        "--zoom-levels",
-        f"{min_zoom}..{max_zoom}",
-        "--tile-size",
-        "256",
-        "-f",
-        "PNG",
-        "--exclude-empty-tiles",
-    ]
-    if jobs is not None:
-        cmd.extend(["-j", str(jobs)])
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def edit_pmtiles_header(
-    pmtiles_path: Path,
-    header_path: Path,
-    center: list[float],
-    bounds: list[float],
-) -> None:
-    pmtiles_bin = shutil.which("pmtiles")
-    if pmtiles_bin is None:
-        return
-    result = subprocess.run(
-        [pmtiles_bin, "show", str(pmtiles_path), "--header-json"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return
-    header = json.loads(result.stdout)
-    header["center"] = center
-    header["bounds"] = bounds
-    header_path.write_text(json.dumps(header))
-    try:
-        subprocess.run(
-            [pmtiles_bin, "edit", str(pmtiles_path), f"--header-json={header_path}"],
-            check=True,
-        )
-    except subprocess.CalledProcessError:
-        return
-    finally:
-        header_path.unlink(missing_ok=True)
-
-
-def _render_rgba(
-    npz_path: Path,
-    field: str,
-    vmin: float,
-    vmax: float,
-    transform: Affine,
-    lats: np.ndarray,
-    colormap: str = "diverging",
-) -> tuple[np.ndarray, Affine]:
-    """Load values, apply colormap, clip to web mercator. Returns (rgba, clipped_transform)."""
-    with np.load(npz_path) as layer:
-        if field not in layer:
-            raise KeyError(f"Missing field '{field}' in {npz_path}.")
-        values = layer[field]
-
-    valid = np.isfinite(values)
-    colormap_fn = sequential_colormap if colormap == "sequential" else diverging_colormap
-    rgba = colormap_fn(values, vmin, vmax, valid)
-    rgba, clipped_transform = clip_to_web_mercator_lat(rgba, transform, lats)
-    return rgba, clipped_transform
-
 
 
 def _process_layer_image(
@@ -411,19 +259,31 @@ def _process_layer_image(
     west, south, east, north = US_HEADER_BOUNDS
     lat_res = abs(transform.e)
     lon_res = abs(transform.a)
-    row_start = max(0, int((transform.f - north) / lat_res))
-    row_end = min(values.shape[0], int((transform.f - south) / lat_res) + 1)
     col_start = max(0, int((west - transform.c) / lon_res))
     col_end = min(values.shape[1], int((east - transform.c) / lon_res) + 1)
+
+    if transform.e > 0:
+        # South-to-north: row 0 is southernmost, transform.f is south edge.
+        row_start = max(0, int((south - transform.f) / lat_res))
+        row_end = min(values.shape[0], int((north - transform.f) / lat_res) + 1)
+    else:
+        # North-to-south: row 0 is northernmost, transform.f is north edge.
+        row_start = max(0, int((transform.f - north) / lat_res))
+        row_end = min(values.shape[0], int((transform.f - south) / lat_res) + 1)
 
     cropped = values[row_start:row_end, col_start:col_end]
     crop_transform = Affine(
         transform.a, transform.b, transform.c + col_start * lon_res,
-        transform.d, transform.e, transform.f - row_start * lat_res,
+        transform.d, transform.e, transform.f + row_start * transform.e,
     )
 
     valid = np.isfinite(cropped)
-    colormap_fn = sequential_colormap if colormap == "sequential" else diverging_colormap
+    _COLORMAP_FNS = {
+        "sequential": sequential_colormap,
+        "diverging": diverging_colormap,
+        "diverging_reversed": diverging_reversed_colormap,
+    }
+    colormap_fn = _COLORMAP_FNS.get(colormap, diverging_colormap)
     rgba = colormap_fn(cropped, global_vmin, global_vmax, valid)
 
     # Write as 4326 GeoTIFF, reproject to 3857, then save as PNG.
@@ -444,74 +304,32 @@ def _process_layer_image(
     return f"{stat_name}/lead_{lead_key}"
 
 
-def _process_layer_pmtiles(
-    lead_key: str,
-    npz_path: Path,
-    field: str,
-    global_vmin: float,
-    global_vmax: float,
-    transform_tuple: tuple,
-    lats: np.ndarray,
-    crs: str,
-    stat_name: str,
+PERCENTILE = 98.0
+
+
+def _collect_tasks_for_period(
+    plugins: list,
+    stats_root: Path,
+    images_root: Path,
     tmp_root: Path,
-    pmtiles_root: Path,
-    min_zoom: int,
-    max_zoom: int,
-    rio_jobs: int | None,
-    merc_transform_tuple: tuple,
-    merc_width: int,
-    merc_height: int,
-    colormap: str = "diverging",
-) -> str:
-    """Render a single layer as PMTiles (pmtiles mode)."""
-    transform = Affine(*transform_tuple[:6])
-    merc_transform = Affine(*merc_transform_tuple[:6])
+    source_subdir: str | None,
+    output_subdir: str | None,
+    skip_forecast: bool = False,
+) -> list[dict]:
+    """Collect tile-generation tasks for a single period (yearly/monthly/seasonal)."""
+    tasks: list[dict] = []
 
-    rgba, write_transform = _render_rgba(
-        npz_path, field, global_vmin, global_vmax, transform, lats, colormap,
-    )
-
-    rgba_path = tmp_root / stat_name / f"lead_{lead_key}_4326_rgba.tif"
-    merc_path = tmp_root / stat_name / f"lead_{lead_key}_3857_rgba.tif"
-    pmtiles_path = pmtiles_root / stat_name / f"lead_{lead_key}.pmtiles"
-
-    write_rgba_raster(rgba_path, rgba, write_transform, crs)
-    reproject_to_mercator(rgba_path, merc_path, merc_transform, merc_width, merc_height)
-    export_pmtiles(merc_path, pmtiles_path, min_zoom, max_zoom, rio_jobs)
-
-    header_tmp = tmp_root / stat_name / f"header_lead_{lead_key}.json"
-    edit_pmtiles_header(pmtiles_path, header_tmp, US_HEADER_CENTER, US_HEADER_BOUNDS)
-
-    return f"{stat_name}/lead_{lead_key}"
-
-
-def _run_for_model(model_key: str, args: argparse.Namespace) -> None:
-    selected_lead_key = args.lead.strip().replace("-", "_") if args.lead is not None else None
-    stats_root = args.stats_root if args.stats_root is not None else Path("stats_output") / model_key
-
-    selected_plugins = resolve_statistics(args.stats)
-    pmtiles_root = args.output_dir / "pmtiles" / model_key
-    images_root = args.output_dir / "images" / model_key
-    tmp_root = args.output_dir / "tmp"
-
-    rio_jobs = args.jobs
-
-    # Collect all (stat, lead) tasks up-front.
-    tasks: list[tuple[str, dict]] = []  # (tile_mode, kwargs)
-
-    for plugin in selected_plugins:
+    for plugin in plugins:
         stat_name = plugin.spec.name
-        tile_mode = plugin.spec.tile_mode
+        if skip_forecast and stat_name == "forecast":
+            continue
         stats_dir = stats_root / stat_name
         if not stats_dir.exists():
-            print(f"Skipping statistic '{stat_name}' (missing {stats_dir}).")
             continue
 
         meta = load_metadata(stats_dir)
-        layers = list(iter_layers(stats_dir, selected_lead_key))
+        layers = list(iter_layers(stats_dir, subdir=source_subdir))
         if not layers:
-            print(f"Skipping statistic '{stat_name}' (no matching leads found).")
             continue
         field = plugin.spec.render_field
         layer_paths = [npz_path for _, npz_path in layers]
@@ -519,102 +337,99 @@ def _run_for_model(model_key: str, args: argparse.Namespace) -> None:
         global_vmin, global_vmax = value_range_from_layers(
             layer_paths,
             field,
-            args.percentile,
+            PERCENTILE,
             colormap,
             plugin.spec.fixed_range,
         )
 
         transform_tuple = tuple(meta["transform"])[:6]
 
-        # PMTiles mode needs pre-computed mercator transform and --max-zoom.
-        merc_transform_tuple = None
-        merc_width = None
-        merc_height = None
-        if tile_mode == "pmtiles":
-            if args.max_zoom is None:
-                raise SystemExit(
-                    f"Error: --max-zoom is required because statistic '{stat_name}' "
-                    "uses pmtiles tile_mode."
-                )
-            _clip_dummy = np.zeros(
-                (len(meta["lats"]), len(meta["lons"]), 4), dtype=np.uint8
-            )
-            _clipped_dummy, clipped_transform = clip_to_web_mercator_lat(
-                _clip_dummy, meta["transform"], meta["lats"]
-            )
-            clipped_height, clipped_width = _clipped_dummy.shape[:2]
-            merc_transform, merc_width, merc_height = compute_mercator_transform(
-                meta["crs"],
-                clipped_width,
-                clipped_height,
-                rasterio.transform.array_bounds(
-                    clipped_height, clipped_width, clipped_transform
-                ),
-            )
-            merc_transform_tuple = tuple(merc_transform)[:6]
-
         for lead_key, npz_path in layers:
-            if tile_mode == "image":
-                tasks.append(("image", dict(
-                    lead_key=lead_key,
-                    npz_path=npz_path,
-                    field=field,
-                    global_vmin=global_vmin,
-                    global_vmax=global_vmax,
-                    transform_tuple=transform_tuple,
-                    lats=meta["lats"],
-                    crs=meta["crs"],
-                    stat_name=stat_name,
-                    images_root=images_root,
-                    tmp_root=tmp_root,
-                    colormap=colormap,
-                )))
+            if output_subdir:
+                out_path = images_root / stat_name / output_subdir / f"lead_{lead_key}.png"
             else:
-                tasks.append(("pmtiles", dict(
-                    lead_key=lead_key,
-                    npz_path=npz_path,
-                    field=field,
-                    global_vmin=global_vmin,
-                    global_vmax=global_vmax,
-                    transform_tuple=transform_tuple,
-                    lats=meta["lats"],
-                    crs=meta["crs"],
-                    stat_name=stat_name,
-                    tmp_root=tmp_root,
-                    pmtiles_root=pmtiles_root,
-                    min_zoom=args.min_zoom,
-                    max_zoom=args.max_zoom,
-                    rio_jobs=rio_jobs,
-                    merc_transform_tuple=merc_transform_tuple,
-                    merc_width=merc_width,
-                    merc_height=merc_height,
-                    colormap=colormap,
-                )))
+                out_path = images_root / stat_name / f"lead_{lead_key}.png"
+            if out_path.exists():
+                continue
+
+            effective_stat_name = f"{stat_name}/{output_subdir}" if output_subdir else stat_name
+
+            tasks.append(dict(
+                lead_key=lead_key,
+                npz_path=npz_path,
+                field=field,
+                global_vmin=global_vmin,
+                global_vmax=global_vmax,
+                transform_tuple=transform_tuple,
+                lats=meta["lats"],
+                crs=meta["crs"],
+                stat_name=effective_stat_name,
+                images_root=images_root,
+                tmp_root=tmp_root,
+                colormap=colormap,
+            ))
+
+    return tasks
+
+
+OUTPUT_DIR = Path("tiles_output")
+
+
+def _run_for_model(model_key: str) -> None:
+    stats_root = Path("stats_output") / model_key
+    plugins = ENABLED_STATISTICS
+    images_root = OUTPUT_DIR / "images" / model_key
+    tmp_root = OUTPUT_DIR / "tmp"
+
+    # Collect tasks for all periods.
+    tasks: list[dict] = []
+
+    # 1. Yearly (source from stat root, output to stat root — unchanged paths).
+    tasks.extend(_collect_tasks_for_period(
+        plugins, stats_root, images_root, tmp_root,
+        source_subdir=None, output_subdir=None,
+    ))
+
+    # 2. All 12 months (skip forecast).
+    for m in range(1, 13):
+        mm = f"{m:02d}"
+        tasks.extend(_collect_tasks_for_period(
+            plugins, stats_root, images_root, tmp_root,
+            source_subdir=f"monthly/{mm}",
+            output_subdir=f"monthly/{mm}",
+            skip_forecast=True,
+        ))
+
+    # 3. All 4 seasons (skip forecast).
+    for season_name in SEASONS:
+        tasks.extend(_collect_tasks_for_period(
+            plugins, stats_root, images_root, tmp_root,
+            source_subdir=f"seasonal/{season_name}",
+            output_subdir=f"seasonal/{season_name}",
+            skip_forecast=True,
+        ))
 
     total = len(tasks)
     if total == 0:
         print("No layers to process.")
     else:
         print(f"Processing {total} layer(s) …")
-        for i, (mode, kwargs) in enumerate(tasks, start=1):
-            label = f"{kwargs['stat_name']}/lead_{kwargs['lead_key']} [{mode}]"
+        for i, kwargs in enumerate(tasks, start=1):
+            label = f"{kwargs['stat_name']}/lead_{kwargs['lead_key']}"
             print(f"  [{i}/{total}] {label} …", flush=True)
-            if mode == "image":
-                _process_layer_image(**kwargs)
-            else:
-                _process_layer_pmtiles(**kwargs)
+            _process_layer_image(**kwargs)
 
     if tmp_root.exists():
         shutil.rmtree(tmp_root)
-    print(f"Output written to {args.output_dir.resolve()}")
+    print(f"Output written to {OUTPUT_DIR.resolve()}")
 
 
 def main() -> None:
     args = parse_args()
-    models = list(MODEL_REGISTRY) if args.all else [args.model or DEFAULT_MODEL]
+    models = [args.model] if args.model else list(MODEL_REGISTRY)
     for model_key in models:
         print(f"\n=== Generating tiles for model '{model_key}' ===")
-        _run_for_model(model_key, args)
+        _run_for_model(model_key)
 
 
 if __name__ == "__main__":
