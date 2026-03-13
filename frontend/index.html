@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Bias PMTiles Viewer</title>
+    <title>Model Accuracy Viewer</title>
     <link
       href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"
       rel="stylesheet"
@@ -11,112 +11,267 @@
     <style>
       :root {
         color-scheme: light dark;
+        --panel-bg: #1a1d23;
+        --panel-border: #2a2d35;
+        --text-primary: #e8eaed;
+        --text-secondary: #9aa0a6;
+        --accent: #8ab4f8;
+        --hover-bg: #2a2d35;
+        --active-bg: #333842;
       }
+      * { box-sizing: border-box; }
       body {
         margin: 0;
         font-family: system-ui, -apple-system, sans-serif;
+        background: #000;
       }
       .controls {
         display: flex;
-        gap: 12px;
+        flex-direction: column;
+        background: var(--panel-bg);
+        color: var(--text-primary);
+        border-bottom: 1px solid var(--panel-border);
+      }
+      .controls-row {
+        display: flex;
+        gap: 16px;
         align-items: center;
-        padding: 10px 14px;
-        background: #101418;
-        color: #fff;
+        padding: 8px 16px;
+      }
+      .controls-row + .controls-row {
+        border-top: 1px solid var(--panel-border);
       }
       .controls label {
-        font-size: 14px;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--text-secondary);
+        white-space: nowrap;
       }
-      .controls select {
-        margin-left: 6px;
+      .controls select,
+      .controls input[type="text"] {
+        background: #2a2d35;
+        color: var(--text-primary);
+        border: 1px solid #3a3d45;
+        border-radius: 4px;
+        padding: 4px 8px;
+        font-size: 13px;
+        outline: none;
+      }
+      .controls select:focus,
+      .controls input[type="text"]:focus {
+        border-color: var(--accent);
+      }
+      .controls select:disabled {
+        opacity: 0.4;
       }
       .controls input[type="range"] {
         vertical-align: middle;
+        accent-color: var(--accent);
+        width: 80px;
+      }
+      .controls button {
+        background: #2a2d35;
+        color: var(--text-primary);
+        border: 1px solid #3a3d45;
+        border-radius: 4px;
+        padding: 4px 12px;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      .controls button:hover {
+        background: #3a3d45;
+      }
+      .opacity-value {
+        font-size: 11px;
+        color: var(--text-secondary);
+        min-width: 28px;
+        text-align: right;
       }
       #map {
         width: 100%;
-        height: calc(100vh - 48px);
+        height: calc(100vh - 82px);
       }
       .status {
         margin-left: auto;
-        font-size: 12px;
-        opacity: 0.85;
+        font-size: 11px;
+        color: var(--text-secondary);
+      }
+      .maplibregl-popup-content {
+        font-family: system-ui, -apple-system, sans-serif;
+        font-size: 13px;
+        line-height: 1.5;
+        padding: 10px 14px;
+      }
+
+      /* Period flyout menu */
+      .period-menu {
+        position: relative;
+      }
+      .period-trigger {
+        pointer-events: none;
+      }
+      .period-trigger.disabled {
+        opacity: 0.4;
+      }
+      .period-dropdown {
+        display: none;
+        position: absolute;
+        top: 100%;
+        left: 0;
+        margin-top: 4px;
+        background: var(--panel-bg);
+        border: 1px solid var(--panel-border);
+        border-radius: 6px;
+        min-width: 140px;
+        z-index: 1000;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+        padding: 4px 0;
+      }
+      .period-dropdown.open {
+        display: block;
+      }
+      .period-item {
+        padding: 6px 12px;
+        font-size: 13px;
+        color: var(--text-primary);
+        cursor: pointer;
+        position: relative;
+      }
+      .period-item:hover {
+        background: var(--hover-bg);
+      }
+      .period-item.active {
+        color: var(--accent);
+      }
+      .period-item.has-sub {
+        padding-right: 24px;
+      }
+      .period-item.has-sub::after {
+        content: "\25B8";
+        position: absolute;
+        right: 10px;
+        top: 50%;
+        transform: translateY(-50%);
+        font-size: 10px;
+        color: var(--text-secondary);
+      }
+      .period-sub {
+        display: none;
+        position: absolute;
+        left: 100%;
+        top: -4px;
+        background: var(--panel-bg);
+        border: 1px solid var(--panel-border);
+        border-radius: 6px;
+        min-width: 140px;
+        box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+        padding: 4px 0;
+        z-index: 1001;
+      }
+      .period-item:hover > .period-sub {
+        display: block;
+      }
+      .period-sub-item {
+        padding: 5px 12px;
+        font-size: 13px;
+        color: var(--text-primary);
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .period-sub-item:hover {
+        background: var(--hover-bg);
+      }
+      .period-sub-item.active {
+        color: var(--accent);
       }
     </style>
   </head>
   <body>
     <div class="controls">
-      <label>
-        Model
-        <select id="modelSelect"></select>
-      </label>
-      <label>
-        Statistic
-        <select id="statSelect"></select>
-      </label>
-      <label>
-        Lead (days)
-        <select id="leadSelect"></select>
-      </label>
-      <label>
-        View
-        <select id="modeSelect">
-          <option value="both">Both</option>
-          <option value="landmarks_only">Landmarks only</option>
-          <option value="weather_only">Weather only</option>
-        </select>
-      </label>
-      <label>
-        Detail
-        <select id="detailSelect">
-          <option value="low">Low</option>
-          <option value="high">High</option>
-        </select>
-      </label>
-      <label>
-        Weather opacity
-        <input id="weatherOpacity" type="range" min="0" max="1" step="0.05" value="0.85" />
-        <span id="weatherOpacityValue">0.85</span>
-      </label>
-      <label>
-        Landmarks opacity
-        <input id="landmarksOpacity" type="range" min="0" max="1" step="0.05" value="0.65" />
-        <span id="landmarksOpacityValue">0.65</span>
-      </label>
-      <label>
-        ZIP
-        <input id="zipInput" type="text" placeholder="80302" size="8" />
-      </label>
-      <button id="zipGoButton" type="button">Go</button>
-      <div class="status" id="status">Idle</div>
+      <div class="controls-row">
+        <label>Model <select id="modelSelect"></select></label>
+        <label>Statistic <select id="statSelect"></select></label>
+        <label>Lead <select id="leadSelect"></select></label>
+        <span class="controls-label" style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-secondary);white-space:nowrap;">Period
+          <div class="period-menu" id="periodMenu">
+            <select class="period-trigger" id="periodTrigger">
+              <option>Yearly</option>
+            </select>
+            <div class="period-dropdown" id="periodDropdown"></div>
+          </div>
+        </span>
+        <button id="downloadBtn" type="button" title="Save the current map as a PNG with title and legend">Export Image</button>
+        <div class="status" id="status">Idle</div>
+      </div>
+      <div class="controls-row">
+        <label>View
+          <select id="modeSelect">
+            <option value="both">Both</option>
+            <option value="landmarks_only">Landmarks only</option>
+            <option value="weather_only">Weather only</option>
+          </select>
+        </label>
+        <label>Detail
+          <select id="detailSelect">
+            <option value="low">Low</option>
+            <option value="high">High</option>
+          </select>
+        </label>
+        <label>Overlay
+          <input id="weatherOpacity" type="range" min="0" max="1" step="0.05" value="0.85" />
+          <span class="opacity-value" id="weatherOpacityValue">0.85</span>
+        </label>
+        <label>Basemap
+          <input id="landmarksOpacity" type="range" min="0" max="1" step="0.05" value="0.65" />
+          <span class="opacity-value" id="landmarksOpacityValue">0.65</span>
+        </label>
+        <label>ZIP <input id="zipInput" type="text" placeholder="80302" size="6" /></label>
+        <button id="zipGoButton" type="button">Go</button>
+      </div>
     </div>
     <div id="map"></div>
 
-    <script src="https://unpkg.com/pmtiles@3.2.0/dist/index.js"></script>
     <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
     <script>
-      const BASE_URL = "http://localhost:8080";
       const API_BASE_URL = "http://localhost:8001";
       const DEFAULT_MAPTILER_STYLE_ID = "streets-v2";
       const FALLBACK_STYLE_URL = "https://demotiles.maplibre.org/style.json";
       const DETAIL_ZOOM_LIMITS = { low: 9, high: 14 };
-      const US_BOUNDS = [-125.0, 24.0, -66.0, 50.0]; // [west, south, east, north]
+      const US_BOUNDS = [-125.0, 24.0, -66.0, 50.0];
       const sourceId = "bias-source";
       const layerId = "bias-layer";
       const statusEl = document.getElementById("status");
+
+      const MONTH_NAMES = [
+        "", "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+      ];
+      const SEASON_NAMES = { djf: "Winter", mam: "Spring", jja: "Summer", son: "Autumn" };
+      const STAT_LABELS = {
+        forecast: "Forecast", bias: "Bias", sacc: "SACC", nrmse: "NRMSE", nmad: "NMAD",
+      };
+
       const appConfig = {
-        models: [],             // [{key, label, lead_days_min, lead_days_max, lead_windows}]
+        models: [],
         defaultModel: "gfs",
         maptilerApiKey: "",
         maptilerStyleId: DEFAULT_MAPTILER_STYLE_ID,
-        statistics: {},         // { name: { tile_mode } }
+        statistics: {},
         defaultStatistic: "bias",
         imageBounds: US_BOUNDS,
-        forecastInitDate: {},   // { model_key: "YYYY-MM-DD" }
+        forecastInitDate: {},
+        accumulationModes: ["yearly", "monthly", "seasonal"],
+        currentMonth: "01",
+        currentSeason: "djf",
       };
       const state = {
         model: "gfs",
-        statistic: "bias",
+        statistic: "forecast",
+        period: "yearly",     // "yearly" | "monthly" | "seasonal"
+        month: "01",          // "01"-"12"
+        season: "djf",        // "djf"|"mam"|"jja"|"son"
         mode: "both",
         detailMode: "low",
         weatherOpacity: 0.85,
@@ -124,11 +279,10 @@
       };
       let map = null;
       let landmarks = [];
+      let initialLoad = true;
 
       function mapStyleUrlFromConfig() {
-        if (!appConfig.maptilerApiKey) {
-          return FALLBACK_STYLE_URL;
-        }
+        if (!appConfig.maptilerApiKey) return FALLBACK_STYLE_URL;
         return `https://api.maptiler.com/maps/${appConfig.maptilerStyleId}/style.json?key=${appConfig.maptilerApiKey}`;
       }
 
@@ -136,121 +290,71 @@
         return `${statistic}/lead_${lead}`;
       }
 
-      function setStatus(message) {
-        statusEl.textContent = message;
-      }
+      function setStatus(message) { statusEl.textContent = message; }
 
       function cacheLandmarkLayers() {
-        if (!map) {
-          return;
-        }
+        if (!map) return;
         const style = map.getStyle();
-        if (!style || !style.layers) {
-          landmarks = [];
-          return;
-        }
+        if (!style || !style.layers) { landmarks = []; return; }
         landmarks = style.layers
           .filter((layer) => layer.id !== layerId)
           .map((layer) => ({
-            id: layer.id,
-            type: layer.type,
+            id: layer.id, type: layer.type,
             sourceLayer: layer["source-layer"] || "",
           }));
       }
 
       function isLowDetailHidden(layerInfo) {
         const text = `${layerInfo.id} ${layerInfo.sourceLayer}`.toLowerCase();
-        const isSymbolLike =
-          layerInfo.type === "symbol" || layerInfo.type === "line";
-        if (!isSymbolLike) {
-          return false;
-        }
-        return [
-          "poi",
-          "transit",
-          "airport",
-          "aeroway",
-          "housenumber",
-          "house_number",
-          "address",
-          "building",
-          "minor_road",
-          "path",
-          "rail",
-        ].some((keyword) => text.includes(keyword));
+        if (layerInfo.type !== "symbol" && layerInfo.type !== "line") return false;
+        return ["poi","transit","airport","aeroway","housenumber","house_number",
+                "address","building","minor_road","path","rail"]
+          .some((kw) => text.includes(kw));
       }
 
-      function setLayerVisibility(layerIdValue, visible) {
-        if (!map) {
-          return;
-        }
-        if (!map.getLayer(layerIdValue)) {
-          return;
-        }
-        map.setLayoutProperty(layerIdValue, "visibility", visible ? "visible" : "none");
+      function setLayerVisibility(id, visible) {
+        if (!map || !map.getLayer(id)) return;
+        map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
       }
 
       function setLandmarkOpacity(layerInfo, opacity) {
-        if (!map) {
-          return;
-        }
-        if (!map.getLayer(layerInfo.id)) {
-          return;
-        }
-        const type = layerInfo.type;
-        if (type === "fill") {
-          map.setPaintProperty(layerInfo.id, "fill-opacity", opacity);
-        } else if (type === "line") {
-          map.setPaintProperty(layerInfo.id, "line-opacity", opacity);
-        } else if (type === "symbol") {
+        if (!map || !map.getLayer(layerInfo.id)) return;
+        const t = layerInfo.type;
+        if (t === "fill") map.setPaintProperty(layerInfo.id, "fill-opacity", opacity);
+        else if (t === "line") map.setPaintProperty(layerInfo.id, "line-opacity", opacity);
+        else if (t === "symbol") {
           map.setPaintProperty(layerInfo.id, "icon-opacity", opacity);
           map.setPaintProperty(layerInfo.id, "text-opacity", opacity);
-        } else if (type === "circle") {
-          map.setPaintProperty(layerInfo.id, "circle-opacity", opacity);
-        } else if (type === "raster") {
-          map.setPaintProperty(layerInfo.id, "raster-opacity", opacity);
-        } else if (type === "background") {
-          map.setPaintProperty(layerInfo.id, "background-opacity", opacity);
-        } else if (type === "fill-extrusion") {
-          map.setPaintProperty(layerInfo.id, "fill-extrusion-opacity", opacity);
-        } else if (type === "heatmap") {
-          map.setPaintProperty(layerInfo.id, "heatmap-opacity", opacity);
         }
+        else if (t === "circle") map.setPaintProperty(layerInfo.id, "circle-opacity", opacity);
+        else if (t === "raster") map.setPaintProperty(layerInfo.id, "raster-opacity", opacity);
+        else if (t === "background") map.setPaintProperty(layerInfo.id, "background-opacity", opacity);
+        else if (t === "fill-extrusion") map.setPaintProperty(layerInfo.id, "fill-extrusion-opacity", opacity);
+        else if (t === "heatmap") map.setPaintProperty(layerInfo.id, "heatmap-opacity", opacity);
       }
 
       function applyLayerState() {
-        if (!map) {
-          return;
-        }
+        if (!map) return;
         const zoomCap = DETAIL_ZOOM_LIMITS[state.detailMode];
         map.setMaxZoom(zoomCap);
-        if (map.getZoom() > zoomCap) {
-          map.setZoom(zoomCap);
-        }
-
+        if (map.getZoom() > zoomCap) map.setZoom(zoomCap);
         const weatherVisible = state.mode !== "landmarks_only";
         if (map.getLayer(layerId)) {
           setLayerVisibility(layerId, weatherVisible);
           map.setPaintProperty(layerId, "raster-opacity", state.weatherOpacity);
         }
-
         const landmarksVisible = state.mode !== "weather_only";
-        for (const landmark of landmarks) {
-          const hideForLowDetail =
-            state.detailMode === "low" && isLowDetailHidden(landmark);
-          setLayerVisibility(landmark.id, landmarksVisible && !hideForLowDetail);
-          setLandmarkOpacity(landmark, state.landmarksOpacity);
+        for (const lm of landmarks) {
+          const hide = state.detailMode === "low" && isLowDetailHidden(lm);
+          setLayerVisibility(lm.id, landmarksVisible && !hide);
+          setLandmarkOpacity(lm, state.landmarksOpacity);
         }
       }
 
       function firstSymbolLayerId() {
-        if (!map) {
-          return undefined;
-        }
-        for (const landmark of landmarks) {
-          if (landmark.type === "symbol" && map.getLayer(landmark.id)) {
-            return landmark.id;
-          }
+        if (!map) return undefined;
+        for (const lm of landmarks) {
+          if (lm.type === "symbol" && map.getLayer(lm.id)) return lm.id;
         }
         return undefined;
       }
@@ -263,116 +367,189 @@
 
       function addRasterLayer() {
         const weatherLayer = {
-          id: layerId,
-          type: "raster",
-          source: sourceId,
+          id: layerId, type: "raster", source: sourceId,
           paint: { "raster-opacity": state.weatherOpacity },
         };
         const beforeId = firstSymbolLayerId();
-        if (beforeId) {
-          map.addLayer(weatherLayer, beforeId);
+        beforeId ? map.addLayer(weatherLayer, beforeId) : map.addLayer(weatherLayer);
+      }
+
+      function periodImageSubdir() {
+        if (state.period === "monthly") return `monthly/${state.month}`;
+        if (state.period === "seasonal") return `seasonal/${state.season}`;
+        return null;
+      }
+
+      function periodStatsParams() {
+        let params = `&period=${state.period}`;
+        if (state.period === "monthly") params += `&month=${state.month}`;
+        else if (state.period === "seasonal") params += `&season=${state.season}`;
+        return params;
+      }
+
+      // Period trigger label
+      function periodLabel() {
+        if (state.period === "yearly") return "Yearly";
+        if (state.period === "monthly") {
+          const name = MONTH_NAMES[parseInt(state.month, 10)] || state.month;
+          return `Monthly (${name})`;
+        }
+        if (state.period === "seasonal") {
+          const name = SEASON_NAMES[state.season] || state.season;
+          return `Seasonal (${name})`;
+        }
+        return "Yearly";
+      }
+
+      const periodTrigger = document.getElementById("periodTrigger");
+      const periodDropdown = document.getElementById("periodDropdown");
+      const periodMenu = document.getElementById("periodMenu");
+
+      function updatePeriodTrigger() {
+        periodTrigger.options[0].textContent = periodLabel();
+      }
+
+      function closePeriodDropdown() {
+        periodDropdown.classList.remove("open");
+      }
+
+      function selectPeriod(period, month, season) {
+        state.period = period;
+        if (month) state.month = month;
+        if (season) state.season = season;
+        updatePeriodTrigger();
+        markActivePeriod();
+        closePeriodDropdown();
+        handleChange();
+      }
+
+      // Click the menu wrapper to open/close (select itself has pointer-events:none)
+      periodMenu.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (periodTrigger.classList.contains("disabled")) return;
+        // Don't toggle if clicking inside the dropdown itself
+        if (periodDropdown.contains(e.target)) return;
+        periodDropdown.classList.toggle("open");
+      });
+
+      // Click outside to close
+      document.addEventListener("click", (e) => {
+        if (!periodMenu.contains(e.target)) {
+          closePeriodDropdown();
+        }
+      });
+
+      function buildPeriodDropdown() {
+        periodDropdown.innerHTML = "";
+
+        // Yearly
+        const yearlyItem = document.createElement("div");
+        yearlyItem.className = "period-item";
+        yearlyItem.textContent = "Yearly";
+        yearlyItem.addEventListener("click", () => selectPeriod("yearly"));
+        periodDropdown.appendChild(yearlyItem);
+
+        // Monthly with hover sub-menu
+        const monthlyItem = document.createElement("div");
+        monthlyItem.className = "period-item has-sub";
+        monthlyItem.textContent = "Monthly";
+        const monthSub = document.createElement("div");
+        monthSub.className = "period-sub";
+        for (let m = 1; m <= 12; m++) {
+          const mm = String(m).padStart(2, "0");
+          const sub = document.createElement("div");
+          sub.className = "period-sub-item";
+          sub.textContent = MONTH_NAMES[m];
+          sub.addEventListener("click", (e) => {
+            e.stopPropagation();
+            selectPeriod("monthly", mm, null);
+          });
+          monthSub.appendChild(sub);
+        }
+        monthlyItem.appendChild(monthSub);
+        periodDropdown.appendChild(monthlyItem);
+
+        // Seasonal with hover sub-menu
+        const seasonalItem = document.createElement("div");
+        seasonalItem.className = "period-item has-sub";
+        seasonalItem.textContent = "Seasonal";
+        const seasonSub = document.createElement("div");
+        seasonSub.className = "period-sub";
+        for (const [key, name] of Object.entries(SEASON_NAMES)) {
+          const sub = document.createElement("div");
+          sub.className = "period-sub-item";
+          sub.textContent = name;
+          sub.addEventListener("click", (e) => {
+            e.stopPropagation();
+            selectPeriod("seasonal", null, key);
+          });
+          seasonSub.appendChild(sub);
+        }
+        seasonalItem.appendChild(seasonSub);
+        periodDropdown.appendChild(seasonalItem);
+
+        markActivePeriod();
+      }
+
+      function markActivePeriod() {
+        periodDropdown.querySelectorAll(".period-item").forEach((el) => {
+          const text = el.childNodes[0].textContent.trim();
+          if (text === "Yearly") el.classList.toggle("active", state.period === "yearly");
+          else if (text === "Monthly") el.classList.toggle("active", state.period === "monthly");
+          else if (text === "Seasonal") el.classList.toggle("active", state.period === "seasonal");
+        });
+        periodDropdown.querySelectorAll(".period-sub-item").forEach((el) => {
+          const monthIdx = MONTH_NAMES.indexOf(el.textContent);
+          if (monthIdx > 0) {
+            const mm = String(monthIdx).padStart(2, "0");
+            el.classList.toggle("active", state.period === "monthly" && state.month === mm);
+          }
+          const seasonKey = Object.entries(SEASON_NAMES).find(([, v]) => v === el.textContent)?.[0];
+          if (seasonKey) {
+            el.classList.toggle("active", state.period === "seasonal" && state.season === seasonKey);
+          }
+        });
+      }
+
+      function updatePeriodForStatistic() {
+        if (state.statistic === "forecast") {
+          state.period = "yearly";
+          updatePeriodTrigger();
+          closePeriodDropdown();
+          periodTrigger.classList.add("disabled");
         } else {
-          map.addLayer(weatherLayer);
+          periodTrigger.classList.remove("disabled");
         }
       }
 
       async function loadTilesetImage(statistic, lead) {
         const id = tilesetId(statistic, lead);
-        const imageUrl = `${API_BASE_URL}/images/${state.model}/${statistic}/lead_${lead}.png`;
-        setStatus(`Loading ${id} (image)...`);
-
+        const subdir = periodImageSubdir();
+        const imageUrl = subdir
+          ? `${API_BASE_URL}/images/${state.model}/${statistic}/${subdir}/lead_${lead}.png`
+          : `${API_BASE_URL}/images/${state.model}/${statistic}/lead_${lead}.png`;
+        setStatus(`Loading ${id}...`);
         removeBiasLayer();
-
         const [west, south, east, north] = appConfig.imageBounds;
         map.addSource(sourceId, {
-          type: "image",
-          url: imageUrl,
+          type: "image", url: imageUrl,
           coordinates: [
-            [west, north],
-            [east, north],
-            [east, south],
-            [west, south],
+            [west, north], [east, north],
+            [east, south], [west, south],
           ],
         });
         addRasterLayer();
         applyLayerState();
-
-        map.fitBounds(
-          [[west, south], [east, north]],
-          { padding: 20 }
-        );
-        setStatus(`Showing ${id}`);
-      }
-
-      async function loadTilesetPmtiles(statistic, lead) {
-        const id = tilesetId(statistic, lead);
-        const tilejsonUrl = `${BASE_URL}/${id}.json`;
-        setStatus(`Loading ${id} (pmtiles)...`);
-
-        removeBiasLayer();
-
-        map.addSource(sourceId, {
-          type: "raster",
-          url: tilejsonUrl,
-          tileSize: 256,
-        });
-        addRasterLayer();
-
-        try {
-          const resp = await fetch(tilejsonUrl);
-          if (resp.ok) {
-            const tilejson = await resp.json();
-            if (typeof tilejson.minzoom === "number") {
-              let center = null;
-              if (tilejson.center && tilejson.center.length >= 2) {
-                center = [tilejson.center[0], tilejson.center[1]];
-              } else if (tilejson.bounds && tilejson.bounds.length >= 4) {
-                center = [
-                  (tilejson.bounds[0] + tilejson.bounds[2]) / 2,
-                  (tilejson.bounds[1] + tilejson.bounds[3]) / 2,
-                ];
-              }
-              if (center) {
-                map.jumpTo({ center, zoom: tilejson.minzoom });
-              } else {
-                map.setZoom(tilejson.minzoom);
-              }
-            } else if (tilejson.center && tilejson.center.length >= 2) {
-              map.easeTo({
-                center: [tilejson.center[0], tilejson.center[1]],
-              });
-            } else if (tilejson.bounds) {
-              map.fitBounds(
-                [
-                  [tilejson.bounds[0], tilejson.bounds[1]],
-                  [tilejson.bounds[2], tilejson.bounds[3]],
-                ],
-                { padding: 20 }
-              );
-            }
-          } else {
-            setStatus(`Failed to load ${id} (${resp.status})`);
-            return;
-          }
-        } catch (err) {
-          console.error("TileJSON fetch failed", err);
-          setStatus(`TileJSON fetch failed for ${id}`);
-          return;
+        if (initialLoad) {
+          map.fitBounds([[west, south], [east, north]], { padding: 20 });
+          initialLoad = false;
         }
-
-        applyLayerState();
         setStatus(`Showing ${id}`);
       }
 
       async function loadTileset(statistic, lead) {
         if (!map) return;
-        const statInfo = appConfig.statistics[statistic] || {};
-        const tileMode = statInfo.tile_mode || "pmtiles";
-        if (tileMode === "image") {
-          await loadTilesetImage(statistic, lead);
-        } else {
-          await loadTilesetPmtiles(statistic, lead);
-        }
+        await loadTilesetImage(statistic, lead);
       }
 
       function formatDate(d) {
@@ -384,28 +561,22 @@
         selectEl.innerHTML = "";
         const modelInitDate = appConfig.forecastInitDate[state.model] || null;
         const initDate = (statistic === "forecast" && modelInitDate)
-          ? new Date(modelInitDate + "T12:00:00Z")
-          : null;
+          ? new Date(modelInitDate + "T12:00:00Z") : null;
         for (const option of options) {
-          const opt = document.createElement("option");
           const key = option.key;
+          const opt = document.createElement("option");
           opt.value = key;
-
           if (key.includes("_")) {
-            // Window key like "1_7"
             const [start, end] = key.split("_").map(Number);
             let label = `${start}-${end} day avg`;
             if (initDate) {
-              const d1 = new Date(initDate);
-              d1.setUTCDate(d1.getUTCDate() + start);
-              const d2 = new Date(initDate);
-              d2.setUTCDate(d2.getUTCDate() + end);
+              const d1 = new Date(initDate); d1.setUTCDate(d1.getUTCDate() + start);
+              const d2 = new Date(initDate); d2.setUTCDate(d2.getUTCDate() + end);
               label += ` (${formatDate(d1)}-${formatDate(d2)})`;
             }
             opt.textContent = label;
           } else {
-            // Single day key like "7"
-            let label = key;
+            let label = `Day ${key}`;
             if (initDate) {
               const d = new Date(initDate);
               d.setUTCDate(d.getUTCDate() + parseInt(key));
@@ -419,10 +590,10 @@
 
       function populateStatistics(selectEl, statistics) {
         selectEl.innerHTML = "";
-        for (const statName of Object.keys(statistics).sort()) {
+        for (const statName of Object.keys(statistics)) {
           const opt = document.createElement("option");
           opt.value = statName;
-          opt.textContent = statName;
+          opt.textContent = STAT_LABELS[statName] || statName;
           selectEl.appendChild(opt);
         }
       }
@@ -439,15 +610,12 @@
 
       function buildLeadOptionsForModel(modelKey) {
         const model = appConfig.models.find(m => m.key === modelKey);
-        if (!model) {
-          return [{ key: "1" }];
-        }
+        if (!model) return [{ key: "1" }];
         const options = [];
         for (let i = model.lead_days_min; i <= model.lead_days_max; i++) {
           options.push({ key: String(i) });
         }
-        const windows = model.lead_windows || [];
-        for (const [start, end] of windows) {
+        for (const [start, end] of (model.lead_windows || [])) {
           if (start >= model.lead_days_min && end <= model.lead_days_max) {
             options.push({ key: `${start}_${end}` });
           }
@@ -458,29 +626,18 @@
       async function fetchAppConfig() {
         try {
           const resp = await fetch(`${API_BASE_URL}/api/config`);
-          if (!resp.ok) {
-            return;
-          }
+          if (!resp.ok) return;
           const data = await resp.json();
-          if (Array.isArray(data.models) && data.models.length > 0) {
-            appConfig.models = data.models;
-          }
-          if (typeof data.default_model === "string") {
-            appConfig.defaultModel = data.default_model;
-          }
-          if (typeof data.maptiler_api_key === "string") {
-            appConfig.maptilerApiKey = data.maptiler_api_key;
-          }
+          if (Array.isArray(data.models) && data.models.length > 0) appConfig.models = data.models;
+          if (typeof data.default_model === "string") appConfig.defaultModel = data.default_model;
+          if (typeof data.maptiler_api_key === "string") appConfig.maptilerApiKey = data.maptiler_api_key;
           if (typeof data.maptiler_style_id === "string" && data.maptiler_style_id.trim()) {
             appConfig.maptilerStyleId = data.maptiler_style_id.trim();
           }
           if (data.statistics && typeof data.statistics === "object" && !Array.isArray(data.statistics)) {
             appConfig.statistics = data.statistics;
           }
-          if (
-            typeof data.default_statistic === "string" &&
-            data.default_statistic in appConfig.statistics
-          ) {
+          if (typeof data.default_statistic === "string" && data.default_statistic in appConfig.statistics) {
             appConfig.defaultStatistic = data.default_statistic;
           }
           if (Array.isArray(data.image_bounds) && data.image_bounds.length === 4) {
@@ -489,9 +646,16 @@
           if (data.forecast_init_date && typeof data.forecast_init_date === "object") {
             appConfig.forecastInitDate = data.forecast_init_date;
           }
-        } catch (err) {
-          // Keep defaults when API config is unavailable.
-        }
+          if (Array.isArray(data.accumulation_modes)) appConfig.accumulationModes = data.accumulation_modes;
+          if (typeof data.current_month === "string") {
+            appConfig.currentMonth = data.current_month;
+            state.month = data.current_month;
+          }
+          if (typeof data.current_season === "string") {
+            appConfig.currentSeason = data.current_season;
+            state.season = data.current_season;
+          }
+        } catch (err) {}
       }
 
       const modelSelect = document.getElementById("modelSelect");
@@ -514,53 +678,30 @@
       landmarksOpacityValue.textContent = landmarksOpacityInput.value;
 
       function handleChange() {
-        if (!map) {
-          return;
-        }
+        if (!map) return;
         loadTileset(state.statistic, leadSelect.value);
       }
 
       async function goToZip() {
-        if (!map) {
-          return;
-        }
+        if (!map) return;
         const rawZip = zipInput.value.trim();
-        if (!rawZip) {
-          setStatus("Enter a ZIP code.");
-          return;
-        }
+        if (!rawZip) { setStatus("Enter a ZIP code."); return; }
         setStatus(`Looking up ZIP ${rawZip}...`);
-        const url = `${API_BASE_URL}/api/zip?zip=${encodeURIComponent(rawZip)}`;
         try {
-          const resp = await fetch(url);
-          if (!resp.ok) {
-            setStatus(`ZIP lookup failed (${resp.status})`);
-            return;
-          }
+          const resp = await fetch(`${API_BASE_URL}/api/zip?zip=${encodeURIComponent(rawZip)}`);
+          if (!resp.ok) { setStatus(`ZIP lookup failed (${resp.status})`); return; }
           const data = await resp.json();
-          if (!data.found) {
-            setStatus(`ZIP not found: ${rawZip}`);
-            return;
-          }
+          if (!data.found) { setStatus(`ZIP not found: ${rawZip}`); return; }
           if (Array.isArray(data.bounds) && data.bounds.length === 4) {
             map.fitBounds(
-              [
-                [data.bounds[0], data.bounds[1]],
-                [data.bounds[2], data.bounds[3]],
-              ],
+              [[data.bounds[0], data.bounds[1]], [data.bounds[2], data.bounds[3]]],
               { padding: 24, duration: 700 }
             );
           } else {
-            map.flyTo({
-              center: [data.lon, data.lat],
-              zoom: 10,
-              duration: 700,
-            });
+            map.flyTo({ center: [data.lon, data.lat], zoom: 10, duration: 700 });
           }
           setStatus(`Centered on ZIP ${data.zip}`);
-        } catch (err) {
-          setStatus("ZIP lookup error");
-        }
+        } catch (err) { setStatus("ZIP lookup error"); }
       }
 
       modelSelect.addEventListener("change", () => {
@@ -570,22 +711,18 @@
         leadSelect.value = leadOpts[0].key;
         handleChange();
       });
+
       statSelect.addEventListener("change", () => {
         state.statistic = statSelect.value;
+        updatePeriodForStatistic();
         const leadOpts = buildLeadOptionsForModel(state.model);
         populateLeads(leadSelect, leadOpts, state.statistic);
         leadSelect.value = leadOpts[0].key;
         handleChange();
       });
       leadSelect.addEventListener("change", handleChange);
-      modeSelect.addEventListener("change", () => {
-        state.mode = modeSelect.value;
-        applyLayerState();
-      });
-      detailSelect.addEventListener("change", () => {
-        state.detailMode = detailSelect.value;
-        applyLayerState();
-      });
+      modeSelect.addEventListener("change", () => { state.mode = modeSelect.value; applyLayerState(); });
+      detailSelect.addEventListener("change", () => { state.detailMode = detailSelect.value; applyLayerState(); });
       weatherOpacityInput.addEventListener("input", () => {
         state.weatherOpacity = Number(weatherOpacityInput.value);
         weatherOpacityValue.textContent = weatherOpacityInput.value;
@@ -596,14 +733,20 @@
         landmarksOpacityValue.textContent = landmarksOpacityInput.value;
         applyLayerState();
       });
-      zipGoButton.addEventListener("click", () => {
-        goToZip();
-      });
-      zipInput.addEventListener("keydown", (event) => {
-        if (event.key === "Enter") {
-          event.preventDefault();
-          goToZip();
-        }
+      zipGoButton.addEventListener("click", goToZip);
+      zipInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); goToZip(); } });
+
+      const downloadBtn = document.getElementById("downloadBtn");
+      downloadBtn.addEventListener("click", () => {
+        const params = new URLSearchParams({
+          model: state.model,
+          statistic: state.statistic,
+          lead: leadSelect.value,
+          period: state.period,
+        });
+        if (state.period === "monthly") params.set("month", state.month);
+        if (state.period === "seasonal") params.set("season", state.season);
+        window.open(`${API_BASE_URL}/api/export-image?${params}`, "_blank");
       });
 
       const popup = new maplibregl.Popup({ closeButton: true });
@@ -612,9 +755,8 @@
         map.on("load", async () => {
           cacheLandmarkLayers();
           if (!appConfig.maptilerApiKey) {
-            setStatus("Using fallback basemap; set MAPTILER_API_KEY in backend env to enable MapTiler.");
+            setStatus("Using fallback basemap; set MAPTILER_API_KEY for MapTiler.");
           }
-          // Populate model dropdown.
           populateModels(modelSelect, appConfig.models);
           state.model = appConfig.defaultModel;
           modelSelect.value = state.model;
@@ -622,6 +764,11 @@
           populateStatistics(statSelect, appConfig.statistics);
           state.statistic = appConfig.defaultStatistic;
           statSelect.value = state.statistic;
+
+          buildPeriodDropdown();
+          state.period = "yearly";
+          updatePeriodTrigger();
+          updatePeriodForStatistic();
 
           const leadOpts = buildLeadOptionsForModel(state.model);
           populateLeads(leadSelect, leadOpts, state.statistic);
@@ -632,7 +779,7 @@
         map.on("click", async (event) => {
           const { lng, lat } = event.lngLat;
           const lead = leadSelect.value;
-          const url = `${API_BASE_URL}/api/stats?model=${encodeURIComponent(state.model)}&lead=${encodeURIComponent(lead)}&lat=${lat}&lon=${lng}`;
+          const url = `${API_BASE_URL}/api/stats?model=${encodeURIComponent(state.model)}&lead=${encodeURIComponent(lead)}&lat=${lat}&lon=${lng}${periodStatsParams()}`;
           let text = "Loading...";
           try {
             const resp = await fetch(url);
@@ -646,12 +793,11 @@
                 text = "No data";
               } else {
                 const lines = entries.map(([name, stat]) => {
-                  if (stat.no_data || stat.value === null) {
-                    return `${name}: No data`;
-                  }
-                  return `${name}: ${Number(stat.value).toFixed(2)} ${stat.units}`;
+                  const label = STAT_LABELS[name] || name;
+                  if (stat.no_data || stat.value === null) return `<b>${label}:</b> No data`;
+                  return `<b>${label}:</b> ${Number(stat.value).toFixed(2)} ${stat.units}`;
                 });
-                text = lines.join("<br />");
+                text = lines.join("<br>");
               }
             }
           } catch (err) {
