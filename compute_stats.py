@@ -38,7 +38,7 @@ GFS_DIR: Path = Path("model_data/gfs")
 GFS_GRID_LATS_PATH: Path = GFS_DIR / "grid_lats.npy"
 GFS_GRID_LONS_PATH: Path = GFS_DIR / "grid_lons.npy"
 PRISM_DIR = Path("prism_data")
-OUTPUT_ROOT: Path = Path("stats")
+OUTPUT_ROOT: Path = Path("stats_output")
 LEAD_DAYS_MIN: int = 1
 LEAD_DAYS_MAX: int = 14
 _active_lead_windows: list[tuple[int, int]] = list(MODEL_REGISTRY[DEFAULT_MODEL].lead_windows)
@@ -51,7 +51,7 @@ def _configure_for_model(model_key: str) -> None:
     GFS_DIR = Path(config.data_dir)
     GFS_GRID_LATS_PATH = GFS_DIR / "grid_lats.npy"
     GFS_GRID_LONS_PATH = GFS_DIR / "grid_lons.npy"
-    OUTPUT_ROOT = Path("stats") / model_key
+    OUTPUT_ROOT = Path("stats_output") / model_key
     LEAD_DAYS_MIN = config.lead_days_min
     LEAD_DAYS_MAX = config.lead_days_max
     _active_lead_windows = list(config.lead_windows)

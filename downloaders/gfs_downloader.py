@@ -233,7 +233,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
 
         gfs_dir = self.output_dir
         if output_root is None:
-            output_root = Path("stats")
+            output_root = Path("stats_output")
         forecast_dir = output_root / "forecast"
         forecast_dir.mkdir(parents=True, exist_ok=True)
 

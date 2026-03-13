@@ -15,7 +15,7 @@ build/
 # Data and outputs (large or generated)
 model_data/
 prism_data/
-stats/
+stats_output/
 tiles_output/
 
 # IDE / OS

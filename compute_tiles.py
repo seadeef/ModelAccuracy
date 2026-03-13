@@ -484,7 +484,7 @@ def main() -> None:
     args = parse_args()
     selected_lead_key = args.lead.strip().replace("-", "_") if args.lead is not None else None
     model_key = args.model
-    stats_root = args.stats_root if args.stats_root is not None else Path("stats") / model_key
+    stats_root = args.stats_root if args.stats_root is not None else Path("stats_output") / model_key
 
     selected_plugins = resolve_statistics(args.stats)
     pmtiles_root = args.output_dir / "pmtiles" / model_key
