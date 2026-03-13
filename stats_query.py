@@ -6,10 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from lead_windows import normalize_lead_key
 from statistics_plugins.registry import STATISTICS_BY_NAME
-
-DEFAULT_STATS_ROOT = Path("stats")
 
 
 @lru_cache(maxsize=64)
@@ -30,10 +27,10 @@ def stats_at_point(
     lat: float,
     lon: float,
     lead: str | int,
-    stats_root: Path = DEFAULT_STATS_ROOT,
+    stats_root: Path = Path("stats"),
     stat_names: list[str] | None = None,
 ) -> dict[str, dict[str, float | None | str | bool]]:
-    lead_key = normalize_lead_key(lead)
+    lead_key = str(lead)
     names = stat_names or sorted(STATISTICS_BY_NAME)
     result: dict[str, dict[str, float | None | str | bool]] = {}
 

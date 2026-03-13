@@ -12,8 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
-from lead_windows import LEAD_WINDOWS, window_to_key
-from lead_config import LEAD_DAYS_MAX, LEAD_DAYS_MIN
+from model_registry import MODEL_REGISTRY, DEFAULT_MODEL, window_to_key
 from statistics_plugins.registry import VERIFICATION_STATISTICS
 
 try:
@@ -34,12 +33,28 @@ except Exception as exc:  # pragma: no cover - environment dependent
     ) from exc
 
 
-GFS_MODEL = "gfs"
-GFS_DIR = Path("model_data") / GFS_MODEL
-GFS_GRID_LATS_PATH = GFS_DIR / "grid_lats.npy"
-GFS_GRID_LONS_PATH = GFS_DIR / "grid_lons.npy"
+# These module-level variables are set by _configure_for_model() before computation.
+GFS_DIR: Path = Path("model_data/gfs")
+GFS_GRID_LATS_PATH: Path = GFS_DIR / "grid_lats.npy"
+GFS_GRID_LONS_PATH: Path = GFS_DIR / "grid_lons.npy"
 PRISM_DIR = Path("prism_data")
-OUTPUT_ROOT = Path("stats")
+OUTPUT_ROOT: Path = Path("stats")
+LEAD_DAYS_MIN: int = 1
+LEAD_DAYS_MAX: int = 14
+_active_lead_windows: list[tuple[int, int]] = list(MODEL_REGISTRY[DEFAULT_MODEL].lead_windows)
+
+
+def _configure_for_model(model_key: str) -> None:
+    global GFS_DIR, GFS_GRID_LATS_PATH, GFS_GRID_LONS_PATH, OUTPUT_ROOT
+    global LEAD_DAYS_MIN, LEAD_DAYS_MAX, _active_lead_windows
+    config = MODEL_REGISTRY[model_key]
+    GFS_DIR = Path(config.data_dir)
+    GFS_GRID_LATS_PATH = GFS_DIR / "grid_lats.npy"
+    GFS_GRID_LONS_PATH = GFS_DIR / "grid_lons.npy"
+    OUTPUT_ROOT = Path("stats") / model_key
+    LEAD_DAYS_MIN = config.lead_days_min
+    LEAD_DAYS_MAX = config.lead_days_max
+    _active_lead_windows = list(config.lead_windows)
 
 GFS_FILE_RE = re.compile(r"f(?P<fhour>\d{3})_(?P<level>[^.]+)\.grib2$")
 
@@ -543,7 +558,7 @@ def _write_stats(
             np.savez_compressed(stat_dir / f"lead_{lead}.npz", **outputs)
 
         # Build requested combined lead windows from already-computed per-lead accumulators.
-        for start, end in LEAD_WINDOWS:
+        for start, end in _active_lead_windows:
             lead_ids = [lead for lead in sorted(accumulators) if start <= lead <= end]
             expected_count = end - start + 1
             if len(lead_ids) != expected_count:
@@ -628,21 +643,32 @@ def preconvert_grib2_to_npy() -> None:
     print(f"Done. Converted {converted} files, skipped {skipped} (already existed).")
 
 
-def main() -> None:
+def main(model_key: str = DEFAULT_MODEL) -> None:
+    _configure_for_model(model_key)
     stat_names = ", ".join(plugin.spec.name for plugin in VERIFICATION_STATISTICS)
     print(
-        "Computing statistics on native GFS grid. "
+        f"Computing statistics for model '{model_key}' on native grid. "
         f"Enabled statistics: {stat_names}"
     )
     accumulators, grid_meta, skipped_partial_files = _compute_lead_stats()
     _write_stats(accumulators, grid_meta)
     if skipped_partial_files:
-        print(f"Skipped {skipped_partial_files} partial GFS files (*.part).")
+        print(f"Skipped {skipped_partial_files} partial files (*.part).")
     print(f"Wrote statistics to {OUTPUT_ROOT.resolve()}")
 
 
 if __name__ == "__main__":
-    if "--preconvert" in sys.argv:
+    import argparse as _argparse
+
+    _parser = _argparse.ArgumentParser(description="Compute verification statistics")
+    _parser.add_argument("--model", default=DEFAULT_MODEL, choices=list(MODEL_REGISTRY),
+                         help="Model to compute statistics for")
+    _parser.add_argument("--preconvert", action="store_true",
+                         help="Convert GRIB2 files to .npy for fast reading")
+    _args = _parser.parse_args()
+
+    if _args.preconvert:
+        _configure_for_model(_args.model)
         preconvert_grib2_to_npy()
     else:
-        main()
+        main(_args.model)

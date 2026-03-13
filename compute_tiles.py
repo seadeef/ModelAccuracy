@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
-from lead_windows import normalize_lead_key
+from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from statistics_plugins.registry import ENABLED_STATISTICS, STATISTICS_BY_NAME
 
 try:
@@ -22,7 +22,6 @@ except Exception as exc:  # pragma: no cover - environment dependent
         "rasterio is required. Install with: pip install rasterio"
     ) from exc
 
-DEFAULT_STATS_ROOT = Path("stats")
 WEB_MERCATOR_MAX_LAT = 85.05112878
 US_HEADER_CENTER = [-98.5795, 39.8283, 3.0]
 US_HEADER_BOUNDS = [-125.0, 24.0, -66.0, 50.0]
@@ -33,10 +32,16 @@ def parse_args() -> argparse.Namespace:
         description="Generate tiles (PNG images or PMTiles) for configured statistics."
     )
     parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        choices=list(MODEL_REGISTRY),
+        help="Model to generate tiles for.",
+    )
+    parser.add_argument(
         "--stats-root",
         type=Path,
-        default=DEFAULT_STATS_ROOT,
-        help="Root directory containing stats/<stat_name>/ subdirectories.",
+        default=None,
+        help="Root directory containing <stat_name>/ subdirectories. Defaults to stats/<model>/.",
     )
     parser.add_argument(
         "--stat",
@@ -477,11 +482,13 @@ def _process_layer_pmtiles(
 
 def main() -> None:
     args = parse_args()
-    selected_lead_key = normalize_lead_key(args.lead) if args.lead is not None else None
+    selected_lead_key = args.lead.strip().replace("-", "_") if args.lead is not None else None
+    model_key = args.model
+    stats_root = args.stats_root if args.stats_root is not None else Path("stats") / model_key
 
     selected_plugins = resolve_statistics(args.stats)
-    pmtiles_root = args.output_dir / "pmtiles"
-    images_root = args.output_dir / "images"
+    pmtiles_root = args.output_dir / "pmtiles" / model_key
+    images_root = args.output_dir / "images" / model_key
     tmp_root = args.output_dir / "tmp"
 
     rio_jobs = args.jobs
@@ -492,7 +499,7 @@ def main() -> None:
     for plugin in selected_plugins:
         stat_name = plugin.spec.name
         tile_mode = plugin.spec.tile_mode
-        stats_dir = args.stats_root / stat_name
+        stats_dir = stats_root / stat_name
         if not stats_dir.exists():
             print(f"Skipping statistic '{stat_name}' (missing {stats_dir}).")
             continue
