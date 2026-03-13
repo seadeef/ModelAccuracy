@@ -12,7 +12,7 @@ class SACCPlugin:
         name="sacc",
         units="%",
         render_field="value",
-        colormap="diverging",
+        colormap="diverging_reversed",
     )
 
     def init_accumulator(self, shape: tuple[int, int]) -> dict[str, np.ndarray]:
@@ -65,4 +65,9 @@ class SACCPlugin:
         return {
             "value": value,
             "sample_count": accumulator["sample_count"],
+            "sum_model": sum_model,
+            "sum_obs": sum_obs,
+            "sum_model_sq": sum_model_sq,
+            "sum_obs_sq": sum_obs_sq,
+            "sum_cross": sum_cross,
         }

@@ -6,7 +6,7 @@ from statistics_plugins.base import StatisticSpec
 
 
 class BiasPlugin:
-    spec = StatisticSpec(name="bias", units="mm", render_field="value", colormap="diverging")
+    spec = StatisticSpec(name="bias", units="mm", render_field="value", colormap="diverging_reversed")
 
     def init_accumulator(self, shape: tuple[int, int]) -> dict[str, np.ndarray]:
         return {
