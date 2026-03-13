@@ -7,6 +7,7 @@ Usage examples:
     python download.py --forecast-only                     # all models, today's forecast
     python download.py --forecast-only --model gfs         # just GFS
     python download.py --all --start-date 2025-01-01 --end-date 2025-01-31
+    python download.py --no-prism --model gfs --start-date 2025-01-01  # skip PRISM
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL, ModelConfig
+from downloaders.prism_downloader import PRISMDownloaderParallel
 
 
 def _resolve_models(args: argparse.Namespace) -> list[ModelConfig]:
@@ -26,6 +28,26 @@ def _resolve_models(args: argparse.Namespace) -> list[ModelConfig]:
         print(f"Unknown model: {key}. Available: {', '.join(sorted(MODEL_REGISTRY))}")
         sys.exit(1)
     return [MODEL_REGISTRY[key]]
+
+
+def _run_prism(args: argparse.Namespace) -> None:
+    """Download PRISM observations for the same date range as model data."""
+    dl = PRISMDownloaderParallel(
+        output_dir="prism_data",
+        max_workers=args.workers or 12,
+        max_retries=3,
+        timeout_seconds=60,
+        remove_zip_after_extract=True,
+    )
+    if args.start_year:
+        dl.download_year_range(
+            start_year=args.start_year,
+            end_year=args.end_year or args.start_year,
+        )
+    else:
+        start = args.start_date or datetime.utcnow().strftime("%Y-%m-%d")
+        end = args.end_date or start
+        dl.download_date_range(start_date=start, end_date=end)
 
 
 def _run_download(config: ModelConfig, args: argparse.Namespace) -> None:
@@ -71,7 +93,7 @@ def _run_forecast(config: ModelConfig, args: argparse.Namespace) -> None:
         forecast_hours=forecast_hours,
     )
 
-    output_root = Path("stats") / config.key
+    output_root = Path("stats_output") / config.key
     print(f"\n--- Extracting forecast for model '{config.key}' ---")
     downloader.extract_forecast(
         forecast_hours=forecast_hours,
@@ -93,6 +115,8 @@ def main() -> None:
     parser.add_argument("--forecast-only", action="store_true",
                         help="Download today's forecast for each model through its max lead time, "
                              "then extract into stats format")
+    parser.add_argument("--no-prism", action="store_true",
+                        help="Skip PRISM observation download")
     parser.add_argument("--start-date",
                         help="Start date (YYYY-MM-DD). Defaults to today.")
     parser.add_argument("--end-date",
@@ -113,6 +137,9 @@ def main() -> None:
         for config in models:
             _run_forecast(config, args)
     else:
+        if not args.no_prism:
+            print("\n=== Downloading PRISM observations ===")
+            _run_prism(args)
         for config in models:
             print(f"\n=== Downloading model '{config.key}' ===")
             _run_download(config, args)
