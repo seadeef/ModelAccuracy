@@ -11,7 +11,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 _this_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_this_dir.parent))
@@ -217,7 +217,7 @@ if __name__ == "__main__":
             extract=extract,
         )
     else:
-        start = args.start_date or datetime.utcnow().strftime("%Y-%m-%d")
+        start = args.start_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         end = args.end_date or start
         dl.download_date_range(
             start_date=start,

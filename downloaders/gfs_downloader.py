@@ -6,7 +6,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 _this_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_this_dir.parent))
@@ -225,7 +225,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         lead_windows: list[tuple[int, int]] | None = None,
         output_root: Path | None = None,
     ) -> None:
-        """Extract raw GFS precipitation forecast into stats/forecast/ format for tile generation."""
+        """Extract raw GFS precipitation forecast into stats_output/forecast/ format for tile generation."""
         import numpy as np
         import rasterio.transform
         import xarray as xr
@@ -304,8 +304,12 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             lat_res = abs(float(lats[1] - lats[0]))
             lon_res = abs(float(lons[1] - lons[0]))
             west = float(lons.min()) - lon_res / 2.0
-            north = float(lats.max()) + lat_res / 2.0
-            return rasterio.transform.from_origin(west, north, lon_res, lat_res)
+            if lats[0] < lats[-1]:
+                south = float(lats.min()) - lat_res / 2.0
+                return rasterio.transform.Affine(lon_res, 0, west, 0, lat_res, south)
+            else:
+                north = float(lats.max()) + lat_res / 2.0
+                return rasterio.transform.from_origin(west, north, lon_res, lat_res)
 
         def _grid_coords_from_transform(transform, height, width):
             lons = transform.c + (np.arange(width) + 0.5) * transform.a
@@ -405,7 +409,7 @@ if __name__ == "__main__":
             forecast_hours=forecast_hours,
         )
     else:
-        start = args.start_date or datetime.utcnow().strftime("%Y-%m-%d")
+        start = args.start_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
         end = args.end_date or start
         downloader.download_date_range(
             start_date=start,
