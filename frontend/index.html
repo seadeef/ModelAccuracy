@@ -47,6 +47,10 @@
   <body>
     <div class="controls">
       <label>
+        Model
+        <select id="modelSelect"></select>
+      </label>
+      <label>
         Statistic
         <select id="statSelect"></select>
       </label>
@@ -101,17 +105,17 @@
       const layerId = "bias-layer";
       const statusEl = document.getElementById("status");
       const appConfig = {
-        leadDaysMin: 1,
-        leadDaysMax: 14,
-        leadOptions: [],
+        models: [],             // [{key, label, lead_days_min, lead_days_max, lead_windows}]
+        defaultModel: "gfs",
         maptilerApiKey: "",
         maptilerStyleId: DEFAULT_MAPTILER_STYLE_ID,
-        statistics: {},  // { name: { tile_mode } }
+        statistics: {},         // { name: { tile_mode } }
         defaultStatistic: "bias",
         imageBounds: US_BOUNDS,
-        forecastInitDate: null,
+        forecastInitDate: {},   // { model_key: "YYYY-MM-DD" }
       };
       const state = {
+        model: "gfs",
         statistic: "bias",
         mode: "both",
         detailMode: "low",
@@ -274,7 +278,7 @@
 
       async function loadTilesetImage(statistic, lead) {
         const id = tilesetId(statistic, lead);
-        const imageUrl = `${API_BASE_URL}/images/${statistic}/lead_${lead}.png`;
+        const imageUrl = `${API_BASE_URL}/images/${state.model}/${statistic}/lead_${lead}.png`;
         setStatus(`Loading ${id} (image)...`);
 
         removeBiasLayer();
@@ -371,33 +375,43 @@
         }
       }
 
+      function formatDate(d) {
+        const mon = d.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
+        return `${mon} ${d.getUTCDate()}`;
+      }
+
       function populateLeads(selectEl, options, statistic) {
         selectEl.innerHTML = "";
-        const initDate = (statistic === "forecast" && appConfig.forecastInitDate)
-          ? new Date(appConfig.forecastInitDate + "T12:00:00Z")
+        const modelInitDate = appConfig.forecastInitDate[state.model] || null;
+        const initDate = (statistic === "forecast" && modelInitDate)
+          ? new Date(modelInitDate + "T12:00:00Z")
           : null;
         for (const option of options) {
           const opt = document.createElement("option");
-          opt.value = option.key;
-          if (initDate && /^\d+$/.test(option.key)) {
-            const d = new Date(initDate);
-            d.setUTCDate(d.getUTCDate() + parseInt(option.key));
-            const mon = d.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
-            const day = d.getUTCDate();
-            opt.textContent = `${option.label} (${mon} ${day})`;
-          } else if (initDate && option.key.includes("_")) {
-            const [start, end] = option.key.split("_").map(Number);
-            const d1 = new Date(initDate);
-            d1.setUTCDate(d1.getUTCDate() + start);
-            const d2 = new Date(initDate);
-            d2.setUTCDate(d2.getUTCDate() + end);
-            const fmt = (d) => {
-              const mon = d.toLocaleString("en-US", { month: "short", timeZone: "UTC" });
-              return `${mon} ${d.getUTCDate()}`;
-            };
-            opt.textContent = `${option.label} (${fmt(d1)}-${fmt(d2)})`;
+          const key = option.key;
+          opt.value = key;
+
+          if (key.includes("_")) {
+            // Window key like "1_7"
+            const [start, end] = key.split("_").map(Number);
+            let label = `${start}-${end} day avg`;
+            if (initDate) {
+              const d1 = new Date(initDate);
+              d1.setUTCDate(d1.getUTCDate() + start);
+              const d2 = new Date(initDate);
+              d2.setUTCDate(d2.getUTCDate() + end);
+              label += ` (${formatDate(d1)}-${formatDate(d2)})`;
+            }
+            opt.textContent = label;
           } else {
-            opt.textContent = option.label;
+            // Single day key like "7"
+            let label = key;
+            if (initDate) {
+              const d = new Date(initDate);
+              d.setUTCDate(d.getUTCDate() + parseInt(key));
+              label += ` (${formatDate(d)})`;
+            }
+            opt.textContent = label;
           }
           selectEl.appendChild(opt);
         }
@@ -413,6 +427,34 @@
         }
       }
 
+      function populateModels(selectEl, models) {
+        selectEl.innerHTML = "";
+        for (const model of models) {
+          const opt = document.createElement("option");
+          opt.value = model.key;
+          opt.textContent = model.label;
+          selectEl.appendChild(opt);
+        }
+      }
+
+      function buildLeadOptionsForModel(modelKey) {
+        const model = appConfig.models.find(m => m.key === modelKey);
+        if (!model) {
+          return [{ key: "1" }];
+        }
+        const options = [];
+        for (let i = model.lead_days_min; i <= model.lead_days_max; i++) {
+          options.push({ key: String(i) });
+        }
+        const windows = model.lead_windows || [];
+        for (const [start, end] of windows) {
+          if (start >= model.lead_days_min && end <= model.lead_days_max) {
+            options.push({ key: `${start}_${end}` });
+          }
+        }
+        return options;
+      }
+
       async function fetchAppConfig() {
         try {
           const resp = await fetch(`${API_BASE_URL}/api/config`);
@@ -420,15 +462,11 @@
             return;
           }
           const data = await resp.json();
-          if (typeof data.lead_days_min === "number") {
-            appConfig.leadDaysMin = data.lead_days_min;
+          if (Array.isArray(data.models) && data.models.length > 0) {
+            appConfig.models = data.models;
           }
-          if (typeof data.lead_days_max === "number") {
-            appConfig.leadDaysMax = data.lead_days_max;
-          }
-          if (appConfig.leadDaysMin > appConfig.leadDaysMax) {
-            appConfig.leadDaysMin = 1;
-            appConfig.leadDaysMax = 14;
+          if (typeof data.default_model === "string") {
+            appConfig.defaultModel = data.default_model;
           }
           if (typeof data.maptiler_api_key === "string") {
             appConfig.maptilerApiKey = data.maptiler_api_key;
@@ -445,13 +483,10 @@
           ) {
             appConfig.defaultStatistic = data.default_statistic;
           }
-          if (Array.isArray(data.lead_options) && data.lead_options.length > 0) {
-            appConfig.leadOptions = data.lead_options;
-          }
           if (Array.isArray(data.image_bounds) && data.image_bounds.length === 4) {
             appConfig.imageBounds = data.image_bounds;
           }
-          if (typeof data.forecast_init_date === "string") {
+          if (data.forecast_init_date && typeof data.forecast_init_date === "object") {
             appConfig.forecastInitDate = data.forecast_init_date;
           }
         } catch (err) {
@@ -459,6 +494,7 @@
         }
       }
 
+      const modelSelect = document.getElementById("modelSelect");
       const statSelect = document.getElementById("statSelect");
       const leadSelect = document.getElementById("leadSelect");
       const modeSelect = document.getElementById("modeSelect");
@@ -527,10 +563,18 @@
         }
       }
 
+      modelSelect.addEventListener("change", () => {
+        state.model = modelSelect.value;
+        const leadOpts = buildLeadOptionsForModel(state.model);
+        populateLeads(leadSelect, leadOpts, state.statistic);
+        leadSelect.value = leadOpts[0].key;
+        handleChange();
+      });
       statSelect.addEventListener("change", () => {
         state.statistic = statSelect.value;
-        populateLeads(leadSelect, appConfig.leadOptions, state.statistic);
-        leadSelect.value = appConfig.leadOptions[0].key;
+        const leadOpts = buildLeadOptionsForModel(state.model);
+        populateLeads(leadSelect, leadOpts, state.statistic);
+        leadSelect.value = leadOpts[0].key;
         handleChange();
       });
       leadSelect.addEventListener("change", handleChange);
@@ -570,24 +614,25 @@
           if (!appConfig.maptilerApiKey) {
             setStatus("Using fallback basemap; set MAPTILER_API_KEY in backend env to enable MapTiler.");
           }
+          // Populate model dropdown.
+          populateModels(modelSelect, appConfig.models);
+          state.model = appConfig.defaultModel;
+          modelSelect.value = state.model;
+
           populateStatistics(statSelect, appConfig.statistics);
           state.statistic = appConfig.defaultStatistic;
           statSelect.value = state.statistic;
-          if (appConfig.leadOptions.length === 0) {
-            appConfig.leadOptions = [];
-            for (let i = appConfig.leadDaysMin; i <= appConfig.leadDaysMax; i += 1) {
-              appConfig.leadOptions.push({ key: String(i), label: String(i) });
-            }
-          }
-          populateLeads(leadSelect, appConfig.leadOptions, state.statistic);
-          leadSelect.value = appConfig.leadOptions[0].key;
+
+          const leadOpts = buildLeadOptionsForModel(state.model);
+          populateLeads(leadSelect, leadOpts, state.statistic);
+          leadSelect.value = leadOpts[0].key;
           handleChange();
         });
 
         map.on("click", async (event) => {
           const { lng, lat } = event.lngLat;
           const lead = leadSelect.value;
-          const url = `${API_BASE_URL}/api/stats?lead=${encodeURIComponent(lead)}&lat=${lat}&lon=${lng}`;
+          const url = `${API_BASE_URL}/api/stats?model=${encodeURIComponent(state.model)}&lead=${encodeURIComponent(lead)}&lat=${lat}&lon=${lng}`;
           let text = "Loading...";
           try {
             const resp = await fetch(url);
