@@ -21,9 +21,23 @@ def _load_metadata(stats_root_str: str, stat_name: str) -> tuple[np.ndarray, np.
 
 
 @lru_cache(maxsize=256)
-def _load_stat_values(stats_root_str: str, stat_name: str, lead_key: str, field: str) -> np.ndarray:
+def _load_stat_values(
+    stats_root_str: str,
+    stat_name: str,
+    lead_key: str,
+    field: str,
+    period: str = "yearly",
+    month: str | None = None,
+    season: str | None = None,
+) -> np.ndarray:
     stats_dir = Path(stats_root_str) / stat_name
-    tile = np.load(stats_dir / f"lead_{lead_key}.npz", allow_pickle=False)
+    if period == "monthly" and month is not None:
+        npz_path = stats_dir / "monthly" / month / f"lead_{lead_key}.npz"
+    elif period == "seasonal" and season is not None:
+        npz_path = stats_dir / "seasonal" / season / f"lead_{lead_key}.npz"
+    else:
+        npz_path = stats_dir / f"lead_{lead_key}.npz"
+    tile = np.load(npz_path, allow_pickle=False)
     return tile[field]
 
 
@@ -33,19 +47,29 @@ def stats_at_point(
     lead: str | int,
     stats_root: Path = _project_root / "stats_output",
     stat_names: list[str] | None = None,
+    period: str = "yearly",
+    month: str | None = None,
+    season: str | None = None,
 ) -> dict[str, dict[str, float | None | str | bool]]:
     lead_key = str(lead)
-    names = stat_names or sorted(STATISTICS_BY_NAME)
+    names = stat_names or list(STATISTICS_BY_NAME)
     result: dict[str, dict[str, float | None | str | bool]] = {}
 
     for stat_name in names:
         plugin = STATISTICS_BY_NAME[stat_name]
+
+        # Forecast only has yearly data.
+        effective_period = "yearly" if stat_name == "forecast" else period
+
         lats, lons = _load_metadata(str(stats_root), stat_name)
         lat_idx = int(np.argmin(np.abs(lats - lat)))
         lon_idx = int(np.argmin(np.abs(lons - lon)))
         field = plugin.spec.render_field
         try:
-            values = _load_stat_values(str(stats_root), stat_name, lead_key, field)
+            values = _load_stat_values(
+                str(stats_root), stat_name, lead_key, field,
+                period=effective_period, month=month, season=season,
+            )
         except (FileNotFoundError, KeyError):
             result[stat_name] = {
                 "value": None,
