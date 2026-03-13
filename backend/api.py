@@ -4,8 +4,13 @@ from __future__ import annotations
 import csv
 import os
 import re
+import sys
 from functools import lru_cache
 from pathlib import Path
+
+_this_dir = Path(__file__).resolve().parent
+_project_root = _this_dir.parent
+sys.path.insert(0, str(_project_root))
 
 import numpy as np
 
@@ -15,12 +20,12 @@ from fastapi.staticfiles import StaticFiles
 
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from statistics_plugins.registry import STATISTICS_BY_NAME
-from stats_query import stats_at_point
+from backend.stats_query import stats_at_point
 
 MAPTILER_API_KEY = os.getenv("MAPTILER_API_KEY", "")
 MAPTILER_STYLE_ID = "streets-v2"
-ZIP_LOOKUP_CSV = Path(os.getenv("ZIP_LOOKUP_CSV", "zip_lookup.csv"))
-TILES_OUTPUT = Path(os.getenv("TILES_OUTPUT", "tiles_output"))
+ZIP_LOOKUP_CSV = _this_dir / os.getenv("ZIP_LOOKUP_CSV", "zip_lookup.csv")
+TILES_OUTPUT = _project_root / os.getenv("TILES_OUTPUT", "tiles_output")
 US_CROP_BOUNDS = [-125.125, 23.875, -65.875, 50.125]  # pixel-snapped to 0.25° GFS grid
 
 app = FastAPI(title="Model Statistics Query API")
@@ -73,7 +78,7 @@ def _load_zip_lookup(path_str: str) -> dict[str, dict[str, float]]:
     return lookup
 
 
-STATS_ROOT = Path("stats")
+STATS_ROOT = _project_root / "stats_output"
 
 
 def _get_forecast_init_date(model_key: str) -> str | None:

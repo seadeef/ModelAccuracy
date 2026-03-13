@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import sys
 from functools import lru_cache
 from pathlib import Path
+
+_project_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_project_root))
 
 import numpy as np
 
@@ -27,7 +31,7 @@ def stats_at_point(
     lat: float,
     lon: float,
     lead: str | int,
-    stats_root: Path = Path("stats"),
+    stats_root: Path = _project_root / "stats_output",
     stat_names: list[str] | None = None,
 ) -> dict[str, dict[str, float | None | str | bool]]:
     lead_key = str(lead)
