@@ -13,7 +13,6 @@ class StatisticSpec:
     render_field: str
     colormap: str = "diverging"
     fixed_range: tuple[float, float] | None = None
-    tile_mode: str = "image"  # "image" (single PNG) or "pmtiles"
 
 
 class StatisticPlugin(Protocol):

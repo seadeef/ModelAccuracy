@@ -16,7 +16,6 @@ class ForecastPlugin:
         units="mm",
         render_field="precip",
         colormap="sequential",
-        tile_mode="image",
     )
 
     def init_accumulator(self, shape):
