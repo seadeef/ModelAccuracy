@@ -1,145 +1,118 @@
 # ModelAccuracy
 
-## Statistics pipeline
+Precipitation forecast verification system. Downloads GFS model forecasts and PRISM observations, computes verification statistics, generates map tiles, and serves an interactive viewer.
 
-Statistics are computed by plugin and written under separate directories:
+## Quick start
 
-- `stats/<stat_name>/metadata.npz`
-- `stats/<stat_name>/lead_<N>.npz`
-- `stats/<stat_name>/lead_1_7.npz`
-- `stats/<stat_name>/lead_7_14.npz`
-- `stats/<stat_name>/lead_1_10.npz`
+```bash
+# 1. Install dependencies
+pip install fastapi uvicorn numpy xarray cfgrib rasterio rioxarray matplotlib
 
-The compute step writes all individual lead-day files first, then writes the combined windows:
+# 2. Download data (all models + PRISM, defaults to today)
+python download.py --start-date 2024-01-01 --end-date 2024-12-31
 
-- `1-7` day average
-- `7-14` day average
-- `1-10` day average
-
-Current enabled statistics are:
-
-- `bias`
-- `sacc` (spatial anomaly correlation coefficient)
-- `nrmse` (normalized root mean square error)
-- `nmad` (normalized mean absolute difference)
-
-Run computations:
-
-```
+# 3. Compute statistics
 python compute_stats.py
-```
 
-Lead-day limits are centralized in `lead_config.py`:
+# 4. Generate map tiles
+python compute_tiles.py
 
-- `LEAD_DAYS_MIN`
-- `LEAD_DAYS_MAX`
-- `FORECAST_HOURS`
+# 5. Start the API server
+export MAPTILER_API_KEY="your_key"   # optional, falls back to demo style
+uvicorn backend.api:app --reload --port 8001
 
-Set `LEAD_DAYS_MAX = 14` (default) to support leads 1-14 consistently across downloader, compute, API, and frontend.
-
-## PMTiles viewer (local)
-
-Basemap configuration is served by the backend API (`/api/config`) from environment variables:
-
-- `MAPTILER_API_KEY`
-
-If `MAPTILER_API_KEY` is empty, the frontend falls back to a demo MapLibre style.
-
-1. Serve PMTiles as ZXY tiles:
-
-```
-pmtiles serve tiles_output/pmtiles --port=8080 --public-url=http://localhost:8080 --cors="*"
-```
-
-Generate tiles for all enabled statistics:
-
-```
-python compute_stats_tiles.py --max-zoom 6
-```
-
-2. Serve the frontend (any static server works):
-
-```
+# 6. Serve the frontend (any static server works)
 python -m http.server 8000 --directory frontend
+
+# 7. Open the viewer
+open http://localhost:8000
 ```
 
-3. Open the viewer:
+The frontend is served on port 8000 and talks to the API on port 8001. If `MAPTILER_API_KEY` is not set, the map falls back to a demo MapLibre style.
 
-```
-http://localhost:8000/index.html
-```
+## Scripts
 
-The viewer expects PMTiles under statistic subdirectories, e.g.:
+### `download.py`
 
-- `tiles_output/pmtiles/bias/lead_1.pmtiles`
-- `tiles_output/pmtiles/sacc/lead_1.pmtiles`
+Downloads GFS model data and PRISM observations. PRISM always downloads alongside model data.
 
-It fetches TileJSON from:
-
-- `http://localhost:8080/<statistic>/lead_<N>.json` (single lead day)
-- `http://localhost:8080/<statistic>/lead_1_7.json` (window average), etc.
-
-### Frontend layer controls
-
-The viewer supports:
-
-- **View mode**: `Both`, `Landmarks only`, `Weather only`
-- **Detail mode**: `Low` and `High`
-  - `Low` caps basemap zoom and hides lower-priority landmark layers.
-  - `High` allows higher basemap zoom and full landmark detail.
-- **Opacity controls**: separate sliders for weather and landmarks.
-
-There is no automatic API-credit tracking in the frontend; detail level is user-controlled.
-Remember to keep required attribution for your chosen MapTiler style per MapTiler terms.
-
-## Statistics query API (local)
-
-The click-to-query popup uses a small API server:
-
-```
-pip install fastapi uvicorn
-export MAPTILER_API_KEY="your_public_maptiler_key"
-uvicorn bias_api:app --reload --port 8001
+```bash
+python download.py --start-date 2025-01-01 --end-date 2025-01-31   # all models + PRISM
+python download.py --model gfs --start-date 2025-01-01              # just GFS + PRISM
+python download.py --model gfs --start-year 2024 --end-year 2025    # full years
+python download.py --forecast                                       # today's forecast
+python download.py --catchup                                        # fill gap through yesterday
 ```
 
-It reads statistics from `stats/`. You can override with:
+- `--model`: download a specific model (default: all registered models)
+- `--forecast`: download and extract today's forecast (mutually exclusive with `--catchup`)
+- `--catchup`: auto-detect last downloaded date and fill through yesterday
 
-```
-http://localhost:8001/api/stats?lead=14&lat=40.0&lon=-100.0&stats_root=/path/to/stats
-http://localhost:8001/api/stats?lead=1-7&lat=40.0&lon=-100.0&stats_root=/path/to/stats
-```
+### `compute_stats.py`
 
-Response shape:
+Computes verification statistics from GFS forecasts and PRISM observations. Automatically preconverts GRIB2 files to `.npy` for faster reading on subsequent runs.
 
-```
-{
-  "lead": "14",
-  "lat": 40.0,
-  "lon": -100.0,
-  "stats": {
-    "bias": {"value": 1.23, "units": "mm", "no_data": false},
-    "sacc": {"value": 72.0, "units": "%", "no_data": false},
-    "nrmse": {"value": 38.0, "units": "%", "no_data": false},
-    "nmad": {"value": 24.0, "units": "%", "no_data": false}
-  }
-}
+```bash
+python compute_stats.py                    # all models
+python compute_stats.py --model gfs        # just GFS
+python compute_stats.py --no-preconvert    # skip GRIB2-to-npy conversion
 ```
 
-Frontend lead options are discovered from:
+Statistics are stored as monthly accumulators (the primitive), with yearly and seasonal views derived by summing:
 
 ```
-http://localhost:8001/api/config
+stats_output/{model}/{stat}/
+  metadata.npz
+  lead_{N}.npz                    # yearly (sum of all months)
+  lead_{window}.npz               # yearly windows
+  monthly/01/ ... 12/
+    lead_{N}.npz                  # per-month
+  seasonal/djf/ mam/ jja/ son/
+    lead_{N}.npz                  # sum of 3 months
 ```
 
-ZIP lookup endpoint for frontend map centering:
+### `compute_tiles.py`
 
-```
-http://localhost:8001/api/zip?zip=80302
+Generates PNG tile images for the map viewer.
+
+```bash
+python compute_tiles.py                # all models
+python compute_tiles.py --model gfs    # just GFS
 ```
 
-By default, ZIP lookups read `zip_lookup.csv` from the project root.
-Override the file path with:
+Generates tiles for yearly, current month, and current season. Forecast tiles are yearly only.
 
-```
-export ZIP_LOOKUP_CSV=/absolute/path/to/zip_lookup.csv
-```
+## Statistics
+
+Verification statistics (computed from GFS + PRISM pairs):
+
+- **bias** — mean precipitation bias (mm)
+- **sacc** — spatial anomaly correlation coefficient (%)
+- **nrmse** — normalized root mean square error (%)
+- **nmad** — normalized mean absolute difference (%)
+
+Display statistics:
+
+- **forecast** — latest model precipitation forecast (mm)
+
+## API
+
+The backend serves at `http://localhost:8001` by default.
+
+- `GET /api/config` — models, statistics, lead options, accumulation modes, current month/season
+- `GET /api/stats?model=gfs&lead=7&lat=40&lon=-100` — point statistics query
+  - `&period=monthly&month=03` — monthly stats
+  - `&period=seasonal&season=mam` — seasonal stats
+- `GET /api/zip?zip=80302` — ZIP code lookup for map centering
+
+## Models
+
+Models are registered in `model_registry.py`. Currently: **GFS** (0.25° global, 12z cycle, leads 1–14 days).
+
+## Environment variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `MAPTILER_API_KEY` | MapTiler API key for basemap | demo style fallback |
+| `ZIP_LOOKUP_CSV` | Path to ZIP code lookup CSV | `backend/zip_lookup.csv` |
+| `TILES_OUTPUT` | Tiles output directory | `tiles_output` |
