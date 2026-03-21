@@ -206,26 +206,9 @@
         <div class="status" id="status">Idle</div>
       </div>
       <div class="controls-row">
-        <label>View
-          <select id="modeSelect">
-            <option value="both">Both</option>
-            <option value="landmarks_only">Landmarks only</option>
-            <option value="weather_only">Weather only</option>
-          </select>
-        </label>
-        <label>Detail
-          <select id="detailSelect">
-            <option value="low">Low</option>
-            <option value="high">High</option>
-          </select>
-        </label>
         <label>Overlay
           <input id="weatherOpacity" type="range" min="0" max="1" step="0.05" value="0.85" />
           <span class="opacity-value" id="weatherOpacityValue">0.85</span>
-        </label>
-        <label>Basemap
-          <input id="landmarksOpacity" type="range" min="0" max="1" step="0.05" value="0.65" />
-          <span class="opacity-value" id="landmarksOpacityValue">0.65</span>
         </label>
         <label>ZIP <input id="zipInput" type="text" placeholder="80302" size="6" /></label>
         <button id="zipGoButton" type="button">Go</button>
@@ -238,7 +221,6 @@
       const API_BASE_URL = "http://localhost:8001";
       const DEFAULT_MAPTILER_STYLE_ID = "streets-v2";
       const FALLBACK_STYLE_URL = "https://demotiles.maplibre.org/style.json";
-      const DETAIL_ZOOM_LIMITS = { low: 9, high: 14 };
       const US_BOUNDS = [-125.0, 24.0, -66.0, 50.0];
       const sourceId = "bias-source";
       const layerId = "bias-layer";
@@ -272,13 +254,9 @@
         period: "yearly",     // "yearly" | "monthly" | "seasonal"
         month: "01",          // "01"-"12"
         season: "djf",        // "djf"|"mam"|"jja"|"son"
-        mode: "both",
-        detailMode: "low",
         weatherOpacity: 0.85,
-        landmarksOpacity: 0.65,
       };
       let map = null;
-      let landmarks = [];
       let initialLoad = true;
 
       function mapStyleUrlFromConfig() {
@@ -292,71 +270,12 @@
 
       function setStatus(message) { statusEl.textContent = message; }
 
-      function cacheLandmarkLayers() {
-        if (!map) return;
-        const style = map.getStyle();
-        if (!style || !style.layers) { landmarks = []; return; }
-        landmarks = style.layers
-          .filter((layer) => layer.id !== layerId)
-          .map((layer) => ({
-            id: layer.id, type: layer.type,
-            sourceLayer: layer["source-layer"] || "",
-          }));
-      }
-
-      function isLowDetailHidden(layerInfo) {
-        const text = `${layerInfo.id} ${layerInfo.sourceLayer}`.toLowerCase();
-        if (layerInfo.type !== "symbol" && layerInfo.type !== "line") return false;
-        return ["poi","transit","airport","aeroway","housenumber","house_number",
-                "address","building","minor_road","path","rail"]
-          .some((kw) => text.includes(kw));
-      }
-
-      function setLayerVisibility(id, visible) {
-        if (!map || !map.getLayer(id)) return;
-        map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
-      }
-
-      function setLandmarkOpacity(layerInfo, opacity) {
-        if (!map || !map.getLayer(layerInfo.id)) return;
-        const t = layerInfo.type;
-        if (t === "fill") map.setPaintProperty(layerInfo.id, "fill-opacity", opacity);
-        else if (t === "line") map.setPaintProperty(layerInfo.id, "line-opacity", opacity);
-        else if (t === "symbol") {
-          map.setPaintProperty(layerInfo.id, "icon-opacity", opacity);
-          map.setPaintProperty(layerInfo.id, "text-opacity", opacity);
-        }
-        else if (t === "circle") map.setPaintProperty(layerInfo.id, "circle-opacity", opacity);
-        else if (t === "raster") map.setPaintProperty(layerInfo.id, "raster-opacity", opacity);
-        else if (t === "background") map.setPaintProperty(layerInfo.id, "background-opacity", opacity);
-        else if (t === "fill-extrusion") map.setPaintProperty(layerInfo.id, "fill-extrusion-opacity", opacity);
-        else if (t === "heatmap") map.setPaintProperty(layerInfo.id, "heatmap-opacity", opacity);
-      }
 
       function applyLayerState() {
         if (!map) return;
-        const zoomCap = DETAIL_ZOOM_LIMITS[state.detailMode];
-        map.setMaxZoom(zoomCap);
-        if (map.getZoom() > zoomCap) map.setZoom(zoomCap);
-        const weatherVisible = state.mode !== "landmarks_only";
         if (map.getLayer(layerId)) {
-          setLayerVisibility(layerId, weatherVisible);
           map.setPaintProperty(layerId, "raster-opacity", state.weatherOpacity);
         }
-        const landmarksVisible = state.mode !== "weather_only";
-        for (const lm of landmarks) {
-          const hide = state.detailMode === "low" && isLowDetailHidden(lm);
-          setLayerVisibility(lm.id, landmarksVisible && !hide);
-          setLandmarkOpacity(lm, state.landmarksOpacity);
-        }
-      }
-
-      function firstSymbolLayerId() {
-        if (!map) return undefined;
-        for (const lm of landmarks) {
-          if (lm.type === "symbol" && map.getLayer(lm.id)) return lm.id;
-        }
-        return undefined;
       }
 
       function removeBiasLayer() {
@@ -370,8 +289,7 @@
           id: layerId, type: "raster", source: sourceId,
           paint: { "raster-opacity": state.weatherOpacity },
         };
-        const beforeId = firstSymbolLayerId();
-        beforeId ? map.addLayer(weatherLayer, beforeId) : map.addLayer(weatherLayer);
+        map.addLayer(weatherLayer);
       }
 
       function periodImageSubdir() {
@@ -661,21 +579,13 @@
       const modelSelect = document.getElementById("modelSelect");
       const statSelect = document.getElementById("statSelect");
       const leadSelect = document.getElementById("leadSelect");
-      const modeSelect = document.getElementById("modeSelect");
-      const detailSelect = document.getElementById("detailSelect");
       const weatherOpacityInput = document.getElementById("weatherOpacity");
-      const landmarksOpacityInput = document.getElementById("landmarksOpacity");
       const weatherOpacityValue = document.getElementById("weatherOpacityValue");
-      const landmarksOpacityValue = document.getElementById("landmarksOpacityValue");
       const zipInput = document.getElementById("zipInput");
       const zipGoButton = document.getElementById("zipGoButton");
       statSelect.value = state.statistic;
-      modeSelect.value = state.mode;
-      detailSelect.value = state.detailMode;
       weatherOpacityInput.value = String(state.weatherOpacity);
-      landmarksOpacityInput.value = String(state.landmarksOpacity);
       weatherOpacityValue.textContent = weatherOpacityInput.value;
-      landmarksOpacityValue.textContent = landmarksOpacityInput.value;
 
       function handleChange() {
         if (!map) return;
@@ -721,16 +631,9 @@
         handleChange();
       });
       leadSelect.addEventListener("change", handleChange);
-      modeSelect.addEventListener("change", () => { state.mode = modeSelect.value; applyLayerState(); });
-      detailSelect.addEventListener("change", () => { state.detailMode = detailSelect.value; applyLayerState(); });
       weatherOpacityInput.addEventListener("input", () => {
         state.weatherOpacity = Number(weatherOpacityInput.value);
         weatherOpacityValue.textContent = weatherOpacityInput.value;
-        applyLayerState();
-      });
-      landmarksOpacityInput.addEventListener("input", () => {
-        state.landmarksOpacity = Number(landmarksOpacityInput.value);
-        landmarksOpacityValue.textContent = landmarksOpacityInput.value;
         applyLayerState();
       });
       zipGoButton.addEventListener("click", goToZip);
@@ -753,7 +656,6 @@
 
       function bindMapEvents() {
         map.on("load", async () => {
-          cacheLandmarkLayers();
           if (!appConfig.maptilerApiKey) {
             setStatus("Using fallback basemap; set MAPTILER_API_KEY for MapTiler.");
           }
