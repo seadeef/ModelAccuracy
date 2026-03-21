@@ -24,10 +24,15 @@ from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from statistics_plugins.registry import STATISTICS_BY_NAME
 from backend.stats_query import stats_at_point
 
-MAPTILER_API_KEY = os.getenv("MAPTILER_API_KEY", "")
+_maptiler_key_file = _project_root / ".maptiler_key"
+MAPTILER_API_KEY = (
+    _maptiler_key_file.read_text().strip()
+    if _maptiler_key_file.is_file()
+    else os.getenv("MAPTILER_API_KEY", "")
+)
 MAPTILER_STYLE_ID = "streets-v2"
-ZIP_LOOKUP_CSV = _this_dir / os.getenv("ZIP_LOOKUP_CSV", "zip_lookup.csv")
-TILES_OUTPUT = _project_root / os.getenv("TILES_OUTPUT", "tiles_output")
+ZIP_LOOKUP_CSV = _this_dir / "zip_lookup.csv"
+TILES_OUTPUT = _project_root / "tiles_output"
 US_CROP_BOUNDS = [-125.125, 23.875, -65.875, 50.125]  # pixel-snapped to 0.25° GFS grid
 
 app = FastAPI(title="Model Statistics Query API")

@@ -18,7 +18,7 @@ python compute_stats.py
 python compute_tiles.py
 
 # 5. Start the API server
-export MAPTILER_API_KEY="your_key"   # optional, falls back to demo style
+echo "your_key" > .maptiler_key       # optional, falls back to demo style
 uvicorn backend.api:app --reload --port 8001
 
 # 6. Serve the frontend (any static server works)
@@ -28,7 +28,7 @@ python -m http.server 8000 --directory frontend
 open http://localhost:8000
 ```
 
-The frontend is served on port 8000 and talks to the API on port 8001. If `MAPTILER_API_KEY` is not set, the map falls back to a demo MapLibre style.
+The frontend is served on port 8000 and talks to the API on port 8001. If `.maptiler_key` is not present, the map falls back to a demo MapLibre style.
 
 ## Scripts
 
@@ -109,10 +109,3 @@ The backend serves at `http://localhost:8001` by default.
 
 Models are registered in `model_registry.py`. Currently: **GFS** (0.25° global, 12z cycle, leads 1–14 days).
 
-## Environment variables
-
-| Variable | Description | Default |
-|---|---|---|
-| `MAPTILER_API_KEY` | MapTiler API key for basemap | demo style fallback |
-| `ZIP_LOOKUP_CSV` | Path to ZIP code lookup CSV | `backend/zip_lookup.csv` |
-| `TILES_OUTPUT` | Tiles output directory | `tiles_output` |

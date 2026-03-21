@@ -18,6 +18,9 @@ prism_data/
 stats_output/
 tiles_output/
 
+# Secrets
+.maptiler_key
+
 # IDE / OS
 .idea/
 .DS_Store
