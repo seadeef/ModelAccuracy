@@ -173,7 +173,7 @@ def diverging_reversed_colormap(
 
 def sequential_colormap(data: np.ndarray, vmin: float, vmax: float, mask: np.ndarray) -> np.ndarray:
     white = np.array([255, 255, 255], dtype=np.float32)
-    blue = np.array([44, 123, 182], dtype=np.float32)
+    blue = np.array([120, 40, 200], dtype=np.float32)  # purple
     valid = mask & np.isfinite(data)
     denom = vmax - vmin if vmax != vmin else 1.0
     t = np.clip((data - vmin) / denom, 0.0, 1.0)
@@ -181,7 +181,8 @@ def sequential_colormap(data: np.ndarray, vmin: float, vmax: float, mask: np.nda
     if np.any(valid):
         tv = t[valid].reshape(-1, 1)
         rgb[valid] = (white + (blue - white) * tv).reshape((-1, 3))
-    alpha = np.where(valid, 255, 0).astype(np.uint8)
+    alpha_vals = np.clip(t * 255 * 4, 0, 255)
+    alpha = np.where(valid, alpha_vals, 0).astype(np.uint8)
     return np.dstack([rgb.astype(np.uint8), alpha])
 
 
@@ -244,6 +245,7 @@ def _process_layer_image(
     images_root: Path,
     tmp_root: Path,
     colormap: str = "diverging",
+    land_mask: np.ndarray | None = None,
 ) -> str:
     """Render a single layer as a mercator-reprojected PNG, cropped to US."""
     from PIL import Image
@@ -276,6 +278,13 @@ def _process_layer_image(
         transform.a, transform.b, transform.c + col_start * lon_res,
         transform.d, transform.e, transform.f + row_start * transform.e,
     )
+
+    # Apply land mask (clips forecast data to coastlines).
+    if land_mask is not None:
+        mask_cropped = land_mask[row_start:row_end, col_start:col_end]
+        if mask_cropped.shape == cropped.shape:
+            cropped = cropped.copy()
+            cropped[~mask_cropped] = np.nan
 
     valid = np.isfinite(cropped)
     _COLORMAP_FNS = {
@@ -315,6 +324,7 @@ def _collect_tasks_for_period(
     source_subdir: str | None,
     output_subdir: str | None,
     skip_forecast: bool = False,
+    land_mask: np.ndarray | None = None,
 ) -> list[dict]:
     """Collect tile-generation tasks for a single period (yearly/monthly/seasonal)."""
     tasks: list[dict] = []
@@ -367,6 +377,7 @@ def _collect_tasks_for_period(
                 images_root=images_root,
                 tmp_root=tmp_root,
                 colormap=colormap,
+                land_mask=land_mask,
             ))
 
     return tasks
@@ -375,11 +386,55 @@ def _collect_tasks_for_period(
 OUTPUT_DIR = Path("tiles_output")
 
 
+PRISM_DIR = Path("prism_data")
+
+
+def _build_land_mask(meta: dict) -> np.ndarray | None:
+    """Build a land mask by reprojecting a single PRISM file onto the GFS grid."""
+    # Find any PRISM GeoTIFF.
+    prism_files = sorted(PRISM_DIR.glob("**/data.tif"))
+    if not prism_files:
+        print("Warning: no PRISM data found for land mask.")
+        return None
+
+    with rasterio.open(prism_files[0]) as src:
+        prism_data = src.read(1).astype(np.float32)
+        prism_transform = src.transform
+        prism_crs = str(src.crs)
+        if src.nodata is not None:
+            prism_data[prism_data == src.nodata] = np.nan
+
+    # Reproject PRISM onto the GFS grid — anywhere PRISM has data is land.
+    gfs_shape = (meta["lats"].size, meta["lons"].size)
+    dst = np.full(gfs_shape, np.nan, dtype=np.float32)
+    reproject(
+        source=prism_data,
+        destination=dst,
+        src_transform=prism_transform,
+        src_crs=prism_crs,
+        dst_transform=meta["transform"],
+        dst_crs="EPSG:4326",
+        resampling=Resampling.nearest,
+        dst_nodata=np.nan,
+    )
+    mask = np.isfinite(dst)
+    print(f"Land mask from {prism_files[0]} ({np.count_nonzero(mask)} land pixels)")
+    return mask
+
+
 def _run_for_model(model_key: str) -> None:
     stats_root = Path("stats_output") / model_key
     plugins = ENABLED_STATISTICS
     images_root = OUTPUT_DIR / "images" / model_key
     tmp_root = OUTPUT_DIR / "tmp"
+
+    # Build land mask from PRISM, reprojected onto the GFS grid.
+    land_mask = None
+    for plugin in plugins:
+        meta_path = stats_root / plugin.spec.name / "metadata.npz"
+        if meta_path.exists():
+            land_mask = _build_land_mask(load_metadata(stats_root / plugin.spec.name))
+            break
 
     # Collect tasks for all periods.
     tasks: list[dict] = []
@@ -388,6 +443,7 @@ def _run_for_model(model_key: str) -> None:
     tasks.extend(_collect_tasks_for_period(
         plugins, stats_root, images_root, tmp_root,
         source_subdir=None, output_subdir=None,
+        land_mask=land_mask,
     ))
 
     # 2. All 12 months (skip forecast).
@@ -398,6 +454,7 @@ def _run_for_model(model_key: str) -> None:
             source_subdir=f"monthly/{mm}",
             output_subdir=f"monthly/{mm}",
             skip_forecast=True,
+            land_mask=land_mask,
         ))
 
     # 3. All 4 seasons (skip forecast).
@@ -407,6 +464,7 @@ def _run_for_model(model_key: str) -> None:
             source_subdir=f"seasonal/{season_name}",
             output_subdir=f"seasonal/{season_name}",
             skip_forecast=True,
+            land_mask=land_mask,
         ))
 
     total = len(tasks)
