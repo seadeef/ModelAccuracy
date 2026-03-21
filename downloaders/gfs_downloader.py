@@ -182,9 +182,14 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             raise ValueError("No init dates selected. Check start/end dates.")
 
         tasks: list[DownloadTask] = []
+        skipped = 0
         for d in init_dates:
             for fh in forecast_hours:
-                tasks.append(DownloadTask(d, int(fh), str(level)))
+                t = DownloadTask(d, int(fh), str(level))
+                if self._output_file(t.init_date, t.fhour, t.level).exists():
+                    skipped += 1
+                else:
+                    tasks.append(t)
 
         print("\n" + "=" * 70)
         print("Parallel GFS filtered download (idx + Range)")
@@ -194,6 +199,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         print(f"Variable: {GFS_VARIABLE} | Level: {level}")
         print(f"Workers: {self.max_workers} | Retries: {self.max_retries}")
         print(f"Output: {self.output_dir.resolve()}")
+        print(f"Tasks: {len(tasks)} to download | {skipped} already exist")
         print("=" * 70)
 
         results = self._run_parallel(
@@ -242,12 +248,15 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         if lead_windows is None:
             lead_windows = []
 
-        # Find init directory.
+        # Find init directory (most recent one that actually has GRIB2 files).
         if init_date is None:
-            all_inits = sorted(gfs_dir.glob("*/*_12z"))
-            if not all_inits:
-                raise SystemExit("No GFS init directories found.")
-            init_date = datetime.strptime(all_inits[-1].name[:8], "%Y%m%d")
+            all_inits = sorted(gfs_dir.glob("*/*_12z"), reverse=True)
+            for candidate in all_inits:
+                if any(candidate.glob("f*_*.grib2")) or any(candidate.glob("f*.npy")):
+                    init_date = datetime.strptime(candidate.name[:8], "%Y%m%d")
+                    break
+            if init_date is None:
+                raise SystemExit("No GFS init directories with data found.")
             print(f"Using most recent init date: {init_date.date()}")
 
         date_str = init_date.strftime("%Y%m%d")
@@ -255,22 +264,15 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         if not init_dir.exists():
             raise SystemExit(f"Init directory not found: {init_dir}")
 
-        # Build land mask from an existing statistic's coverage.
-        land_mask = None
-        for stat_dir in sorted(output_root.iterdir()):
-            if stat_dir.name == "forecast" or not stat_dir.is_dir():
-                continue
-            for npz_file in stat_dir.glob("lead_*.npz"):
-                with np.load(npz_file) as f:
-                    field = list(f.keys())[0]
-                    land_mask = np.isfinite(f[field])
-                break
-            if land_mask is not None:
-                print(f"Land mask from {npz_file} ({np.count_nonzero(land_mask)} valid pixels)")
-                break
+        US_CROP_BOUNDS = (-130.0, 20.0, -60.0, 55.0)
 
-        if land_mask is None:
-            print("Warning: no existing statistics found for land mask. Forecast will include ocean.")
+        def _crop_to_us(data, lats, lons):
+            west, south, east, north = US_CROP_BOUNDS
+            lat_mask = (lats >= south) & (lats <= north)
+            lon_mask = (lons >= west) & (lons <= east)
+            lat_idx = np.where(lat_mask)[0]
+            lon_idx = np.where(lon_mask)[0]
+            return data[np.ix_(lat_idx, lon_idx)], lats[lat_idx], lons[lon_idx]
 
         def _read_gfs_apcp(grib_path: Path):
             npy_path = grib_path.with_suffix(".npy")
@@ -278,27 +280,29 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             grid_lons = gfs_dir / "grid_lons.npy"
 
             if npy_path.exists() and grid_lats.exists() and grid_lons.exists():
-                return np.load(npy_path), np.load(grid_lats), np.load(grid_lons)
+                data = np.load(npy_path)
+                lats = np.load(grid_lats)
+                lons = np.load(grid_lons)
+            else:
+                ds = xr.open_dataset(grib_path, engine="cfgrib")
+                if not ds.data_vars:
+                    raise ValueError(f"No variables found in {grib_path}")
+                var_name = list(ds.data_vars)[0]
+                data = ds[var_name].values.astype(np.float32)
+                lats = ds["latitude"].values
+                lons = ds["longitude"].values
 
-            ds = xr.open_dataset(grib_path, engine="cfgrib")
-            if not ds.data_vars:
-                raise ValueError(f"No variables found in {grib_path}")
-            var_name = list(ds.data_vars)[0]
-            data = ds[var_name].values.astype(np.float32)
-            lats = ds["latitude"].values
-            lons = ds["longitude"].values
+                if lons.max() > 180:
+                    lons = ((lons + 180) % 360) - 180
+                sort_idx = np.argsort(lons)
+                lons = lons[sort_idx]
+                data = data[:, sort_idx]
 
-            if lons.max() > 180:
-                lons = ((lons + 180) % 360) - 180
-            sort_idx = np.argsort(lons)
-            lons = lons[sort_idx]
-            data = data[:, sort_idx]
+                if lats[0] > lats[-1]:
+                    lats = lats[::-1]
+                    data = data[::-1, :]
 
-            if lats[0] > lats[-1]:
-                lats = lats[::-1]
-                data = data[::-1, :]
-
-            return data, lats, lons
+            return _crop_to_us(data, lats, lons)
 
         def _gfs_transform(lats, lons):
             lat_res = abs(float(lats[1] - lats[0]))
@@ -330,9 +334,6 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             data, lats, lons = _read_gfs_apcp(grib_path)
             if transform is None:
                 transform = _gfs_transform(lats, lons)
-
-            if land_mask is not None and data.shape == land_mask.shape:
-                data[~land_mask] = np.nan
 
             lead_data[lead_days] = data
             print(f"  Lead {lead_days}: {grib_path.name}")

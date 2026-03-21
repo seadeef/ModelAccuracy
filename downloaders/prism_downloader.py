@@ -159,7 +159,13 @@ class PRISMDownloaderParallel(BaseDownloader):
     def _download(self, dates: list[datetime], extract: bool = True) -> None:
         if not dates:
             raise ValueError("No dates selected.")
-        tasks = [PRISMTask(date=d, extract=extract) for d in dates]
+        tasks: list[PRISMTask] = []
+        skipped = 0
+        for d in dates:
+            if self._output_path(d).exists():
+                skipped += 1
+            else:
+                tasks.append(PRISMTask(date=d, extract=extract))
 
         print("\n" + "=" * 70)
         print("PRISM parallel daily download")
@@ -167,6 +173,7 @@ class PRISMDownloaderParallel(BaseDownloader):
         print(f"Range: {dates[0].date()} to {dates[-1].date()}  ({len(dates)} days)")
         print(f"Workers: {self.max_workers} | Retries: {self.max_retries} | Extract: {extract} | Remove zip after extract: {self.remove_zip_after_extract}")
         print(f"Output: {self.output_dir.resolve()}")
+        print(f"Tasks: {len(tasks)} to download | {skipped} already exist")
         print("=" * 70)
 
         results = self._run_parallel(
