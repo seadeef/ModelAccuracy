@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import shutil
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 import numpy as np
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from statistics_plugins.registry import ENABLED_STATISTICS
+from stats_grid_metadata import load_model_metadata
 
 try:
     import rasterio
@@ -21,7 +21,9 @@ except Exception as exc:  # pragma: no cover - environment dependent
         "rasterio is required. Install with: pip install rasterio"
     ) from exc
 
-US_HEADER_BOUNDS = [-125.0, 24.0, -66.0, 50.0]
+# Nominal CONUS → fixed Mercator grid in _fixed_mercator_target. If this or 236×104 changes,
+# update TILE_IMAGE_BOUNDS_WGS84 in backend/tile_overlay_constants.py and frontend constants.js.
+US_BOUNDS = [-125.0, 24.0, -66.0, 50.0]
 
 SEASONS = {"djf": (12, 1, 2), "mam": (3, 4, 5), "jja": (6, 7, 8), "son": (9, 10, 11)}
 
@@ -42,11 +44,8 @@ def parse_args() -> argparse.Namespace:
 
 
 
-def load_metadata(stats_dir: Path) -> dict:
-    meta_path = stats_dir / "metadata.npz"
-    if not meta_path.exists():
-        raise FileNotFoundError(f"Missing metadata: {meta_path.resolve()}")
-    meta = np.load(meta_path)
+def load_metadata(stats_root: Path) -> dict:
+    meta = load_model_metadata(stats_root)
     transform = Affine(*meta["transform"][:6])
     return {
         "lats": meta["lats"],
@@ -203,21 +202,38 @@ def write_rgba_raster(path: Path, rgba: np.ndarray, transform: Affine, crs: str)
             dst.write(rgba[:, :, idx], idx + 1)
 
 
+def _fixed_mercator_target() -> tuple[Affine, int, int]:
+    """Compute a fixed EPSG:3857 transform + dimensions for US_BOUNDS.
+
+    All models reproject into this same grid, ensuring identical PNG extents
+    regardless of each model's native pixel alignment.
+    """
+    west, south, east, north = US_BOUNDS
+    dst_transform, dst_width, dst_height = calculate_default_transform(
+        "EPSG:4326", "EPSG:3857",
+        # Use a reasonable source size; rasterio derives resolution from this.
+        width=236, height=104,
+        left=west, bottom=south, right=east, top=north,
+    )
+    return dst_transform, dst_width, dst_height
+
+
+# Compute once at module level.
+_MERC_TRANSFORM, _MERC_WIDTH, _MERC_HEIGHT = _fixed_mercator_target()
+
+
 def reproject_to_mercator(
     src_path: Path,
     dst_path: Path,
 ) -> None:
     dst_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(src_path) as src:
-        dst_transform, dst_width, dst_height = calculate_default_transform(
-            src.crs, "EPSG:3857", src.width, src.height, *src.bounds
-        )
         profile = src.profile.copy()
         profile.update(
             crs="EPSG:3857",
-            transform=dst_transform,
-            width=dst_width,
-            height=dst_height,
+            transform=_MERC_TRANSFORM,
+            width=_MERC_WIDTH,
+            height=_MERC_HEIGHT,
         )
         with rasterio.open(dst_path, "w", **profile) as dst:
             for i in range(1, src.count + 1):
@@ -226,9 +242,9 @@ def reproject_to_mercator(
                     destination=rasterio.band(dst, i),
                     src_transform=src.transform,
                     src_crs=src.crs,
-                    dst_transform=dst_transform,
+                    dst_transform=_MERC_TRANSFORM,
                     dst_crs="EPSG:3857",
-                    resampling=Resampling.bilinear,
+                    resampling=Resampling.nearest,
                 )
 
 
@@ -239,7 +255,6 @@ def _process_layer_image(
     global_vmin: float,
     global_vmax: float,
     transform_tuple: tuple,
-    lats: np.ndarray,
     crs: str,
     stat_name: str,
     images_root: Path,
@@ -247,7 +262,13 @@ def _process_layer_image(
     colormap: str = "diverging",
     land_mask: np.ndarray | None = None,
 ) -> str:
-    """Render a single layer as a mercator-reprojected PNG, cropped to US."""
+    """Render a single layer as a mercator-reprojected PNG.
+
+    The full model grid is colormapped and written as a GeoTIFF with the
+    model's own Affine transform.  Reprojection into a fixed Mercator
+    bounding box (shared by all models) handles sub-pixel alignment so
+    that every model's PNG covers the exact same geographic extent.
+    """
     from PIL import Image
 
     transform = Affine(*transform_tuple[:6])
@@ -257,51 +278,25 @@ def _process_layer_image(
             raise KeyError(f"Missing field '{field}' in {npz_path}.")
         values = layer[field]
 
-    # Crop to US in source grid before colormapping.
-    west, south, east, north = US_HEADER_BOUNDS
-    lat_res = abs(transform.e)
-    lon_res = abs(transform.a)
-    col_start = max(0, int((west - transform.c) / lon_res))
-    col_end = min(values.shape[1], int((east - transform.c) / lon_res) + 1)
+    if land_mask is not None and land_mask.shape == values.shape:
+        values = values.copy()
+        values[~land_mask] = np.nan
 
-    if transform.e > 0:
-        # South-to-north: row 0 is southernmost, transform.f is south edge.
-        row_start = max(0, int((south - transform.f) / lat_res))
-        row_end = min(values.shape[0], int((north - transform.f) / lat_res) + 1)
-    else:
-        # North-to-south: row 0 is northernmost, transform.f is north edge.
-        row_start = max(0, int((transform.f - north) / lat_res))
-        row_end = min(values.shape[0], int((transform.f - south) / lat_res) + 1)
-
-    cropped = values[row_start:row_end, col_start:col_end]
-    crop_transform = Affine(
-        transform.a, transform.b, transform.c + col_start * lon_res,
-        transform.d, transform.e, transform.f + row_start * transform.e,
-    )
-
-    # Apply land mask (clips forecast data to coastlines).
-    if land_mask is not None:
-        mask_cropped = land_mask[row_start:row_end, col_start:col_end]
-        if mask_cropped.shape == cropped.shape:
-            cropped = cropped.copy()
-            cropped[~mask_cropped] = np.nan
-
-    valid = np.isfinite(cropped)
+    valid = np.isfinite(values)
     _COLORMAP_FNS = {
         "sequential": sequential_colormap,
         "diverging": diverging_colormap,
         "diverging_reversed": diverging_reversed_colormap,
     }
     colormap_fn = _COLORMAP_FNS.get(colormap, diverging_colormap)
-    rgba = colormap_fn(cropped, global_vmin, global_vmax, valid)
+    rgba = colormap_fn(values, global_vmin, global_vmax, valid)
 
-    # Write as 4326 GeoTIFF, reproject to 3857, then save as PNG.
+    # Write as 4326 GeoTIFF, reproject to fixed 3857 extent, save as PNG.
     tif_4326 = tmp_root / stat_name / f"lead_{lead_key}_img_4326.tif"
     tif_3857 = tmp_root / stat_name / f"lead_{lead_key}_img_3857.tif"
-    write_rgba_raster(tif_4326, rgba, crop_transform, crs)
+    write_rgba_raster(tif_4326, rgba, transform, crs)
     reproject_to_mercator(tif_4326, tif_3857)
 
-    # Read the reprojected raster and save as PNG.
     with rasterio.open(tif_3857) as src:
         merc_rgba = np.stack([src.read(i) for i in range(1, 5)], axis=-1)
 
@@ -319,6 +314,7 @@ PERCENTILE = 98.0
 def _collect_tasks_for_period(
     plugins: list,
     stats_root: Path,
+    meta: dict,
     images_root: Path,
     tmp_root: Path,
     source_subdir: str | None,
@@ -337,7 +333,6 @@ def _collect_tasks_for_period(
         if not stats_dir.exists():
             continue
 
-        meta = load_metadata(stats_dir)
         layers = list(iter_layers(stats_dir, subdir=source_subdir))
         if not layers:
             continue
@@ -371,7 +366,6 @@ def _collect_tasks_for_period(
                 global_vmin=global_vmin,
                 global_vmax=global_vmax,
                 transform_tuple=transform_tuple,
-                lats=meta["lats"],
                 crs=meta["crs"],
                 stat_name=effective_stat_name,
                 images_root=images_root,
@@ -425,23 +419,20 @@ def _build_land_mask(meta: dict) -> np.ndarray | None:
 def _run_for_model(model_key: str) -> None:
     stats_root = Path("stats_output") / model_key
     plugins = ENABLED_STATISTICS
-    images_root = OUTPUT_DIR / "images" / model_key
+    images_root = OUTPUT_DIR / model_key
     tmp_root = OUTPUT_DIR / "tmp"
 
-    # Build land mask from PRISM, reprojected onto the GFS grid.
-    land_mask = None
-    for plugin in plugins:
-        meta_path = stats_root / plugin.spec.name / "metadata.npz"
-        if meta_path.exists():
-            land_mask = _build_land_mask(load_metadata(stats_root / plugin.spec.name))
-            break
+    meta = load_metadata(stats_root)
+
+    # Build land mask from PRISM, reprojected onto the model grid.
+    land_mask = _build_land_mask(meta)
 
     # Collect tasks for all periods.
     tasks: list[dict] = []
 
     # 1. Yearly (source from stat root, output to stat root — unchanged paths).
     tasks.extend(_collect_tasks_for_period(
-        plugins, stats_root, images_root, tmp_root,
+        plugins, stats_root, meta, images_root, tmp_root,
         source_subdir=None, output_subdir=None,
         land_mask=land_mask,
     ))
@@ -450,7 +441,7 @@ def _run_for_model(model_key: str) -> None:
     for m in range(1, 13):
         mm = f"{m:02d}"
         tasks.extend(_collect_tasks_for_period(
-            plugins, stats_root, images_root, tmp_root,
+            plugins, stats_root, meta, images_root, tmp_root,
             source_subdir=f"monthly/{mm}",
             output_subdir=f"monthly/{mm}",
             skip_forecast=True,
@@ -460,7 +451,7 @@ def _run_for_model(model_key: str) -> None:
     # 3. All 4 seasons (skip forecast).
     for season_name in SEASONS:
         tasks.extend(_collect_tasks_for_period(
-            plugins, stats_root, images_root, tmp_root,
+            plugins, stats_root, meta, images_root, tmp_root,
             source_subdir=f"seasonal/{season_name}",
             output_subdir=f"seasonal/{season_name}",
             skip_forecast=True,
@@ -479,6 +470,7 @@ def _run_for_model(model_key: str) -> None:
 
     if tmp_root.exists():
         shutil.rmtree(tmp_root)
+
     print(f"Output written to {OUTPUT_DIR.resolve()}")
 
 

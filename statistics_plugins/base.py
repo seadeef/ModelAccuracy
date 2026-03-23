@@ -9,10 +9,12 @@ import numpy as np
 @dataclass(frozen=True)
 class StatisticSpec:
     name: str
+    label: str
     units: str
     render_field: str
     colormap: str = "diverging"
     fixed_range: tuple[float, float] | None = None
+    default: bool = False
 
 
 class StatisticPlugin(Protocol):

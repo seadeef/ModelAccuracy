@@ -1,0 +1,19 @@
+{
+  "name": "model-accuracy-viewer",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^5",
+    "svelte": "^5",
+    "vite": "^6"
+  },
+  "dependencies": {
+    "maplibre-gl": "^4.7.1"
+  }
+}

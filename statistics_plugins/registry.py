@@ -26,3 +26,8 @@ DISPLAY_STATISTICS: list[StatisticPlugin] = [
 ENABLED_STATISTICS: list[StatisticPlugin] = DISPLAY_STATISTICS + VERIFICATION_STATISTICS
 
 STATISTICS_BY_NAME = {plugin.spec.name: plugin for plugin in ENABLED_STATISTICS}
+
+DEFAULT_STATISTIC = next(
+    (p.spec.name for p in ENABLED_STATISTICS if p.spec.default),
+    ENABLED_STATISTICS[0].spec.name,  # fallback to first if none marked
+)

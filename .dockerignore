@@ -1,0 +1,15 @@
+.git
+.gitignore
+.cursor
+node_modules
+frontend/node_modules
+lambda_package
+archive
+**/__pycache__
+**/*.pyc
+*.zip
+.env
+.env.*
+.venv
+venv
+*.md

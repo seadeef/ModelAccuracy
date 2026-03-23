@@ -16,18 +16,15 @@ from typing import Dict, List, Tuple
 import numpy as np
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL, window_to_key
 from statistics_plugins.registry import VERIFICATION_STATISTICS
-
-try:
-    import xarray as xr
-except Exception as exc:  # pragma: no cover - environment dependent
-    raise RuntimeError(
-        "xarray is required for reading GFS GRIB2 files. "
-        "Install with: pip install xarray cfgrib"
-    ) from exc
+from stats_grid_metadata import load_model_metadata, save_model_metadata
 
 try:
     import rasterio
     from rasterio.warp import Resampling, reproject
+    try:
+        from rasterio.errors import NotGeoreferencedWarning as _RASTERIO_NOT_GEOREFERENCED
+    except Exception:  # pragma: no cover - older rasterio
+        _RASTERIO_NOT_GEOREFERENCED = None
 except Exception as exc:  # pragma: no cover - environment dependent
     raise RuntimeError(
         "rasterio is required for reading PRISM GeoTIFFs. "
@@ -58,10 +55,9 @@ def _configure_for_model(model_key: str) -> None:
     LEAD_DAYS_MAX = config.lead_days_max
     _active_lead_windows = list(config.lead_windows)
 
-GFS_FILE_RE = re.compile(r"f(?P<fhour>\d{3})_(?P<level>[^.]+)\.grib2$")
+# Task discovery: downloaders produce .npy files (CONUS-cropped float32 arrays).
+LEAD_NPY_RE = re.compile(r"f(?P<fhour>\d{3})_(?P<level>[^.]+)\.npy$")
 
-# Crop bounds for US region (with a small buffer). Data outside this region
-# is discarded at read time to reduce memory from ~1M to ~14K cells per grid.
 US_CROP_BOUNDS = (-130.0, 20.0, -60.0, 55.0)  # (west, south, east, north)
 
 THREADS_PER_PROCESS = 4
@@ -129,7 +125,7 @@ class GridMeta:
 
 @dataclass(frozen=True)
 class StatsTask:
-    grib_path: Path
+    npy_path: Path
     prism_path: Path
     lead_days: int
     valid_date: datetime
@@ -173,67 +169,23 @@ def _get_prism_tif_path(date: datetime) -> Path:
     return day_dir / "data.tif"
 
 
-def _read_gfs_apcp_global(grib_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Read GFS APCP data without cropping (for preconvert / grid coord saving)."""
-    npy_path = grib_path.with_suffix(".npy")
-    if npy_path.exists() and GFS_GRID_LATS_PATH.exists() and GFS_GRID_LONS_PATH.exists():
-        data = np.load(npy_path)
-        lats = np.load(GFS_GRID_LATS_PATH)
-        lons = np.load(GFS_GRID_LONS_PATH)
-        return data, lats, lons
-
-    ds = xr.open_dataset(grib_path, engine="cfgrib")
-    if not ds.data_vars:
-        raise ValueError(f"No variables found in {grib_path}")
-    var_name = list(ds.data_vars)[0]
-    data = ds[var_name].values.astype(np.float32)
-    lats = ds["latitude"].values
-    lons = ds["longitude"].values
-
-    if lons.max() > 180:
-        lons = ((lons + 180) % 360) - 180
-    sort_idx = np.argsort(lons)
-    lons = lons[sort_idx]
-    data = data[:, sort_idx]
-
-    if lats[0] > lats[-1]:
-        lats = lats[::-1]
-        data = data[::-1, :]
-
+def _read_model_npy(npy_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Read a CONUS-cropped .npy precipitation array and its grid coordinates."""
+    if not npy_path.exists():
+        raise FileNotFoundError(f"Missing .npy file: {npy_path}")
+    if not GFS_GRID_LATS_PATH.exists() or not GFS_GRID_LONS_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing grid coordinate files: {GFS_GRID_LATS_PATH}, {GFS_GRID_LONS_PATH}"
+        )
+    data = np.load(npy_path)
+    lats = np.load(GFS_GRID_LATS_PATH)
+    lons = np.load(GFS_GRID_LONS_PATH)
+    if data.shape != (lats.size, lons.size):
+        raise ValueError(
+            f"{npy_path}: shape {data.shape} != grid ({lats.size}, {lons.size}). "
+            f"Re-run the downloader to regenerate .npy files."
+        )
     return data, lats, lons
-
-
-def _crop_to_us(
-    data: np.ndarray, lats: np.ndarray, lons: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Crop global grid to US bounds."""
-    west, south, east, north = US_CROP_BOUNDS
-    lat_mask = (lats >= south) & (lats <= north)
-    lon_mask = (lons >= west) & (lons <= east)
-    lat_idx = np.where(lat_mask)[0]
-    lon_idx = np.where(lon_mask)[0]
-    return data[np.ix_(lat_idx, lon_idx)], lats[lat_idx], lons[lon_idx]
-
-
-def _read_gfs_apcp(grib_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Read GFS APCP, cropped to US bounds.
-
-    If the .npy cache was written with US-cropped data (matching the cropped
-    grid_lats/grid_lons), it is returned directly.  Otherwise the global data
-    is cropped on the fly.
-    """
-    npy_path = grib_path.with_suffix(".npy")
-    if npy_path.exists() and GFS_GRID_LATS_PATH.exists() and GFS_GRID_LONS_PATH.exists():
-        data = np.load(npy_path)
-        lats = np.load(GFS_GRID_LATS_PATH)
-        lons = np.load(GFS_GRID_LONS_PATH)
-        if data.shape == (lats.size, lons.size):
-            return data, lats, lons
-        # Cache is global but grid coords are cropped — crop data to match.
-        return _crop_to_us(data, *_read_gfs_apcp_global(grib_path)[1:])
-
-    data, lats, lons = _read_gfs_apcp_global(grib_path)
-    return _crop_to_us(data, lats, lons)
 
 
 def _gfs_transform(lats: np.ndarray, lons: np.ndarray) -> rasterio.Affine:
@@ -281,7 +233,14 @@ def _reproject_prism_to_gfs(
 ) -> np.ndarray:
     dst = np.full(gfs_shape, np.nan, dtype=np.float32)
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message="Dataset has no geotransform")
+        if _RASTERIO_NOT_GEOREFERENCED is not None:
+            warnings.simplefilter("ignore", _RASTERIO_NOT_GEOREFERENCED)
+        # Rasterio 1.4+ message includes "gcps, or rpcs" / "identity matrix"
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*[Nn]o geotransform.*|.*identity matrix will be returned.*",
+            category=UserWarning,
+        )
         reproject(
             source=prism_data,
             destination=dst,
@@ -336,6 +295,16 @@ def _validate_or_build_grid_meta(
     return grid_meta
 
 
+def _grid_meta_from_saved_metadata(stats_root: Path) -> GridMeta:
+    meta = load_model_metadata(stats_root)
+    return GridMeta(
+        transform=rasterio.Affine(*meta["transform"]),
+        crs=str(meta["crs"]),
+        lats=meta["lats"],
+        lons=meta["lons"],
+    )
+
+
 def _build_tasks_for_inits(init_dirs: list[Path]) -> Tuple[list[StatsTask], int]:
     tasks: list[StatsTask] = []
     skipped_partial_files = 0
@@ -343,16 +312,16 @@ def _build_tasks_for_inits(init_dirs: list[Path]) -> Tuple[list[StatsTask], int]
     for init_dir in init_dirs:
         init_date = _parse_init_date(init_dir.name)
 
-        for grib_path in sorted(init_dir.iterdir()):
-            if not grib_path.is_file():
+        for path in sorted(init_dir.iterdir()):
+            if not path.is_file():
                 continue
-            if grib_path.name.endswith(".part"):
+            if path.name.endswith(".part"):
                 skipped_partial_files += 1
                 continue
-            match = GFS_FILE_RE.match(grib_path.name)
-            if not match:
+            m = LEAD_NPY_RE.match(path.name)
+            if not m:
                 continue
-            fhour = int(match.group("fhour"))
+            fhour = int(m.group("fhour"))
             lead_days = fhour // 24
             if lead_days < LEAD_DAYS_MIN or lead_days > LEAD_DAYS_MAX:
                 continue
@@ -363,7 +332,7 @@ def _build_tasks_for_inits(init_dirs: list[Path]) -> Tuple[list[StatsTask], int]
                 continue
             tasks.append(
                 StatsTask(
-                    grib_path=grib_path,
+                    npy_path=path,
                     prism_path=prism_tif,
                     lead_days=lead_days,
                     valid_date=valid_date,
@@ -387,7 +356,7 @@ def _process_single_task(
     Returns (lead_days, stat_accumulators, transform_tuple, grid_shape).
     The accumulators contain one sample's contribution so the caller can merge.
     """
-    gfs_data, gfs_lats, gfs_lons = _read_gfs_apcp(task.grib_path)
+    gfs_data, gfs_lats, gfs_lons = _read_model_npy(task.npy_path)
     gfs_tf = _gfs_transform(gfs_lats, gfs_lons)
     transform_tuple = _affine_to_tuple(gfs_tf)
 
@@ -438,6 +407,7 @@ def _merge_task_result(
 
 
 def _compute_years_chunk(
+    model_key: str,
     year_init_dirs: list[tuple[int, list[Path]]],
 ) -> Tuple[
     MonthAccumulators,
@@ -452,9 +422,14 @@ def _compute_years_chunk(
     releases the GIL). The reprojection cache is local to this process and
     shared safely across threads under CPython's GIL.
 
+    Re-applies model configuration in the child so ``GFS_GRID_LATS_PATH`` /
+    ``GFS_DIR`` match *model_key* (required when the process start method is
+    ``spawn``, which re-imports this module and resets globals to defaults).
+
     Returns (accumulators, transform_tuple, grid_shape, task_count, skipped).
     accumulators is month-keyed: {month: {lead: {stat: {key: array}}}}.
     """
+    _configure_for_model(model_key)
     cache = _ReprojectionCache()
     accumulators: MonthAccumulators = {}
     grid_transform_tuple: Tuple[float, float, float, float, float, float] | None = None
@@ -481,9 +456,10 @@ def _compute_years_chunk(
             try:
                 task, (lead_days, stat_accs, t_tuple, shape) = future.result()
             except Exception as exc:
-                raise RuntimeError(
-                    f"Failed task (valid date unknown)"
-                ) from exc
+                failed_task = futures[future]
+                print(f"  WARNING: skipping {failed_task.npy_path} "
+                      f"(valid {failed_task.valid_date.date()}): {exc}")
+                continue
 
             # Validate grid consistency.
             if grid_transform_tuple is None:
@@ -622,7 +598,7 @@ def _load_existing_accumulators(
     return accumulators
 
 
-def _compute_lead_stats() -> Tuple[
+def _compute_lead_stats(model_key: str) -> Tuple[
     MonthAccumulators, GridMeta, int, list[str]
 ]:
     init_dirs = _list_gfs_inits()
@@ -651,7 +627,7 @@ def _compute_lead_stats() -> Tuple[
 
     with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
         futures = {
-            pool.submit(_compute_years_chunk, chunk): i
+            pool.submit(_compute_years_chunk, model_key, chunk): i
             for i, chunk in enumerate(chunks)
         }
         for future in as_completed(futures):
@@ -688,7 +664,7 @@ def _compute_lead_stats() -> Tuple[
     return merged, grid_meta, total_skipped, [d.name for d in init_dirs]
 
 
-def _compute_lead_stats_incremental() -> Tuple[
+def _compute_lead_stats_incremental(model_key: str) -> Tuple[
     MonthAccumulators, GridMeta, int, list[str]
 ]:
     """Incremental version: load existing accumulators and only process new init dirs."""
@@ -750,7 +726,7 @@ def _compute_lead_stats_incremental() -> Tuple[
 
     with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
         futures = {
-            pool.submit(_compute_years_chunk, chunk): i
+            pool.submit(_compute_years_chunk, model_key, chunk): i
             for i, chunk in enumerate(chunks)
         }
         for future in as_completed(futures):
@@ -783,22 +759,8 @@ def _compute_lead_stats_incremental() -> Tuple[
             None, grid_transform_tuple, "EPSG:4326", grid_shape
         )
     else:
-        # No new tasks produced grid info; load from existing metadata.
-        meta_path = None
-        for plugin in VERIFICATION_STATISTICS:
-            candidate = OUTPUT_ROOT / plugin.spec.name / "metadata.npz"
-            if candidate.exists():
-                meta_path = candidate
-                break
-        if meta_path is None:
-            raise RuntimeError("Cannot load grid metadata from existing stats.")
-        with np.load(meta_path, allow_pickle=True) as m:
-            grid_meta = GridMeta(
-                transform=rasterio.Affine(*m["transform"]),
-                crs=str(m["crs"]),
-                lats=m["lats"],
-                lons=m["lons"],
-            )
+        # No new tasks produced grid info; load model-level metadata from disk.
+        grid_meta = _grid_meta_from_saved_metadata(OUTPUT_ROOT)
 
     return merged, grid_meta, total_skipped, all_init_names
 
@@ -859,18 +821,18 @@ def _write_stats(
     grid_meta: GridMeta,
 ) -> None:
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    save_model_metadata(
+        OUTPUT_ROOT,
+        lats=grid_meta.lats,
+        lons=grid_meta.lons,
+        transform=np.array(grid_meta.transform),
+        crs=grid_meta.crs,
+    )
 
     for plugin in VERIFICATION_STATISTICS:
         stat_name = plugin.spec.name
         stat_dir = OUTPUT_ROOT / stat_name
         stat_dir.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            stat_dir / "metadata.npz",
-            lats=grid_meta.lats,
-            lons=grid_meta.lons,
-            transform=np.array(grid_meta.transform),
-            crs=grid_meta.crs,
-        )
 
         # 1. Monthly .npz files (the primitive).
         for month in sorted(accumulators):
@@ -895,68 +857,6 @@ def _write_stats(
             _write_lead_files(season_dir, plugin, season_leads)
 
 
-def _convert_single_grib(grib_path: Path) -> bool:
-    """Convert a single GRIB2 file to cropped US .npy. Returns True if converted, False if skipped."""
-    npy_path = grib_path.with_suffix(".npy")
-    if npy_path.exists():
-        return False
-    data, lats, lons = _read_gfs_apcp_global(grib_path)
-    cropped, _clats, _clons = _crop_to_us(data, lats, lons)
-    np.save(npy_path, cropped)
-    return True
-
-
-def preconvert_grib2_to_npy() -> None:
-    """Convert all GFS GRIB2 files to .npy for fast reading."""
-    print("Scanning for GRIB2 files to convert...")
-    grib_paths: list[Path] = []
-    for init_dir in _list_gfs_inits():
-        for f in sorted(init_dir.iterdir()):
-            if f.is_file() and GFS_FILE_RE.match(f.name):
-                grib_paths.append(f)
-
-    if not grib_paths:
-        print("No GRIB2 files found.")
-        return
-
-    # Save cropped grid lats/lons from the first file (grid is constant across all files).
-    if not GFS_GRID_LATS_PATH.exists() or not GFS_GRID_LONS_PATH.exists():
-        print("Saving cropped grid coordinates from first file...")
-        _data, lats, lons = _read_gfs_apcp_global(grib_paths[0])
-        _cdata, clats, clons = _crop_to_us(_data, lats, lons)
-        np.save(GFS_GRID_LATS_PATH, clats)
-        np.save(GFS_GRID_LONS_PATH, clons)
-        print(f"  Saved {GFS_GRID_LATS_PATH} and {GFS_GRID_LONS_PATH} "
-              f"(cropped: {clats.size}x{clons.size})")
-
-    # Filter to files that actually need conversion.
-    to_convert = [p for p in grib_paths if not p.with_suffix(".npy").exists()]
-    if not to_convert:
-        print(f"All {len(grib_paths)} GRIB2 files already converted.")
-        return
-
-    print(f"Converting {len(to_convert)} of {len(grib_paths)} GRIB2 files...")
-    max_workers = max(1, (os.cpu_count() or 1) - 1)
-    converted = 0
-
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        future_to_path = {
-            executor.submit(_convert_single_grib, p): p for p in to_convert
-        }
-        total = len(future_to_path)
-        for i, future in enumerate(as_completed(future_to_path), start=1):
-            path = future_to_path[future]
-            try:
-                was_converted = future.result()
-            except Exception as exc:
-                print(f"  ERROR converting {path}: {exc}")
-                continue
-            if was_converted:
-                converted += 1
-            if i % 500 == 0 or i == total:
-                print(f"  Progress: {i}/{total} ({converted} converted)")
-
-    print(f"Done. Converted {converted} files.")
 
 
 def _check_stats_complete() -> bool:
@@ -1033,14 +933,14 @@ def main(model_key: str = DEFAULT_MODEL) -> None:
     if _can_do_incremental():
         print("Existing stats complete, checking for new data...")
         accumulators, grid_meta, skipped_partial_files, all_inits = (
-            _compute_lead_stats_incremental()
+            _compute_lead_stats_incremental(model_key)
         )
         if accumulators is None:
             return
     else:
         print("Full recompute required.")
         accumulators, grid_meta, skipped_partial_files, all_inits = (
-            _compute_lead_stats()
+            _compute_lead_stats(model_key)
         )
     _write_stats(accumulators, grid_meta)
     _save_manifest(OUTPUT_ROOT, all_inits, LEAD_DAYS_MIN, LEAD_DAYS_MAX)
@@ -1055,13 +955,8 @@ if __name__ == "__main__":
     _parser = _argparse.ArgumentParser(description="Compute verification statistics")
     _parser.add_argument("--model", default=None, choices=list(MODEL_REGISTRY),
                          help="Model to compute statistics for (default: all models)")
-    _parser.add_argument("--no-preconvert", action="store_true",
-                         help="Skip GRIB2-to-npy conversion before computing stats")
     _args = _parser.parse_args()
 
     _models = [_args.model] if _args.model else list(MODEL_REGISTRY)
     for _model_key in _models:
-        if not _args.no_preconvert:
-            _configure_for_model(_model_key)
-            preconvert_grib2_to_npy()
         main(_model_key)

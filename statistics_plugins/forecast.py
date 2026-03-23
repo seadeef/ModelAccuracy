@@ -13,6 +13,7 @@ class ForecastPlugin:
 
     spec = StatisticSpec(
         name="forecast",
+        label="Forecast",
         units="mm",
         render_field="precip",
         colormap="sequential",

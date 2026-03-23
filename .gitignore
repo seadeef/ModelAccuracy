@@ -1,6 +1,7 @@
 # Virtual environment
 venv/
 .venv/
+.venv_bounds/
 env/
 
 # Python
@@ -11,12 +12,16 @@ __pycache__/
 .eggs/
 dist/
 build/
+lambda_package/
+function.zip
+archive/
 
 # Data and outputs (large or generated)
 model_data/
 prism_data/
 stats_output/
 tiles_output/
+static_export/
 
 # Secrets
 .maptiler_key

@@ -10,6 +10,7 @@ EPSILON = 1e-10
 class SACCPlugin:
     spec = StatisticSpec(
         name="sacc",
+        label="SACC",
         units="%",
         render_field="value",
         colormap="diverging_reversed",

@@ -1,0 +1,1063 @@
+<script>
+  import { appConfig, ui, statLabel, accuracyStatKeys } from '../state.svelte.js';
+  import { fetchStatsAllLeads, fetchLeadWinnersForRegion } from '../api.js';
+  import { getModelLeadBounds } from '../tile.js';
+  import { modelPalette } from '../modelPalette.js';
+  import { glyphPanelClose } from '../appIcons.js';
+
+  let { onleadchange, onstatchange, onperiodchange, onmodelchange } = $props();
+
+  const STAT_COLORS = {
+    nrmse: '#6eb5ff',
+    bias: '#ffd93d',
+    sacc: '#a78bfa',
+    nmad: '#ff6b6b',
+  };
+
+  let canvasEl;
+  let loading = $state(false);
+  let leadData = $state([]);
+  /** Chart / card highlight; must match `ui.statistic` when the panel opens (map layer). */
+  let activeStat = $state('bias');
+  let hoverLead = $state(null);
+  /** When true, chart scrubbing does not move the map lead; click the chart again to unlock. */
+  let leadScrubLocked = $state(false);
+  /** For distinguishing a click from a drag when toggling lock (pointer capture on chart). */
+  let scrubPointerDown = $state(null);
+
+  /** Best model per lead from ``POST /api/stats/lead-winners`` (region-scoped). */
+  let winnersPayload = $state(null);
+  let winnersLoading = $state(false);
+  let winnersGen = 0;
+  let leadFetchGen = 0;
+
+  /** Plot area insets; `PLOT_TOP` reserves space above the grid for the hover readout. */
+  const PAD = { left: 48, right: 18, bottom: 26 };
+  const PLOT_TOP = 34;
+  const HOVER_LABEL_Y = 16;
+
+  function regionCenter() {
+    const r = ui.selectedRegion;
+    if (!r) return null;
+    if (r.type === 'point') return { lat: r.coordinates[1], lon: r.coordinates[0] };
+    if (r.type === 'rectangle') return {
+      lat: (r.coordinates[0][1] + r.coordinates[1][1]) / 2,
+      lon: (r.coordinates[0][0] + r.coordinates[1][0]) / 2,
+    };
+    if (r.type === 'polygon') {
+      const lats = r.coordinates.map(c => c[1]);
+      const lons = r.coordinates.map(c => c[0]);
+      return { lat: lats.reduce((a, b) => a + b, 0) / lats.length, lon: lons.reduce((a, b) => a + b, 0) / lons.length };
+    }
+    return null;
+  }
+
+  function regionLabel() {
+    const r = ui.selectedRegion;
+    const c = regionCenter();
+    if (!r || !c) return '';
+    const coord = `${c.lat.toFixed(2)}\u00b0N, ${Math.abs(c.lon).toFixed(2)}\u00b0W`;
+    if (r.type === 'polygon') return `Polygon centered at: ${coord}`;
+    if (r.type === 'rectangle') return `Rectangle centered at: ${coord}`;
+    return coord;
+  }
+
+  /** Panel chart + stat grid order: NMAD and Bias swapped vs config (map toolbar unchanged). */
+  const chartStats = $derived.by(() => {
+    const keys = accuracyStatKeys();
+    const out = [...keys];
+    const ib = out.indexOf('bias');
+    const inm = out.indexOf('nmad');
+    if (ib !== -1 && inm !== -1) {
+      [out[ib], out[inm]] = [out[inm], out[ib]];
+    }
+    return out;
+  });
+  const isAccuracyStatistic = $derived(chartStats.includes(ui.statistic));
+  const bounds = $derived(getModelLeadBounds(appConfig.models, ui.model));
+  const leadMin = $derived(bounds.min);
+  const leadMax = $derived(bounds.max);
+
+  const palette = $derived(modelPalette(appConfig.models));
+
+  const chartLead = $derived(hoverLead ?? ui.leadFractional);
+
+  const winnerLeadKey = $derived.by(() => {
+    if (ui.activeWindow && /^\d+$/.test(String(ui.activeWindow))) {
+      return String(ui.activeWindow);
+    }
+    if (ui.activeWindow && /^\d+_\d+$/.test(String(ui.activeWindow))) {
+      return String(ui.activeWindow).split('_')[0];
+    }
+    const hl = chartLead;
+    const r = Math.round(Number(hl));
+    const clamped = Math.max(leadMin, Math.min(leadMax, r));
+    return String(clamped);
+  });
+
+  function modelLabel(key) {
+    return appConfig.models.find((m) => m.key === key)?.label ?? key;
+  }
+
+  /** Rows from ``leads`` sorted by day (matches static JSON). */
+  const winnerTableRows = $derived.by(() => {
+    const p = winnersPayload;
+    if (!p?.leads || typeof p.leads !== 'object') return [];
+    return Object.keys(p.leads)
+      .filter((k) => /^\d+$/.test(k))
+      .map((day) => ({ day, winner: p.leads[day] }))
+      .sort((a, b) => Number(a.day) - Number(b.day));
+  });
+
+  function seriesFor(statName) {
+    return leadData.map(d => {
+      if (!d.stats?.[statName]) return null;
+      const s = d.stats[statName];
+      return (s.no_data || s.value === null) ? null : s.value;
+    });
+  }
+
+  function interpValue(data, frac) {
+    const i = frac - leadMin;
+    const lo = Math.max(0, Math.min(data.length - 1, Math.floor(i)));
+    const hi = Math.min(data.length - 1, lo + 1);
+    if (data[lo] === null) return data[hi];
+    if (data[hi] === null) return data[lo];
+    return data[lo] + (data[hi] - data[lo]) * (i - lo);
+  }
+
+  function getYRange() {
+    let min = Infinity, max = -Infinity;
+    for (const stat of chartStats) {
+      for (const v of seriesFor(stat)) {
+        if (v !== null) { if (v < min) min = v; if (v > max) max = v; }
+      }
+    }
+    if (!isFinite(min)) return { min: 0, max: 100 };
+    const pad = (max - min) * 0.1 || 1;
+    return { min: min - pad, max: max + pad };
+  }
+
+  function drawSmoothLine(ctx, points) {
+    if (points.length < 2) return;
+    if (points.length === 2) { ctx.moveTo(points[0].x, points[0].y); ctx.lineTo(points[1].x, points[1].y); return; }
+    const n = points.length;
+    const dx = [], dy = [], m = [];
+    for (let i = 0; i < n - 1; i++) { dx.push(points[i+1].x - points[i].x); dy.push(points[i+1].y - points[i].y); m.push(dy[i] / dx[i]); }
+    const tangent = [m[0]];
+    for (let i = 1; i < n - 1; i++) tangent.push(m[i-1] * m[i] <= 0 ? 0 : (m[i-1] + m[i]) / 2);
+    tangent.push(m[n - 2]);
+    ctx.moveTo(points[0].x, points[0].y);
+    for (let i = 0; i < n - 1; i++) {
+      const p0 = points[i], p1 = points[i+1], d = p1.x - p0.x;
+      ctx.bezierCurveTo(p0.x + d/3, p0.y + tangent[i]*d/3, p1.x - d/3, p1.y - tangent[i+1]*d/3, p1.x, p1.y);
+    }
+  }
+
+  function drawChart() {
+    if (!canvasEl || leadData.length === 0) return;
+    const rect = canvasEl.parentElement.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    canvasEl.width = rect.width * dpr;
+    canvasEl.height = rect.height * dpr;
+    canvasEl.style.width = rect.width + 'px';
+    canvasEl.style.height = rect.height + 'px';
+    const ctx = canvasEl.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const w = rect.width, h = rect.height;
+    const { min: yMin, max: yMax } = getYRange();
+    const plotBottom = h - PAD.bottom;
+
+    const xForLead = lead => PAD.left + ((lead - leadMin) / (leadMax - leadMin)) * (w - PAD.left - PAD.right);
+    const yForValue = val => PLOT_TOP + (1 - (val - yMin) / (yMax - yMin)) * (plotBottom - PLOT_TOP);
+
+    ctx.clearRect(0, 0, w, h);
+
+    // Grid
+    ctx.strokeStyle = 'rgba(255,255,255,0.035)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = yForValue(yMin + (yMax - yMin) * i / 4);
+      ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(w - PAD.right, y); ctx.stroke();
+    }
+    ctx.fillStyle = '#444';
+    ctx.font = '10px "DM Sans", system-ui';
+    ctx.textAlign = 'right';
+    for (let i = 0; i <= 4; i++) {
+      const v = yMin + (yMax - yMin) * i / 4;
+      ctx.fillText(v.toFixed(1), PAD.left - 6, yForValue(v) + 3);
+    }
+    ctx.textAlign = 'center';
+    ctx.font = '10px "DM Sans", system-ui';
+    for (let d = leadMin; d <= leadMax; d++) ctx.fillText(d, xForLead(d), h - 6);
+
+    // Lines
+    for (const stat of chartStats) {
+      const isActive = stat === activeStat;
+      const color = STAT_COLORS[stat] || '#888';
+      const data = seriesFor(stat);
+      const points = [];
+      for (let i = 0; i < data.length; i++) if (data[i] !== null) points.push({ x: xForLead(leadMin + i), y: yForValue(data[i]) });
+      if (points.length < 2) continue;
+
+      if (isActive) {
+        ctx.beginPath(); drawSmoothLine(ctx, points);
+        ctx.lineTo(points[points.length-1].x, yForValue(yMin)); ctx.lineTo(points[0].x, yForValue(yMin)); ctx.closePath();
+        ctx.fillStyle = color + '15'; ctx.fill();
+      }
+      ctx.beginPath(); drawSmoothLine(ctx, points);
+      ctx.strokeStyle = color; ctx.globalAlpha = isActive ? 1 : 0.2; ctx.lineWidth = isActive ? 2 : 1.2; ctx.stroke(); ctx.globalAlpha = 1;
+      for (const p of points) { ctx.beginPath(); ctx.arc(p.x, p.y, isActive ? 2.5 : 1.5, 0, Math.PI*2); ctx.fillStyle = color; ctx.globalAlpha = isActive ? 1 : 0.2; ctx.fill(); ctx.globalAlpha = 1; }
+    }
+
+    // Lead cursor (scrub or locked position)
+    const hl = chartLead;
+    if (hl >= leadMin && hl <= leadMax) {
+      const hx = xForLead(hl);
+      ctx.setLineDash([3, 3]); ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(hx, PLOT_TOP); ctx.lineTo(hx, plotBottom); ctx.stroke(); ctx.setLineDash([]);
+
+      for (const stat of chartStats) {
+        const val = interpValue(seriesFor(stat), hl);
+        if (val === null) continue;
+        const color = STAT_COLORS[stat] || '#888';
+        const y = yForValue(val);
+        const isActive = stat === activeStat;
+        if (isActive) { ctx.beginPath(); ctx.arc(hx, y, 7, 0, Math.PI*2); ctx.fillStyle = color + '20'; ctx.fill(); }
+        ctx.beginPath(); ctx.arc(hx, y, isActive ? 4 : 3, 0, Math.PI*2);
+        ctx.fillStyle = isActive ? color : '#0e1117'; ctx.fill();
+        if (!isActive) { ctx.strokeStyle = color; ctx.lineWidth = 1.2; ctx.stroke(); }
+        if (isActive) {
+          const units = leadData[0]?.stats?.[stat]?.units || '';
+          const label = `${val.toFixed(2)} ${units}`;
+          ctx.save();
+          ctx.font = '600 11px "DM Sans", system-ui';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          const tw = ctx.measureText(label).width;
+          const padX = 9;
+          const padY = 10;
+          const halfW = tw / 2 + padX;
+          let lx = hx;
+          const xMin = PAD.left + halfW + 2;
+          const xMax = w - PAD.right - halfW - 2;
+          if (lx < xMin) lx = xMin;
+          if (lx > xMax) lx = xMax;
+          const bx = lx - tw / 2 - padX;
+          const by = HOVER_LABEL_Y - padY;
+          const bw = tw + padX * 2;
+          const bh = padY * 2;
+          ctx.fillStyle = 'rgba(12, 14, 20, 0.94)';
+          ctx.strokeStyle = color + '66';
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          if (typeof ctx.roundRect === 'function') {
+            ctx.roundRect(bx, by, bw, bh, 6);
+          } else {
+            ctx.rect(bx, by, bw, bh);
+          }
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = color;
+          ctx.fillText(label, lx, HOVER_LABEL_Y);
+          ctx.restore();
+        }
+      }
+    }
+  }
+
+  function leadFromClientX(clientX) {
+    if (!canvasEl) return ui.leadFractional;
+    const rect = canvasEl.parentElement.getBoundingClientRect();
+    const mx = clientX - rect.left;
+    let lead = leadMin + ((mx - PAD.left) / (rect.width - PAD.left - PAD.right)) * (leadMax - leadMin);
+    lead = Math.max(leadMin, Math.min(leadMax, lead));
+    return Math.round(lead * 10) / 10;
+  }
+
+  function handleChartMouseMove(e) {
+    if (!canvasEl || leadData.length === 0 || leadScrubLocked) return;
+    const lead = leadFromClientX(e.clientX);
+    if (lead === hoverLead) return;
+    hoverLead = lead;
+    ui.leadFractional = lead;
+    onleadchange?.(lead);
+    drawChart();
+  }
+
+  function handleChartMouseLeave() {
+    if (leadScrubLocked) return;
+    hoverLead = null;
+    drawChart();
+  }
+
+  function handleLeadChartPointerDown(e) {
+    if (e.button !== 0 || leadData.length === 0) return;
+    scrubPointerDown = { x: e.clientX, y: e.clientY, t: Date.now() };
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function handleLeadChartPointerUp(e) {
+    if (e.button !== 0 || leadData.length === 0) return;
+    const down = scrubPointerDown;
+    scrubPointerDown = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    if (!down) return;
+    const dist = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+    const dt = Date.now() - down.t;
+    if (dt > 450 || dist > 12) return;
+
+    if (leadScrubLocked) {
+      leadScrubLocked = false;
+      drawChart();
+      return;
+    }
+    const lead = leadFromClientX(e.clientX);
+    leadScrubLocked = true;
+    hoverLead = null;
+    ui.leadFractional = lead;
+    onleadchange?.(lead);
+    drawChart();
+  }
+
+  function handleLeadChartPointerCancel(e) {
+    scrubPointerDown = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function statAtHoverLead(statName) {
+    const hl = chartLead;
+    const val = interpValue(seriesFor(statName), hl);
+    if (val === null) return null;
+    return { value: val, units: leadData[0]?.stats?.[statName]?.units || '' };
+  }
+
+  /**
+   * Good / ok / bad tiers for panel values (same units as API: % for SACC/NRMSE/NMAD, mm for bias).
+   * Cutoffs rounded from a one-off analysis of static_export/static/ranges (legend vmin/vmax per
+   * model/stat/period) so tiers sit near the scale of real outputs instead of mistaken 0–1 bounds.
+   */
+  function colorClass(statName, value) {
+    if (value == null) return '';
+    if (statName === 'sacc') return value > 42 ? 'c-good' : value > 20 ? 'c-ok' : 'c-bad';
+    if (statName === 'nmad') return value < 100 ? 'c-good' : value < 125 ? 'c-ok' : 'c-bad';
+    if (statName === 'nrmse') return value < 350 ? 'c-good' : value < 510 ? 'c-ok' : 'c-bad';
+    if (statName === 'bias') {
+      const a = Math.abs(value);
+      return a < 2 ? 'c-good' : a < 4 ? 'c-ok' : 'c-bad';
+    }
+    return '';
+  }
+
+  let panelEntering = $state(false);
+  /** Only true right after we transition from no region → region (not on every reactive run). */
+  let hadSelectedRegion = $state(false);
+
+  // Keep panel emphasis aligned with the map's current statistic (avoids stale default e.g. NRMSE vs bias).
+  $effect(() => {
+    if (!ui.selectedRegion) return;
+    const keys = accuracyStatKeys();
+    if (!keys.length) return;
+    const s = ui.statistic;
+    activeStat = keys.includes(s) ? s : keys[0];
+  });
+
+  // Entrance animation only when the panel opens, not when statistic/period/etc. change while open.
+  $effect(() => {
+    const has = !!ui.selectedRegion;
+    if (has && !hadSelectedRegion) {
+      panelEntering = true;
+      setTimeout(() => { panelEntering = false; }, 450);
+    }
+    hadSelectedRegion = has;
+  });
+
+  $effect(() => {
+    if (!ui.selectedRegion) {
+      leadScrubLocked = false;
+      scrubPointerDown = null;
+      hoverLead = null;
+    }
+  });
+
+  function closePanel() {
+    ui.selectedRegion = null;
+  }
+
+  function selectPeriod(period, month, season) {
+    ui.period = period;
+    if (month) ui.month = month;
+    if (season) ui.season = season;
+    onperiodchange?.();
+  }
+
+  const periodOptions = [
+    { key: 'yearly', label: 'Yearly' },
+    { key: 'djf', label: 'DJF', period: 'seasonal', season: 'djf' },
+    { key: 'mam', label: 'MAM', period: 'seasonal', season: 'mam' },
+    { key: 'jja', label: 'JJA', period: 'seasonal', season: 'jja' },
+    { key: 'son', label: 'SON', period: 'seasonal', season: 'son' },
+  ];
+
+  function currentPeriodKey() {
+    if (ui.period === 'yearly') return 'yearly';
+    if (ui.period === 'seasonal') return ui.season;
+    return 'yearly';
+  }
+
+  // Build a key from the fetch dependencies — only refetch when this changes
+  let lastFetchKey = '';
+
+  function regionGeometryKey(r) {
+    if (r.type === 'point') {
+      return `p:${r.coordinates[1].toFixed(5)},${r.coordinates[0].toFixed(5)}`;
+    }
+    if (r.type === 'rectangle') {
+      return `r:${r.bounds.map((x) => x.toFixed(5)).join(',')}`;
+    }
+    if (r.type === 'polygon') {
+      return `g:${r.coordinates.map(([lng, lat]) => `${lng.toFixed(5)},${lat.toFixed(5)}`).join(';')}`;
+    }
+    return '';
+  }
+
+  function fetchKey() {
+    const r = ui.selectedRegion;
+    if (!r) return '';
+    const geo = regionGeometryKey(r);
+    if (!geo) return '';
+    return `${geo}|${ui.model}|${ui.period}|${ui.month}|${ui.season}`;
+  }
+
+  $effect(() => {
+    // Read reactive deps to track them
+    const region = ui.selectedRegion;
+    const model = ui.model;
+    const period = ui.period;
+    const month = ui.month;
+    const season = ui.season;
+
+    // Compute key from deps
+    const key = fetchKey();
+
+    if (!key) {
+      lastFetchKey = '';
+      leadFetchGen += 1;
+      if (leadData.length > 0) leadData = [];
+      return;
+    }
+
+    if (key === lastFetchKey) return; // no change
+    lastFetchKey = key;
+
+    const b = getModelLeadBounds(appConfig.models, model);
+    const isFirstLoad = leadData.length === 0;
+    const lid = leadFetchGen + 1;
+    leadFetchGen = lid;
+
+    // Use untracked timeout to avoid writing $state inside tracked $effect
+    setTimeout(() => {
+      if (isFirstLoad) loading = true;
+
+      fetchStatsAllLeads({
+        model,
+        region,
+        period,
+        month,
+        season,
+        minLead: b.min,
+        maxLead: b.max,
+      }).then((results) => {
+        if (lid !== leadFetchGen) return;
+        leadData = results;
+        loading = false;
+      });
+    }, 0);
+  });
+
+  $effect(() => {
+    const region = ui.selectedRegion;
+    const stat = ui.statistic;
+    const period = ui.period;
+    const month = ui.month;
+    const season = ui.season;
+    const accKeys = accuracyStatKeys();
+    const b = getModelLeadBounds(appConfig.models, ui.model);
+
+    if (!region || !accKeys.includes(stat)) {
+      winnersGen += 1;
+      winnersPayload = null;
+      winnersLoading = false;
+      return;
+    }
+
+    const my = winnersGen + 1;
+    winnersGen = my;
+    winnersLoading = true;
+    // Keep showing previous rankings while fetching so the panel does not jump to "Loading…".
+
+    queueMicrotask(async () => {
+      const data = await fetchLeadWinnersForRegion({
+        region,
+        statistic: stat,
+        period,
+        month,
+        season,
+        minLead: b.min,
+        maxLead: b.max,
+      });
+      if (my !== winnersGen) return;
+      winnersPayload = data;
+      winnersLoading = false;
+    });
+  });
+
+  $effect(() => {
+    const _ = [leadData, activeStat, winnerLeadKey, leadScrubLocked, chartLead];
+    requestAnimationFrame(() => drawChart());
+  });
+</script>
+
+{#if ui.selectedRegion}
+  <div class="panel" class:entering={panelEntering}>
+    <div class="panel-handle"></div>
+
+    <div class="panel-header">
+      <div class="header-left">
+        <span class="panel-title">{regionLabel()}</span>
+      </div>
+      <div class="header-controls">
+        <label class="model-field">
+          <span class="model-field-label">Model</span>
+          <select class="panel-model-select" value={ui.model} onchange={onmodelchange}>
+            {#each appConfig.models as m}
+              <option value={m.key}>{m.label}</option>
+            {/each}
+          </select>
+        </label>
+        <div class="period-pills">
+          {#each periodOptions as opt}
+            <button
+              class="period-pill"
+              class:active={currentPeriodKey() === opt.key}
+              onclick={() => selectPeriod(opt.period || 'yearly', null, opt.season || null)}
+            >{opt.label}</button>
+          {/each}
+        </div>
+        <button class="icon-btn close-btn" type="button" title="Close panel" aria-label="Close panel" onclick={closePanel}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphPanelClose}</svg>
+        </button>
+      </div>
+    </div>
+
+    {#if loading}
+      <div class="panel-loading">
+        <div class="loading-dot"></div>
+        Loading stats...
+      </div>
+    {:else if leadData.length > 0}
+      <div class="panel-body">
+        <!-- Chart -->
+        <div class="chart-section">
+          <div class="section-label">Accuracy vs. lead time</div>
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div
+            class="lead-chart"
+            class:lead-locked={leadScrubLocked}
+            onmousemove={handleChartMouseMove}
+            onmouseleave={handleChartMouseLeave}
+            onpointerdown={handleLeadChartPointerDown}
+            onpointerup={handleLeadChartPointerUp}
+            onpointercancel={handleLeadChartPointerCancel}
+          >
+            <canvas bind:this={canvasEl}></canvas>
+          </div>
+          <div class="chart-legend">
+            {#each chartStats as stat}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div
+                class="legend-item"
+                class:active={activeStat === stat}
+                class:dimmed={activeStat !== stat}
+                style="--stat-color: {STAT_COLORS[stat] || '#888'}"
+                onclick={() => { activeStat = stat; }}
+              >
+                <div class="legend-dot"></div>
+                {statLabel(stat)}
+              </div>
+            {/each}
+          </div>
+        </div>
+
+        <!-- Stats at hover lead -->
+        <div class="stats-section">
+          <div class="stat-grid">
+            {#each chartStats as stat}
+              {@const s = statAtHoverLead(stat)}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="stat-card" class:highlighted={activeStat === stat} onclick={() => { activeStat = stat; ui.statistic = stat; ui.activeWindow = null; onstatchange?.({ target: { value: stat } }); }}>
+                <div class="stat-label">{statLabel(stat)}</div>
+                <div class="stat-val {s ? colorClass(stat, s.value) : ''}">{s ? s.value.toFixed(2) : '\u2014'}</div>
+                <div class="stat-unit">{s?.units || ''}</div>
+              </div>
+            {/each}
+          </div>
+        </div>
+
+        <!-- Region-scoped best model per lead (API); each lead day is a column -->
+        <div class="compare-section">
+          <div class="section-label compare-section-label">
+            <span>Best model by day — {statLabel(ui.statistic)}</span>
+          </div>
+          {#if !isAccuracyStatistic}
+            <div class="winners-loading">Domain winners apply to accuracy metrics only.</div>
+          {:else if winnersLoading && winnersPayload === null}
+            <div class="winners-loading">Loading rankings…</div>
+          {:else if winnerTableRows.length === 0}
+            <div class="winners-loading">No winner data for this slice.</div>
+          {:else}
+            <div class="winners-table-wrap">
+              <table class="compare-table winners-table winners-table-cols">
+                <thead>
+                  <tr>
+                    {#each winnerTableRows as row}
+                      <th
+                        class="winners-day-head"
+                        class:winners-col-current={row.day === winnerLeadKey}
+                      >{row.day}</th>
+                    {/each}
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    {#each winnerTableRows as row}
+                      {@const pc = row.winner ? palette[row.winner] : null}
+                      <td class:winners-col-current={row.day === winnerLeadKey}>
+                        {#if row.winner}
+                          {#if pc}
+                            <span
+                              class="winner-pill winner-pill-compact"
+                              style:background={pc.bg}
+                              style:color={pc.fg}
+                              style:border-color={pc.border}
+                            >{modelLabel(row.winner)}</span>
+                          {:else}
+                            <span class="winner-pill winner-pill-compact winner-pill-fallback">{modelLabel(row.winner)}</span>
+                          {/if}
+                        {:else}
+                          <span class="compare-nodata">&mdash;</span>
+                        {/if}
+                      </td>
+                    {/each}
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          {/if}
+        </div>
+      </div>
+    {:else}
+      <div class="panel-loading">No data available</div>
+    {/if}
+  </div>
+{/if}
+
+<style>
+  .panel {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--panel-bg);
+    backdrop-filter: blur(24px) saturate(1.4);
+    -webkit-backdrop-filter: blur(24px) saturate(1.4);
+    border-top: 1px solid var(--panel-border);
+    border-radius: 16px 16px 0 0;
+    max-height: 52vh;
+    overflow-y: auto;
+    z-index: 20;
+  }
+  .panel.entering {
+    animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes slideUp {
+    from { transform: translateY(100%); opacity: 0.5; }
+    to { transform: translateY(0); opacity: 1; }
+  }
+  .panel-handle {
+    width: 32px;
+    height: 3px;
+    background: rgba(255,255,255,0.1);
+    border-radius: 2px;
+    margin: 10px auto 0;
+  }
+
+  /* Header */
+  .panel-header {
+    padding: 10px 16px 8px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .panel-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: #fff;
+    white-space: nowrap;
+  }
+  .header-controls {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .model-field {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    align-items: flex-start;
+  }
+  .model-field-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--text-secondary);
+  }
+  .panel-model-select {
+    background: var(--surface);
+    color: var(--text-primary);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    font-size: 12px;
+    font-family: inherit;
+    font-weight: 500;
+    padding: 5px 24px 5px 9px;
+    cursor: pointer;
+    outline: none;
+    max-width: 8.5rem;
+    -webkit-appearance: none;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'%3E%3Cpath fill='%237a818c' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 6px center;
+  }
+  .panel-model-select:focus {
+    border-color: var(--accent);
+  }
+  .panel-model-select option {
+    background: var(--panel-solid);
+    color: var(--text-primary);
+  }
+  .period-pills {
+    display: flex;
+    gap: 2px;
+    background: var(--surface);
+    border-radius: 6px;
+    padding: 2px;
+  }
+  .period-pill {
+    padding: 5px 11px;
+    font-size: 12px;
+    font-family: inherit;
+    font-weight: 500;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .period-pill.active {
+    background: var(--accent-glow);
+    color: var(--accent);
+  }
+  .period-pill:hover:not(.active) {
+    color: var(--text-primary);
+  }
+  .icon-btn {
+    width: 30px;
+    height: 30px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .icon-btn:hover { background: var(--hover-bg); color: var(--text-primary); }
+  .close-btn {
+    width: 36px;
+    height: 36px;
+    flex-shrink: 0;
+    border-radius: 8px;
+    border: 1px solid var(--panel-border);
+    background: var(--surface);
+    color: var(--text-primary);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  }
+  .close-btn:hover {
+    color: #ff8a8a;
+    background: rgba(255, 107, 107, 0.14);
+    border-color: rgba(255, 107, 107, 0.35);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  }
+
+  /* Body */
+  .panel-body {
+    display: grid;
+    grid-template-columns: 1fr 238px;
+    gap: 12px;
+    padding: 4px 16px 16px;
+  }
+  .section-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text-secondary);
+    margin-bottom: 6px;
+  }
+  .compare-section-label {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  /* Chart */
+  .chart-section {
+    min-width: 0;
+  }
+  .lead-chart {
+    width: 100%;
+    height: 156px;
+    position: relative;
+    cursor: crosshair;
+    touch-action: none;
+    border-radius: 8px;
+  }
+  .lead-chart.lead-locked {
+    box-shadow: inset 0 0 0 1px rgba(110, 181, 255, 0.35);
+    cursor: pointer;
+  }
+  .lead-chart canvas { width: 100%; height: 100%; }
+  .chart-legend {
+    display: flex;
+    gap: 4px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.15s;
+    border: 1px solid transparent;
+    user-select: none;
+    color: var(--stat-color);
+  }
+  .legend-item:hover { background: rgba(255,255,255,0.03); }
+  .legend-item.active { border-color: var(--stat-color); background: rgba(255,255,255,0.03); }
+  .legend-item.dimmed { opacity: 0.3; }
+  .legend-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--stat-color);
+    flex-shrink: 0;
+  }
+
+  /* Stats */
+  .stats-section {
+    display: flex;
+    flex-direction: column;
+  }
+  .stat-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    flex: 1;
+  }
+  .stat-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    min-height: 5.75rem;
+    padding: 10px 8px;
+    border-radius: 8px;
+    background: var(--surface);
+    border: 1px solid transparent;
+    cursor: pointer;
+    transition: all 0.15s;
+    gap: 5px;
+  }
+  .stat-card:hover { border-color: var(--panel-border); }
+  .stat-card.highlighted { border-color: rgba(110,181,255,0.2); background: var(--accent-glow); }
+  .stat-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--text-secondary);
+    margin: 0;
+    line-height: 1.2;
+  }
+  .stat-val {
+    font-size: 19px;
+    font-weight: 600;
+    line-height: 1.1;
+    margin: 0;
+  }
+  .stat-unit {
+    font-size: 10px;
+    color: rgba(255,255,255,0.28);
+    margin: 0;
+    line-height: 1.2;
+  }
+  .c-good { color: #4ade80; }
+  .c-ok { color: #fbbf24; }
+  .c-bad { color: #f87171; }
+
+  /* Model comparison */
+  .compare-section {
+    grid-column: 1 / -1;
+    margin-top: 4px;
+  }
+  .compare-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .compare-table th {
+    text-align: left;
+    padding: 6px 10px;
+    color: var(--text-secondary);
+    font-weight: 600;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    border-bottom: 1px solid var(--panel-border);
+  }
+  .compare-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+  }
+  .compare-table tr:last-child td {
+    border-bottom: none;
+  }
+  .compare-nodata {
+    color: rgba(255,255,255,0.15);
+  }
+
+  .winners-table-wrap {
+    max-height: min(220px, 40vh);
+    overflow: auto;
+    border-radius: 8px;
+    border: 1px solid var(--panel-border);
+  }
+  .winners-table-wrap .compare-table {
+    margin: 0;
+  }
+  .winners-table-cols th,
+  .winners-table-cols td {
+    text-align: center;
+    vertical-align: middle;
+    min-width: 3.25rem;
+    padding: 6px 4px;
+  }
+  .winners-day-head {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.2px;
+  }
+  .winners-table-cols th.winners-col-current,
+  .winners-table-cols td.winners-col-current {
+    background: rgba(110, 181, 255, 0.1);
+    box-shadow: inset 0 0 0 1px rgba(110, 181, 255, 0.2);
+  }
+
+  .winners-loading {
+    padding: 10px 10px 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+  .winner-pill {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    border: 1px solid transparent;
+  }
+  .winner-pill-compact {
+    padding: 3px 6px;
+    font-size: 11px;
+    border-radius: 4px;
+    max-width: 100%;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .winner-pill-fallback {
+    background: var(--surface);
+    color: var(--text-primary);
+    border-color: var(--panel-border);
+  }
+
+  .panel-loading {
+    padding: 24px;
+    text-align: center;
+    color: var(--text-secondary);
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .loading-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: pulse 1s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
+  }
+</style>
