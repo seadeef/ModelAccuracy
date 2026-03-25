@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""GFS downloader.
+
+Downloads APCP (precipitation) GRIB2 files from the NOAA GFS S3 bucket
+using byte-range requests via .idx index files.  After download, each
+GRIB2 is converted to a CONUS-cropped .npy array and the GRIB2 is deleted.
+This matches the NBM pipeline and keeps model_data/ free of GRIB2 files.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +24,69 @@ from base import BaseDownloader
 # Fixed 12z cycle for GFS; used in remote paths and local dir names.
 GFS_CYCLE = 12
 GFS_VARIABLE = "APCP"
+
+# CONUS crop bounds (must match compute_stats / NBM target grid).
+US_CROP_BOUNDS = (-130.0, 20.0, -60.0, 55.0)
+
+
+def _grib2_to_npy(grib_path: Path, output_dir: Path) -> None:
+    """Convert a single GFS GRIB2 to a CONUS-cropped .npy and delete the GRIB2.
+
+    Also saves grid_lats.npy / grid_lons.npy on first call.
+    Must run in a single process (cfgrib is not thread-safe).
+    """
+    import numpy as np
+    import xarray as xr
+
+    npy_path = grib_path.with_suffix(".npy")
+    if npy_path.exists():
+        grib_path.unlink(missing_ok=True)
+        return
+
+    ds = xr.open_dataset(grib_path, engine="cfgrib")
+    if not ds.data_vars:
+        ds.close()
+        grib_path.unlink(missing_ok=True)
+        return
+    var_name = list(ds.data_vars)[0]
+    data = ds[var_name].values.astype(np.float32)
+    lats = ds["latitude"].values
+    lons = ds["longitude"].values
+    ds.close()
+
+    # Normalize grid: wrap longitudes, ensure south-to-north.
+    if lons.max() > 180:
+        lons = ((lons + 180) % 360) - 180
+        sort_idx = np.argsort(lons)
+        lons = lons[sort_idx]
+        data = data[:, sort_idx]
+    if lats[0] > lats[-1]:
+        lats = lats[::-1]
+        data = data[::-1, :]
+
+    # Crop to CONUS.
+    west, south, east, north = US_CROP_BOUNDS
+    lat_mask = (lats >= south) & (lats <= north)
+    lon_mask = (lons >= west) & (lons <= east)
+    lat_idx = np.where(lat_mask)[0]
+    lon_idx = np.where(lon_mask)[0]
+    data = data[np.ix_(lat_idx, lon_idx)]
+    lats = lats[lat_idx]
+    lons = lons[lon_idx]
+
+    np.save(npy_path, data)
+
+    # Save grid coords once.
+    grid_lats = output_dir / "grid_lats.npy"
+    grid_lons = output_dir / "grid_lons.npy"
+    if not grid_lats.exists():
+        np.save(grid_lats, lats)
+        np.save(grid_lons, lons)
+
+    grib_path.unlink(missing_ok=True)
+    # cfgrib may leave a .idx sidecar file.
+    for idx in grib_path.parent.glob(grib_path.name + ".*idx*"):
+        idx.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -67,13 +137,18 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         idx_path = f"gfs.{date_str}/{cycle_str}/atmos/{idx_filename}"
         return grib_filename, grib_path, idx_path
 
-    def _output_file(self, init_date: datetime, fhour: int, level: str) -> Path:
+    def _output_npy(self, init_date: datetime, fhour: int, level: str) -> Path:
+        """Final .npy output path (what compute_stats reads)."""
         date_str = init_date.strftime("%Y%m%d")
         cycle_str = f"{GFS_CYCLE:02d}"
         safe_level = level.replace(" ", "_")
         out_dir = self.output_dir / str(init_date.year) / f"{date_str}_{cycle_str}z"
         out_dir.mkdir(parents=True, exist_ok=True)
-        return out_dir / f"f{fhour:03d}_{safe_level}.grib2"
+        return out_dir / f"f{fhour:03d}_{safe_level}.npy"
+
+    def _output_grib(self, init_date: datetime, fhour: int, level: str) -> Path:
+        """Temporary GRIB2 path (deleted after conversion to .npy)."""
+        return self._output_npy(init_date, fhour, level).with_suffix(".grib2")
 
     def _find_byte_range(self, idx_text: str, level: str):
         lines = idx_text.strip().split("\n")
@@ -94,13 +169,14 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         return start_byte, end_byte
 
     def _download_task(self, task: DownloadTask) -> tuple[DownloadTask, str]:
-        init_date, fhour, level = (
-            task.init_date,
-            task.fhour,
-            task.level,
-        )
-        out_file = self._output_file(init_date, fhour, level)
-        if out_file.exists():
+        init_date, fhour, level = task.init_date, task.fhour, task.level
+        npy_file = self._output_npy(init_date, fhour, level)
+        if npy_file.exists():
+            return task, "exists"
+
+        grib_file = self._output_grib(init_date, fhour, level)
+        if grib_file.exists():
+            # GRIB2 from a previous run that wasn't converted yet; skip download.
             return task, "exists"
 
         grib_filename, grib_path, idx_path = self._paths(init_date, fhour)
@@ -112,7 +188,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             time.sleep(self.polite_delay_seconds)
 
         for attempt in range(1, self.max_retries + 1):
-            part = out_file.with_suffix(out_file.suffix + ".part")
+            part = grib_file.with_suffix(grib_file.suffix + ".part")
             try:
                 idx_resp = self.session.get(idx_url, timeout=self.timeout_seconds)
                 if idx_resp.status_code == 404:
@@ -128,15 +204,23 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
                     for chunk in resp.iter_content(chunk_size=1024 * 256):
                         if chunk:
                             f.write(chunk)
-                part.replace(out_file)
-                size_kb = out_file.stat().st_size / 1024
+                # Validate GRIB2 magic bytes before accepting.
+                with open(part, "rb") as check:
+                    magic = check.read(4)
+                if magic != b"GRIB":
+                    part.unlink(missing_ok=True)
+                    last_err = ValueError(f"Invalid GRIB2 (magic={magic!r})")
+                    time.sleep(1.25 * attempt)
+                    continue
+                part.replace(grib_file)
+                size_kb = grib_file.stat().st_size / 1024
                 return task, f"downloaded ({size_kb:.1f} KB)"
             except Exception as e:
                 last_err = e
                 if part.exists():
                     part.unlink(missing_ok=True)
-                if out_file.exists():
-                    out_file.unlink(missing_ok=True)
+                if grib_file.exists():
+                    grib_file.unlink(missing_ok=True)
                 time.sleep(1.25 * attempt)
         return task, f"failed: {last_err}"
 
@@ -182,9 +266,14 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             raise ValueError("No init dates selected. Check start/end dates.")
 
         tasks: list[DownloadTask] = []
+        skipped = 0
         for d in init_dates:
             for fh in forecast_hours:
-                tasks.append(DownloadTask(d, int(fh), str(level)))
+                t = DownloadTask(d, int(fh), str(level))
+                if self._output_npy(t.init_date, t.fhour, t.level).exists():
+                    skipped += 1
+                else:
+                    tasks.append(t)
 
         print("\n" + "=" * 70)
         print("Parallel GFS filtered download (idx + Range)")
@@ -194,6 +283,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         print(f"Variable: {GFS_VARIABLE} | Level: {level}")
         print(f"Workers: {self.max_workers} | Retries: {self.max_retries}")
         print(f"Output: {self.output_dir.resolve()}")
+        print(f"Tasks: {len(tasks)} to download | {skipped} already exist")
         print("=" * 70)
 
         results = self._run_parallel(
@@ -215,7 +305,23 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             print("Examples:")
             for e in examples:
                 print("  " + e)
-        print("-" * 70 + "\n")
+        print("-" * 70)
+
+        # Convert GRIB2 → cropped .npy and delete GRIB2.
+        # cfgrib is not thread-safe, so this runs sequentially.
+        grib_files = []
+        for task, status in results:
+            if status.startswith("downloaded"):
+                grib = self._output_grib(task.init_date, task.fhour, task.level)
+                if grib.exists():
+                    grib_files.append(grib)
+        if grib_files:
+            print(f"Converting {len(grib_files)} GRIB2 files to .npy...")
+            for i, grib in enumerate(grib_files, 1):
+                _grib2_to_npy(grib, self.output_dir)
+                if i % 25 == 0 or i == len(grib_files):
+                    print(f"  Converted {i}/{len(grib_files)}", flush=True)
+            print()
 
 
     def extract_forecast(
@@ -225,10 +331,9 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         lead_windows: list[tuple[int, int]] | None = None,
         output_root: Path | None = None,
     ) -> None:
-        """Extract raw GFS precipitation forecast into stats_output/forecast/ format for tile generation."""
+        """Extract GFS .npy forecast data into stats_output/forecast/ format for tile generation."""
         import numpy as np
         import rasterio.transform
-        import xarray as xr
         from model_registry import window_to_key
 
         gfs_dir = self.output_dir
@@ -244,10 +349,13 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
 
         # Find init directory.
         if init_date is None:
-            all_inits = sorted(gfs_dir.glob("*/*_12z"))
-            if not all_inits:
-                raise SystemExit("No GFS init directories found.")
-            init_date = datetime.strptime(all_inits[-1].name[:8], "%Y%m%d")
+            all_inits = sorted(gfs_dir.glob("*/*_12z"), reverse=True)
+            for candidate in all_inits:
+                if any(candidate.glob("f*_*.npy")):
+                    init_date = datetime.strptime(candidate.name[:8], "%Y%m%d")
+                    break
+            if init_date is None:
+                raise SystemExit("No GFS init directories with data found.")
             print(f"Using most recent init date: {init_date.date()}")
 
         date_str = init_date.strftime("%Y%m%d")
@@ -255,98 +363,40 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         if not init_dir.exists():
             raise SystemExit(f"Init directory not found: {init_dir}")
 
-        # Build land mask from an existing statistic's coverage.
-        land_mask = None
-        for stat_dir in sorted(output_root.iterdir()):
-            if stat_dir.name == "forecast" or not stat_dir.is_dir():
-                continue
-            for npz_file in stat_dir.glob("lead_*.npz"):
-                with np.load(npz_file) as f:
-                    field = list(f.keys())[0]
-                    land_mask = np.isfinite(f[field])
-                break
-            if land_mask is not None:
-                print(f"Land mask from {npz_file} ({np.count_nonzero(land_mask)} valid pixels)")
-                break
+        grid_lats_path = gfs_dir / "grid_lats.npy"
+        grid_lons_path = gfs_dir / "grid_lons.npy"
+        if not grid_lats_path.exists() or not grid_lons_path.exists():
+            raise SystemExit("Grid coordinate files not found. Run download first.")
 
-        if land_mask is None:
-            print("Warning: no existing statistics found for land mask. Forecast will include ocean.")
+        lats = np.load(grid_lats_path)
+        lons = np.load(grid_lons_path)
 
-        def _read_gfs_apcp(grib_path: Path):
-            npy_path = grib_path.with_suffix(".npy")
-            grid_lats = gfs_dir / "grid_lats.npy"
-            grid_lons = gfs_dir / "grid_lons.npy"
-
-            if npy_path.exists() and grid_lats.exists() and grid_lons.exists():
-                return np.load(npy_path), np.load(grid_lats), np.load(grid_lons)
-
-            ds = xr.open_dataset(grib_path, engine="cfgrib")
-            if not ds.data_vars:
-                raise ValueError(f"No variables found in {grib_path}")
-            var_name = list(ds.data_vars)[0]
-            data = ds[var_name].values.astype(np.float32)
-            lats = ds["latitude"].values
-            lons = ds["longitude"].values
-
-            if lons.max() > 180:
-                lons = ((lons + 180) % 360) - 180
-            sort_idx = np.argsort(lons)
-            lons = lons[sort_idx]
-            data = data[:, sort_idx]
-
-            if lats[0] > lats[-1]:
-                lats = lats[::-1]
-                data = data[::-1, :]
-
-            return data, lats, lons
-
-        def _gfs_transform(lats, lons):
-            lat_res = abs(float(lats[1] - lats[0]))
-            lon_res = abs(float(lons[1] - lons[0]))
-            west = float(lons.min()) - lon_res / 2.0
-            if lats[0] < lats[-1]:
-                south = float(lats.min()) - lat_res / 2.0
-                return rasterio.transform.Affine(lon_res, 0, west, 0, lat_res, south)
-            else:
-                north = float(lats.max()) + lat_res / 2.0
-                return rasterio.transform.from_origin(west, north, lon_res, lat_res)
-
-        def _grid_coords_from_transform(transform, height, width):
-            lons = transform.c + (np.arange(width) + 0.5) * transform.a
-            lats = transform.f + (np.arange(height) + 0.5) * transform.e
-            return lats.astype(np.float32), lons.astype(np.float32)
+        # Build transform from the regular 1D grid coords.
+        lat_res = abs(float(lats[1] - lats[0]))
+        lon_res = abs(float(lons[1] - lons[0]))
+        west = float(lons.min()) - lon_res / 2.0
+        south = float(lats.min()) - lat_res / 2.0
+        transform = rasterio.transform.Affine(lon_res, 0, west, 0, lat_res, south)
 
         # Read all available lead days.
         lead_data: dict[int, np.ndarray] = {}
-        transform = None
-
         for fhour in forecast_hours:
             lead_days = fhour // 24
-            grib_path = init_dir / f"f{fhour:03d}_surface.grib2"
-            if not grib_path.exists():
-                print(f"  Skipping lead {lead_days} (missing {grib_path.name})")
+            npy_path = init_dir / f"f{fhour:03d}_surface.npy"
+            if not npy_path.exists():
+                print(f"  Skipping lead {lead_days} (missing {npy_path.name})")
                 continue
+            lead_data[lead_days] = np.load(npy_path)
+            print(f"  Lead {lead_days}: {npy_path.name}")
 
-            data, lats, lons = _read_gfs_apcp(grib_path)
-            if transform is None:
-                transform = _gfs_transform(lats, lons)
-
-            if land_mask is not None and data.shape == land_mask.shape:
-                data[~land_mask] = np.nan
-
-            lead_data[lead_days] = data
-            print(f"  Lead {lead_days}: {grib_path.name}")
-
-        if not lead_data or transform is None:
-            raise SystemExit("No forecast hours found.")
+        if not lead_data:
+            raise SystemExit("No forecast data found.")
 
         # Write metadata.
-        height, width = next(iter(lead_data.values())).shape
-        meta_lats, meta_lons = _grid_coords_from_transform(transform, height, width)
         np.savez_compressed(
             forecast_dir / "metadata.npz",
-            lats=meta_lats,
-            lons=meta_lons,
+            lats=lats,
+            lons=lons,
             transform=np.array(transform),
             crs="EPSG:4326",
             init_date=init_date.strftime("%Y-%m-%d"),
@@ -364,7 +414,6 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             if len(leads_in_window) != expected:
                 print(f"  Skipping window {start}-{end} (have {len(leads_in_window)}/{expected} leads)")
                 continue
-
             avg = np.mean([lead_data[ld] for ld in leads_in_window], axis=0)
             wkey = window_to_key(start, end)
             np.savez_compressed(forecast_dir / f"lead_{wkey}.npz", precip=avg)

@@ -10,6 +10,7 @@ EPSILON = 1e-10
 class NRMSEPlugin:
     spec = StatisticSpec(
         name="nrmse",
+        label="NRMSE",
         units="%",
         render_field="value",
         colormap="diverging",

@@ -139,15 +139,18 @@ def _run_catchup(models: list[ModelConfig]) -> None:
 
 
 def _forecast_dir_has_data(config: ModelConfig, date: datetime) -> bool:
-    """Check whether the init directory for the given date has any GRIB2 files."""
+    """Check whether the init directory has assembled lead files (GRIB and/or .npy)."""
     date_str = date.strftime("%Y%m%d")
     init_dir = Path(config.data_dir) / str(date.year) / f"{date_str}_{config.cycle_hour:02d}z"
-    return init_dir.exists() and any(init_dir.glob("f*_*.grib2"))
+    if not init_dir.exists():
+        return False
+    return any(init_dir.glob("f*_*.grib2")) or any(init_dir.glob("f*_*.npy"))
 
 
 def _run_forecast(config: ModelConfig) -> None:
     forecast_hours = config.forecast_hours
-    today = datetime.now(timezone.utc)
+    today = datetime.now(timezone.utc) - timedelta(hours=14)  # GFS 12z needs ~14h to publish
+    today = today.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday = today - timedelta(days=1)
 
     cls = config.get_downloader_class()
@@ -171,6 +174,13 @@ def _run_forecast(config: ModelConfig) -> None:
             )
             if _forecast_dir_has_data(config, attempt_date):
                 break
+            # Remove empty init directory so it doesn't confuse extract_forecast.
+            date_str_compact = attempt_date.strftime("%Y%m%d")
+            empty_dir = Path(config.data_dir) / str(attempt_date.year) / f"{date_str_compact}_{config.cycle_hour:02d}z"
+            if empty_dir.exists() and not (
+                any(empty_dir.glob("f*_*.grib2")) or any(empty_dir.glob("f*_*.npy"))
+            ):
+                empty_dir.rmdir()
             print(f"No forecast data available for {date_str}, trying previous day...")
 
     output_root = Path("stats_output") / config.key
@@ -202,6 +212,8 @@ def main() -> None:
                         help="Start date (YYYY-MM-DD). Defaults to today.")
     parser.add_argument("--end-date",
                         help="End date (YYYY-MM-DD). Defaults to start date.")
+    parser.add_argument("--no-prism", action="store_true",
+                        help="Skip PRISM observation download")
     parser.add_argument("--start-year", type=int,
                         help="Start year (downloads full years)")
     parser.add_argument("--end-year", type=int,
@@ -221,13 +233,14 @@ def main() -> None:
         for config in models:
             _run_forecast(config)
     else:
-        print("\n=== Downloading PRISM observations ===")
-        if args.start_year:
-            _run_prism_years(args.start_year, args.end_year or args.start_year)
-        else:
-            start = args.start_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            end = args.end_date or start
-            _run_prism(start, end)
+        if not args.no_prism:
+            print("\n=== Downloading PRISM observations ===")
+            if args.start_year:
+                _run_prism_years(args.start_year, args.end_year or args.start_year)
+            else:
+                start = args.start_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                end = args.end_date or start
+                _run_prism(start, end)
         for config in models:
             print(f"\n=== Downloading model '{config.key}' ===")
             _run_download(config, args)

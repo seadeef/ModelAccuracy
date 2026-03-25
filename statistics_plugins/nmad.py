@@ -10,9 +10,11 @@ EPSILON = 1e-10
 class NMADPlugin:
     spec = StatisticSpec(
         name="nmad",
+        label="NMAD",
         units="%",
         render_field="value",
         colormap="diverging",
+        default=True
     )
 
     def init_accumulator(self, shape: tuple[int, int]) -> dict[str, np.ndarray]:

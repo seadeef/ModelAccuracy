@@ -18,17 +18,14 @@ python compute_stats.py
 python compute_tiles.py
 
 # 5. Start the API server
-export MAPTILER_API_KEY="your_key"   # optional, falls back to demo style
-uvicorn backend.api:app --reload --port 8001
+echo "your_key" > .maptiler_key       # optional, falls back to demo style
+uvicorn backend.api:app --reload --port 8000
 
-# 6. Serve the frontend (any static server works)
-python -m http.server 8000 --directory frontend
-
-# 7. Open the viewer
+# 6. Open the viewer
 open http://localhost:8000
 ```
 
-The frontend is served on port 8000 and talks to the API on port 8001. If `MAPTILER_API_KEY` is not set, the map falls back to a demo MapLibre style.
+The frontend is served on port 8000 and talks to the API on port 8001. If `.maptiler_key` is not present, the map falls back to a demo MapLibre style.
 
 ## Scripts
 
@@ -61,14 +58,15 @@ python compute_stats.py --no-preconvert    # skip GRIB2-to-npy conversion
 Statistics are stored as monthly accumulators (the primitive), with yearly and seasonal views derived by summing:
 
 ```
-stats_output/{model}/{stat}/
-  metadata.npz
-  lead_{N}.npz                    # yearly (sum of all months)
-  lead_{window}.npz               # yearly windows
-  monthly/01/ ... 12/
-    lead_{N}.npz                  # per-month
-  seasonal/djf/ mam/ jja/ son/
-    lead_{N}.npz                  # sum of 3 months
+stats_output/{model}/
+  metadata.npz                    # shared grid metadata for the model
+  {stat}/
+    lead_{N}.npz                  # yearly (sum of all months)
+    lead_{window}.npz             # yearly windows
+    monthly/01/ ... 12/
+      lead_{N}.npz                # per-month
+    seasonal/djf/ mam/ jja/ son/
+      lead_{N}.npz                # sum of 3 months
 ```
 
 ### `compute_tiles.py`
@@ -81,6 +79,8 @@ python compute_tiles.py --model gfs    # just GFS
 ```
 
 Generates tiles for yearly, current month, and current season. Forecast tiles are yearly only.
+
+PNG layout mirrors stats: `tiles_output/<model>/<statistic>/lead_*.png` (plus `monthly/` / `seasonal/`). Map overlay extent is fixed in `backend/tile_overlay_constants.py` and `frontend/src/lib/constants.js` (keep in sync).
 
 ## Statistics
 
@@ -100,19 +100,20 @@ Display statistics:
 The backend serves at `http://localhost:8001` by default.
 
 - `GET /api/config` — models, statistics, lead options, accumulation modes, current month/season
-- `GET /api/stats?model=gfs&lead=7&lat=40&lon=-100` — point statistics query
+- `GET /api/stats?model=gfs&lead=7&lat=40&lon=-100` — point statistics query (model keys: `gfs`, `nbm`)
+  - `model` may be omitted or empty; then `X-Model: nbm` (or another key) is used, else the server `DEFAULT_MODEL`
   - `&period=monthly&month=03` — monthly stats
   - `&period=seasonal&season=mam` — seasonal stats
 - `GET /api/zip?zip=80302` — ZIP code lookup for map centering
+- `GET /tiles/<model>/<statistic>/lead_<n>.png` — map overlay images (static files under `tiles_output/`)
 
 ## Models
 
-Models are registered in `model_registry.py`. Currently: **GFS** (0.25° global, 12z cycle, leads 1–14 days).
+Models are registered in `model_registry.py`. Currently: **GFS** (0.25° global, 12z cycle, leads 1–14 days) and **NBM** (assembled daily `.npy` on a 0.25° US grid, 12z cycle). `compute_stats` discovers leads from real `f*_*.grib2` files and/or `f*_*.npy` files in each init directory.
 
-## Environment variables
+## Production deployment
 
-| Variable | Description | Default |
-|---|---|---|
-| `MAPTILER_API_KEY` | MapTiler API key for basemap | demo style fallback |
-| `ZIP_LOOKUP_CSV` | Path to ZIP code lookup CSV | `backend/zip_lookup.csv` |
-| `TILES_OUTPUT` | Tiles output directory | `tiles_output` |
+Deploy the API with **Docker on AWS Fargate** (ECS + ALB). See **[DEPLOYMENT.md](DEPLOYMENT.md)** and **[docs/FARGATE.md](docs/FARGATE.md)**.
+
+Legacy AWS Lambda packaging scripts are **archived** under [`archive/lambda/`](archive/lambda/README.md).
+
