@@ -46,7 +46,7 @@
 
   let lastShownUrl = $state('');
 
-  /** URL or data URL of the raster currently on the map (for client-side PNG export). */
+  /** Tile URL, data URL, or blob URL of the raster on the map (for client-side PNG export). */
   export function getCurrentOverlayUrl() {
     return lastShownUrl;
   }
@@ -68,7 +68,7 @@
     lastShownUrl = '';
   }
 
-  export function loadTilesetInterp(statistic, frac) {
+  export async function loadTilesetInterp(statistic, frac) {
     if (!map) return;
     const { min: leadMin, max: leadMax } = getModelLeadBounds(appConfig.models, ui.model);
     let lo = Math.floor(frac);
@@ -84,22 +84,21 @@
     if (t === 0 || lo === hi) {
       if (imgLo) showOnMap(tileUrl(ui.model, statistic, lo, ui.period, ui.month, ui.season));
     } else if (imgLo && imgHi) {
-      showOnMap(
-        compositeToDataUrlCached(
-          {
-            model: ui.model,
-            statistic,
-            period: ui.period,
-            month: ui.month,
-            season: ui.season,
-            lo,
-            hi,
-          },
-          imgLo,
-          imgHi,
-          t,
-        ),
+      const url = await compositeToDataUrlCached(
+        {
+          model: ui.model,
+          statistic,
+          period: ui.period,
+          month: ui.month,
+          season: ui.season,
+          lo,
+          hi,
+        },
+        imgLo,
+        imgHi,
+        t,
       );
+      showOnMap(url);
     } else if (imgLo) {
       showOnMap(tileUrl(ui.model, statistic, lo, ui.period, ui.month, ui.season));
     } else if (imgHi) {

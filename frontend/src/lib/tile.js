@@ -7,7 +7,7 @@ const interpCtx = interpCanvas.getContext('2d');
 // Cache of loaded Image objects keyed by integer lead day
 const leadImages = {};
 
-/** LRU of composited lead-blend data URLs (see compositeToDataUrlCached). */
+/** LRU of composited lead-blend blob URLs (see compositeToDataUrlCached). */
 const compositeDataUrlCache = new Map();
 const MAX_COMPOSITE_CACHE = 128;
 /** Quantize blend factor so scrubbing reuses canvas work (invisible at ~64 steps). */
@@ -15,6 +15,9 @@ const COMPOSITE_T_STEPS = 64;
 
 export function clearLeadImages() {
   for (const key of Object.keys(leadImages)) delete leadImages[key];
+  for (const url of compositeDataUrlCache.values()) {
+    URL.revokeObjectURL(url);
+  }
   compositeDataUrlCache.clear();
 }
 
@@ -55,7 +58,8 @@ export function preloadLeads({ model, statistic, period, month, season, minLead,
 }
 
 /**
- * Per-pixel linear crossfade between two images.
+ * Linear crossfade between two images via canvas "lighter" (premultiplied add).
+ * Returns a blob: URL from async PNG encoding (no base64 data: URL).
  */
 export function compositeToDataUrl(imgA, imgB, t) {
   const w = imgA.naturalWidth;
@@ -68,57 +72,33 @@ export function compositeToDataUrl(imgA, imgB, t) {
       `${imgB.naturalWidth}x${imgB.naturalHeight}`,
     );
   }
+  if (!interpCtx) {
+    return Promise.reject(new Error('Canvas 2D context unavailable'));
+  }
   if (interpCanvas.width !== w || interpCanvas.height !== h) {
     interpCanvas.width = w;
     interpCanvas.height = h;
   }
   interpCtx.imageSmoothingEnabled = false;
-  interpCtx.globalAlpha = 1.0;
   interpCtx.clearRect(0, 0, w, h);
+  interpCtx.globalCompositeOperation = 'source-over';
+  interpCtx.globalAlpha = 1.0 - t;
   interpCtx.drawImage(imgA, 0, 0, w, h);
-  const dataA = interpCtx.getImageData(0, 0, w, h);
-  interpCtx.clearRect(0, 0, w, h);
+  interpCtx.globalCompositeOperation = 'lighter';
+  interpCtx.globalAlpha = t;
   interpCtx.drawImage(imgB, 0, 0, w, h);
-  const dataB = interpCtx.getImageData(0, 0, w, h);
-  const pA = dataA.data;
-  const pB = dataB.data;
-  const s = 1.0 - t;
-  // Where only one side has coverage, keep that pixel (avoids halos at land/ocean).
-  // Where both have alpha > 0, cross-fade in premultiplied space then unpremultiply —
-  // straight RGB * s + RGB * t is wrong when alpha varies (e.g. sequential tiles).
-  for (let i = 0, n = pA.length; i < n; i += 4) {
-    const aA = pA[i + 3];
-    const aB = pB[i + 3];
-    if (aA > 0 && aB > 0) {
-      const pmAr = (pA[i] * aA) / 255;
-      const pmAg = (pA[i + 1] * aA) / 255;
-      const pmAb = (pA[i + 2] * aA) / 255;
-      const pmBr = (pB[i] * aB) / 255;
-      const pmBg = (pB[i + 1] * aB) / 255;
-      const pmBb = (pB[i + 2] * aB) / 255;
-      const aOut = aA * s + aB * t;
-      if (aOut <= 0) {
-        pA[i] = pA[i + 1] = pA[i + 2] = pA[i + 3] = 0;
-        continue;
+  interpCtx.globalCompositeOperation = 'source-over';
+  interpCtx.globalAlpha = 1.0;
+
+  return new Promise((resolve, reject) => {
+    interpCanvas.toBlob((blob) => {
+      if (!blob) {
+        reject(new Error('compositeToDataUrl: toBlob failed'));
+        return;
       }
-      const pmOr = pmAr * s + pmBr * t;
-      const pmOg = pmAg * s + pmBg * t;
-      const pmOb = pmAb * s + pmBb * t;
-      const inv = 255 / aOut;
-      pA[i] = Math.min(255, (pmOr * inv + 0.5) | 0);
-      pA[i + 1] = Math.min(255, (pmOg * inv + 0.5) | 0);
-      pA[i + 2] = Math.min(255, (pmOb * inv + 0.5) | 0);
-      pA[i + 3] = Math.min(255, (aOut + 0.5) | 0);
-    } else if (aB > 0) {
-      pA[i] = pB[i];
-      pA[i + 1] = pB[i + 1];
-      pA[i + 2] = pB[i + 2];
-      pA[i + 3] = pB[i + 3];
-    }
-    // else: only A or neither — keep pA
-  }
-  interpCtx.putImageData(dataA, 0, 0);
-  return interpCanvas.toDataURL();
+      resolve(URL.createObjectURL(blob));
+    });
+  });
 }
 
 function quantizeBlendT(t) {
@@ -136,11 +116,10 @@ function compositeCacheKey(meta, tq) {
 
 /**
  * Same pixels as compositeToDataUrl, but memoized by (model context, leads, quantized t).
- * Interpolated frames are data: URLs — they are not HTTP-cached like /static/… PNGs, so
- * DevTools only shows “cached” for the underlying tile images; this avoids redoing the
- * expensive getImageData loop when the user revisits the same fractional lead.
+ * Interpolated frames are blob: URLs; this avoids redoing canvas encode when revisiting
+ * the same fractional lead.
  */
-export function compositeToDataUrlCached(meta, imgA, imgB, t) {
+export async function compositeToDataUrlCached(meta, imgA, imgB, t) {
   const tq = quantizeBlendT(t);
   const key = compositeCacheKey(meta, tq);
   const hit = compositeDataUrlCache.get(key);
@@ -149,13 +128,15 @@ export function compositeToDataUrlCached(meta, imgA, imgB, t) {
     compositeDataUrlCache.set(key, hit);
     return hit;
   }
-  const dataUrl = compositeToDataUrl(imgA, imgB, tq);
-  compositeDataUrlCache.set(key, dataUrl);
+  const blobUrl = await compositeToDataUrl(imgA, imgB, tq);
+  compositeDataUrlCache.set(key, blobUrl);
   while (compositeDataUrlCache.size > MAX_COMPOSITE_CACHE) {
-    const oldest = compositeDataUrlCache.keys().next().value;
-    compositeDataUrlCache.delete(oldest);
+    const oldestKey = compositeDataUrlCache.keys().next().value;
+    const evicted = compositeDataUrlCache.get(oldestKey);
+    compositeDataUrlCache.delete(oldestKey);
+    if (evicted) URL.revokeObjectURL(evicted);
   }
-  return dataUrl;
+  return blobUrl;
 }
 
 /**
