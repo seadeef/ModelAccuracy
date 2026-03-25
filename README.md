@@ -5,8 +5,8 @@ Precipitation forecast verification system. Downloads GFS model forecasts and PR
 ## Quick start
 
 ```bash
-# 1. Python deps (API + export pipeline)
-pip install -r requirements.api.txt
+# 1. Python deps (API + export pipeline — same pins as Dockerfile)
+pip install "fastapi>=0.115.0" "uvicorn[standard]>=0.32.0" "numpy>=2.0.0" "pydantic>=2.0.0" "boto3>=1.35.0"
 # Plus processing stack for download/stats/tiles, e.g.:
 pip install xarray cfgrib rasterio rioxarray matplotlib
 
@@ -129,8 +129,7 @@ The supported path is **AWS Fargate**: containerized FastAPI with `static_export
 | Artifact | Role |
 |----------|------|
 | [Dockerfile](Dockerfile) | Image build; verifies `static_export/data/<model>/grid.json` exists |
-| [requirements.api.txt](requirements.api.txt) | Python dependencies in the image |
-| [deploy_fargate.sh](deploy_fargate.sh) | Runs `export_static.py`, verifies data, `docker build`, ECR login + push (default **us-west-1**) |
+| [deploy_fargate.sh](deploy_fargate.sh) | Runs `export_static.py`, verifies data, `docker build`, ECR push (**us-west-1** default); API deps are in the Dockerfile |
 
 ### Build pipeline order
 
@@ -235,7 +234,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -r requirements.api.txt
+      - run: pip install "fastapi>=0.115.0" "uvicorn[standard]>=0.32.0" "numpy>=2.0.0" "pydantic>=2.0.0" "boto3>=1.35.0"
       - run: python export_static.py
       - uses: aws-actions/configure-aws-credentials@v4
         with:

@@ -6,8 +6,13 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-COPY requirements.api.txt .
-RUN pip install --no-cache-dir -r requirements.api.txt
+# API stack (keep in sync with README quick start and deploy_fargate.sh header comment)
+RUN pip install --no-cache-dir \
+  "fastapi>=0.115.0" \
+  "uvicorn[standard]>=0.32.0" \
+  "numpy>=2.0.0" \
+  "pydantic>=2.0.0" \
+  "boto3>=1.35.0"
 
 COPY model_registry.py stats_grid_metadata.py ./
 COPY backend ./backend

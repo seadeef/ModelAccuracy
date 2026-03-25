@@ -18,6 +18,8 @@
 #   IMAGE_TAG=v1.2.3 ./deploy_fargate.sh
 #   SKIP_EXPORT=1 SKIP_PUSH=1 ./deploy_fargate.sh
 #
+# API image pip deps live in Dockerfile RUN pip install (same pins as README local install).
+#
 # Container entrypoint (also set in Dockerfile ENTRYPOINT):
 #   exec uvicorn backend.api:app --host 0.0.0.0 --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips '*'
 #
@@ -34,7 +36,7 @@ LOCAL_IMAGE="${LOCAL_IMAGE:-modelaccuracy-api:build}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 
 usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'
   exit 0
 }
 
