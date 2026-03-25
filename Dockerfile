@@ -25,4 +25,9 @@ RUN python3 -c "import pathlib,sys; r=pathlib.Path('static_export/data'); (r.is_
 # Container command (documented in deploy_fargate.sh header)
 ENV PORT=8080
 EXPOSE 8080
+
+# No curl in slim image; urllib matches GET /health (backend.api).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD python -c "import os,urllib.request; p=os.environ.get('PORT','8080'); urllib.request.urlopen(f'http://127.0.0.1:{p}/health', timeout=4)"
+
 ENTRYPOINT ["/bin/sh", "-c", "exec uvicorn backend.api:app --host 0.0.0.0 --port ${PORT:-8080} --proxy-headers --forwarded-allow-ips '*'"]
