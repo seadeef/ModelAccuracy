@@ -74,7 +74,7 @@ export async function fetchZip(zip) {
 }
 
 /**
- * Fetch stats for every lead day from min to max.
+ * Fetch stats for every lead day from min to max (all verification statistics in one request).
  * Point regions use the nearest grid cell; rectangle/polygon use the spatial mean over masked cells.
  * Returns an array of { lead, stats } objects.
  */

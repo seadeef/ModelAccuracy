@@ -149,16 +149,6 @@
         if (v > max) max = v;
       }
     }
-    if (!isFinite(min)) {
-      for (const stat of chartStats) {
-        for (const v of seriesFor(stat)) {
-          if (v !== null) {
-            if (v < min) min = v;
-            if (v > max) max = v;
-          }
-        }
-      }
-    }
     if (!isFinite(min)) return { min: 0, max: 100 };
     let span = max - min;
     if (span < 1e-12) {
@@ -236,23 +226,20 @@
     ctx.rect(PAD.left, PLOT_TOP, w - PAD.left - PAD.right, plotBottom - PLOT_TOP);
     ctx.clip();
 
-    // Lines (may extend outside Y when inactive stats differ in scale from activeStat)
-    for (const stat of chartStats) {
-      const isActive = stat === activeStat;
-      const color = STAT_COLORS[stat] || '#888';
-      const data = seriesFor(stat);
-      const points = [];
-      for (let i = 0; i < data.length; i++) if (data[i] !== null) points.push({ x: xForLead(leadMin + i), y: yForValue(data[i]) });
-      if (points.length < 2) continue;
-
-      if (isActive) {
-        ctx.beginPath(); drawSmoothLine(ctx, points);
-        ctx.lineTo(points[points.length-1].x, yForValue(yMin)); ctx.lineTo(points[0].x, yForValue(yMin)); ctx.closePath();
-        ctx.fillStyle = color + '15'; ctx.fill();
-      }
+    const stat = activeStat;
+    const color = STAT_COLORS[stat] || '#888';
+    const data = seriesFor(stat);
+    const points = [];
+    for (let i = 0; i < data.length; i++) if (data[i] !== null) points.push({ x: xForLead(leadMin + i), y: yForValue(data[i]) });
+    if (points.length >= 2) {
       ctx.beginPath(); drawSmoothLine(ctx, points);
-      ctx.strokeStyle = color; ctx.globalAlpha = isActive ? 1 : 0.2; ctx.lineWidth = isActive ? 2.6 : 1.2; ctx.stroke(); ctx.globalAlpha = 1;
-      for (const p of points) { ctx.beginPath(); ctx.arc(p.x, p.y, isActive ? 2.5 : 1.5, 0, Math.PI*2); ctx.fillStyle = color; ctx.globalAlpha = isActive ? 1 : 0.2; ctx.fill(); ctx.globalAlpha = 1; }
+      ctx.lineTo(points[points.length - 1].x, yForValue(yMin)); ctx.lineTo(points[0].x, yForValue(yMin)); ctx.closePath();
+      ctx.fillStyle = color + '15'; ctx.fill();
+      ctx.beginPath(); drawSmoothLine(ctx, points);
+      ctx.strokeStyle = color; ctx.lineWidth = 2.6; ctx.stroke();
+      for (const p of points) {
+        ctx.beginPath(); ctx.arc(p.x, p.y, 2.5, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+      }
     }
 
     ctx.restore();
@@ -264,18 +251,15 @@
       ctx.setLineDash([3, 3]); ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(hx, PLOT_TOP); ctx.lineTo(hx, plotBottom); ctx.stroke(); ctx.setLineDash([]);
 
-      for (const stat of chartStats) {
-        const val = interpValue(seriesFor(stat), hl);
-        if (val === null) continue;
-        const color = STAT_COLORS[stat] || '#888';
-        const y = yForValue(val);
-        const isActive = stat === activeStat;
-        if (isActive) { ctx.beginPath(); ctx.arc(hx, y, 7, 0, Math.PI*2); ctx.fillStyle = color + '20'; ctx.fill(); }
-        ctx.beginPath(); ctx.arc(hx, y, isActive ? 4 : 3, 0, Math.PI*2);
-        ctx.fillStyle = isActive ? color : '#0e1117'; ctx.fill();
-        if (!isActive) { ctx.strokeStyle = color; ctx.lineWidth = 1.2; ctx.stroke(); }
-        if (isActive) {
-          const units = leadData[0]?.stats?.[stat]?.units || '';
+      {
+        const st = activeStat;
+        const val = interpValue(seriesFor(st), hl);
+        if (val !== null) {
+          const c = STAT_COLORS[st] || '#888';
+          const y = yForValue(val);
+          ctx.beginPath(); ctx.arc(hx, y, 7, 0, Math.PI * 2); ctx.fillStyle = c + '20'; ctx.fill();
+          ctx.beginPath(); ctx.arc(hx, y, 4, 0, Math.PI * 2); ctx.fillStyle = c; ctx.fill();
+          const units = leadData[0]?.stats?.[st]?.units || '';
           const label = `${val.toFixed(2)} ${units}`;
           ctx.save();
           ctx.font = '600 11px "DM Sans", system-ui';
@@ -295,7 +279,7 @@
           const bw = tw + padX * 2;
           const bh = padY * 2;
           ctx.fillStyle = 'rgba(12, 14, 20, 0.94)';
-          ctx.strokeStyle = color + '66';
+          ctx.strokeStyle = c + '66';
           ctx.lineWidth = 1;
           ctx.beginPath();
           if (typeof ctx.roundRect === 'function') {
@@ -305,7 +289,7 @@
           }
           ctx.fill();
           ctx.stroke();
-          ctx.fillStyle = color;
+          ctx.fillStyle = c;
           ctx.fillText(label, lx, HOVER_LABEL_Y);
           ctx.restore();
         }
@@ -638,7 +622,7 @@
         <div class="chart-section">
           <div
             class="section-label"
-            title="Each colored line is one verification metric vs forecast lead day. Click a legend item or stat card to highlight it and rescale the vertical axis to that metric."
+            title="All verification metrics load together for this region; the chart shows only the highlighted metric (legend or stat cards) so scales do not mix. Stat cards use the current lead (scrub the chart or the map slider)."
           >Accuracy vs. lead time</div>
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
@@ -662,7 +646,12 @@
                 class:dimmed={activeStat !== stat}
                 style="--stat-color: {STAT_COLORS[stat] || '#888'}"
                 title={statisticTooltip(stat)}
-                onclick={() => { activeStat = stat; }}
+                onclick={() => {
+                  activeStat = stat;
+                  ui.statistic = stat;
+                  ui.activeWindow = null;
+                  onstatchange?.({ target: { value: stat } });
+                }}
               >
                 <div class="legend-dot"></div>
                 {statLabel(stat)}
