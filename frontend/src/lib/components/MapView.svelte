@@ -7,7 +7,7 @@
   import { fetchConfig } from '../api.js';
   import {
     tileUrl, preloadLeads, clearLeadImages, getLeadImage,
-    compositeToDataUrl, getModelLeadBounds,
+    compositeToDataUrlCached, getModelLeadBounds,
   } from '../tile.js';
   import { drawToolGlyph } from '../appIcons.js';
 
@@ -84,7 +84,22 @@
     if (t === 0 || lo === hi) {
       if (imgLo) showOnMap(tileUrl(ui.model, statistic, lo, ui.period, ui.month, ui.season));
     } else if (imgLo && imgHi) {
-      showOnMap(compositeToDataUrl(imgLo, imgHi, t));
+      showOnMap(
+        compositeToDataUrlCached(
+          {
+            model: ui.model,
+            statistic,
+            period: ui.period,
+            month: ui.month,
+            season: ui.season,
+            lo,
+            hi,
+          },
+          imgLo,
+          imgHi,
+          t,
+        ),
+      );
     } else if (imgLo) {
       showOnMap(tileUrl(ui.model, statistic, lo, ui.period, ui.month, ui.season));
     } else if (imgHi) {

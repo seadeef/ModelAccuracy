@@ -4,12 +4,14 @@
 # Prerequisites: Docker, AWS CLI v2, Python 3 (for export_static.py), credentials with ECR push.
 #
 # Environment (optional):
-#   AWS_REGION      default us-west-1
-#   ECR_REPOSITORY  default modelaccuracy-api
-#   IMAGE_TAG       default latest (pushed tag)
-#   LOCAL_IMAGE     default modelaccuracy-api:build  (local name before tag to ECR)
-#   SKIP_EXPORT=1   skip python3 export_static.py (use existing static_export/)
-#   SKIP_PUSH=1     build only; do not login/push to ECR
+#   AWS_REGION       default us-west-1
+#   ECR_REPOSITORY   default modelaccuracy-api
+#   IMAGE_TAG        default latest (pushed tag)
+#   LOCAL_IMAGE      default modelaccuracy-api:build  (local name before tag to ECR)
+#   DOCKER_PLATFORM  default linux/amd64 (Fargate x86). Use linux/arm64 for Graviton Fargate
+#                    or faster local builds on Apple Silicon when SKIP_PUSH=1.
+#   SKIP_EXPORT=1    skip python3 export_static.py (use existing static_export/)
+#   SKIP_PUSH=1      build only; do not login/push to ECR
 #
 # Usage:
 #   ./deploy_fargate.sh
@@ -28,6 +30,8 @@ AWS_REGION="${AWS_REGION:-us-west-1}"
 ECR_REPOSITORY="${ECR_REPOSITORY:-modelaccuracy-api}"
 IMAGE_TAG="${IMAGE_TAG:-latest}"
 LOCAL_IMAGE="${LOCAL_IMAGE:-modelaccuracy-api:build}"
+# Fargate default CPU is x86_64; plain `docker build` on Apple Silicon is arm64 → ECS CannotPullContainerError.
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 
 usage() {
   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
@@ -70,8 +74,8 @@ fi
 echo "==> verify static_export/data"
 verify_static_export
 
-echo "==> docker build -t ${LOCAL_IMAGE}"
-docker build -t "$LOCAL_IMAGE" .
+echo "==> docker build --platform ${DOCKER_PLATFORM} -t ${LOCAL_IMAGE}"
+docker build --platform "$DOCKER_PLATFORM" -t "$LOCAL_IMAGE" .
 
 if [[ -n "${SKIP_PUSH:-}" ]]; then
   echo "==> SKIP_PUSH set — not pushing to ECR"

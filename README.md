@@ -5,10 +5,12 @@ Precipitation forecast verification system. Downloads GFS model forecasts and PR
 ## Quick start
 
 ```bash
-# 1. Install dependencies
-pip install fastapi uvicorn numpy xarray cfgrib rasterio rioxarray matplotlib
+# 1. Python deps (API + export pipeline)
+pip install -r requirements.api.txt
+# Plus processing stack for download/stats/tiles, e.g.:
+pip install xarray cfgrib rasterio rioxarray matplotlib
 
-# 2. Download data (all models + PRISM, defaults to today)
+# 2. Download data (all models + PRISM)
 python download.py --start-date 2024-01-01 --end-date 2024-12-31
 
 # 3. Compute statistics
@@ -17,15 +19,17 @@ python compute_stats.py
 # 4. Generate map tiles
 python compute_tiles.py
 
-# 5. Start the API server
-echo "your_key" > .maptiler_key       # optional, falls back to demo style
-uvicorn backend.api:app --reload --port 8000
+# 5. Build static_export/ (SPA, config, zip JSON, tiles, grid data for the API)
+python export_static.py
 
-# 6. Open the viewer
-open http://localhost:8000
+# 6. API server (repository root so imports and static_export/ resolve)
+uvicorn backend.api:app --reload --host 0.0.0.0 --port 8000
+
+# 7. Viewer (separate terminal) — Vite proxies /api, /static, /data to the API
+cd frontend && npm install && npm run dev
 ```
 
-The frontend is served on port 8000 and talks to the API on port 8001. If `.maptiler_key` is not present, the map falls back to a demo MapLibre style.
+Open the URL Vite prints (default **http://localhost:5173**). Optional: put your MapTiler key in `.maptiler_key` at the repo root for a custom basemap; otherwise the app uses a demo MapLibre style.
 
 ## Scripts
 
@@ -82,6 +86,10 @@ Generates tiles for yearly, current month, and current season. Forecast tiles ar
 
 PNG layout mirrors stats: `tiles_output/<model>/<statistic>/lead_*.png` (plus `monthly/` / `seasonal/`). Map overlay extent is fixed in `backend/tile_overlay_constants.py` and `frontend/src/lib/constants.js` (keep in sync).
 
+### `export_static.py`
+
+Builds `static_export/` for disk-backed serving: Vite SPA (`index.html`, `assets/`), `static_export/static/` (config, zip lookups, tiles, ranges), and `static_export/data/` (grid metadata and `.bin` arrays). Run this before `docker build` or local API use. See `python export_static.py --help` for flags (`--skip-frontend-build`, `--frontend-only`, etc.).
+
 ## Statistics
 
 Verification statistics (computed from GFS + PRISM pairs):
@@ -95,25 +103,165 @@ Display statistics:
 
 - **forecast** — latest model precipitation forecast (mm)
 
-## API
+## API and static URLs
 
-The backend serves at `http://localhost:8001` by default.
+The FastAPI app (`backend.api:app`) does **not** serve the SPA at `/`; use **Vite dev** (or CloudFront/S3 + ALB in production) for HTML. The API mounts:
 
-- `GET /api/config` — models, statistics, lead options, accumulation modes, current month/season
-- `GET /api/stats?model=gfs&lead=7&lat=40&lon=-100` — point statistics query (model keys: `gfs`, `nbm`)
-  - `model` may be omitted or empty; then `X-Model: nbm` (or another key) is used, else the server `DEFAULT_MODEL`
-  - `&period=monthly&month=03` — monthly stats
-  - `&period=seasonal&season=mam` — seasonal stats
-- `GET /api/zip?zip=80302` — ZIP code lookup for map centering
-- `GET /tiles/<model>/<statistic>/lead_<n>.png` — map overlay images (static files under `tiles_output/`)
+- `/static/…` — files under `static_export/static` (e.g. `config.json`, `zip/{code}.json`, tiles)
+- `/data/…` — files under `static_export/data` (per-model `grid.json`, statistic `.bin` files)
+
+Dynamic routes:
+
+- `GET /health` — load balancer / ECS health check (`{"status":"ok"}`)
+- `POST /api/stats/query` — stats across leads for a region (JSON body); optional `X-Model` header if `model` is omitted in the body
+- `POST /api/stats/lead-winners` — best verification statistic per lead for the current map region
+
+The frontend loads **`/static/config.json`** and **`/static/zip/{5-digit}.json`** (not REST `/api/config` or `/api/zip`).
 
 ## Models
 
 Models are registered in `model_registry.py`. Currently: **GFS** (0.25° global, 12z cycle, leads 1–14 days) and **NBM** (assembled daily `.npy` on a 0.25° US grid, 12z cycle). `compute_stats` discovers leads from real `f*_*.grib2` files and/or `f*_*.npy` files in each init directory.
 
-## Production deployment
+## Production deployment (AWS Fargate)
 
-Deploy the API with **Docker on AWS Fargate** (ECS + ALB). See **[DEPLOYMENT.md](DEPLOYMENT.md)** and **[docs/FARGATE.md](docs/FARGATE.md)**.
+The supported path is **AWS Fargate**: containerized FastAPI with `static_export/` on disk in the image (or on EFS). Stats are read from disk; the task role does **not** need S3 permissions for stats unless you add other features.
 
-Legacy AWS Lambda packaging scripts are **archived** under [`archive/lambda/`](archive/lambda/README.md).
+| Artifact | Role |
+|----------|------|
+| [Dockerfile](Dockerfile) | Image build; verifies `static_export/data/<model>/grid.json` exists |
+| [requirements.api.txt](requirements.api.txt) | Python dependencies in the image |
+| [deploy_fargate.sh](deploy_fargate.sh) | Runs `export_static.py`, verifies data, `docker build`, ECR login + push (default **us-west-1**) |
 
+### Build pipeline order
+
+The Docker image **fails to build** if `static_export/data/<model>/grid.json` is missing.
+
+1. **`python export_static.py`** (or your CI equivalent).
+2. **`docker build`**, or **`./deploy_fargate.sh`** for export + verify + build + push.
+
+```bash
+chmod +x deploy_fargate.sh
+./deploy_fargate.sh
+```
+
+Examples:
+
+- `IMAGE_TAG=v1.2.3 ./deploy_fargate.sh`
+- `SKIP_EXPORT=1 ./deploy_fargate.sh` — use existing `static_export/`
+- `SKIP_PUSH=1 ./deploy_fargate.sh` — build only, no ECR
+- `AWS_REGION=us-east-1 ECR_REPOSITORY=my-api ./deploy_fargate.sh`
+- `DOCKER_PLATFORM=linux/arm64 ./deploy_fargate.sh` — only if the ECS task is **ARM/Graviton**; default **`linux/amd64`** matches standard x86 Fargate (and avoids pull errors when building on Apple Silicon).
+
+See `./deploy_fargate.sh --help` for the full header comment.
+
+### ECS task environment variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `MODELACCURACY_WARM_CACHE` | Optional | `1` / `true` / `yes` — preload every model’s `grid.json` into the in-process stats cache at startup (slower start, faster first request). |
+| `PORT` | Optional | Listen port (default **8080**). Match the container port mapping and ALB target group. |
+
+The container runs **one uvicorn** process per task (`Dockerfile` `ENTRYPOINT`; same command in `deploy_fargate.sh`) with `--proxy-headers` and `--forwarded-allow-ips '*'` behind an ALB. Stats caching in `backend/stats_query.py` is **in-process**; scale with more tasks or CPU, not multiple workers in one container.
+
+### Same-origin (no CORS on the API)
+
+The FastAPI app does **not** send CORS headers. Browsers only allow `fetch` from the **same site** as the page unless you add CORS at **CloudFront** (response headers policy) or a reverse proxy.
+
+Recommended patterns:
+
+- **CloudFront** with one hostname: route `/`, `/assets/*` to S3 and `/api/*`, `/static/*`, `/data/*` to the ALB so the SPA calls `/api/...` same-origin.
+- **Local dev:** [frontend/vite.config.js](frontend/vite.config.js) proxies `/api`, `/static`, and `/data` to the backend.
+
+### Caching
+
+- **In-process:** `backend/stats_query.py` caches loaded data per process after first read.
+- **HTTP:** `GET` under `/static/` and `/data/` get `Cache-Control: public, max-age=31536000, immutable` for CDN/browser caching when those paths go through CloudFront.
+
+### Run the container locally
+
+```bash
+python export_static.py
+docker build -t modelaccuracy-api:latest .
+docker run --rm -p 8080:8080 modelaccuracy-api:latest
+# Optional: -e MODELACCURACY_WARM_CACHE=1
+curl -s http://127.0.0.1:8080/health
+```
+
+### Push to ECR (manual outline)
+
+If not using `deploy_fargate.sh`:
+
+```bash
+export AWS_REGION=us-west-1
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+aws ecr create-repository --repository-name modelaccuracy-api --region "$AWS_REGION" 2>/dev/null || true
+aws ecr get-login-password --region "$AWS_REGION" \
+  | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+export ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/modelaccuracy-api:latest"
+docker tag modelaccuracy-api:latest "$ECR_URI"
+docker push "$ECR_URI"
+```
+
+### ECS + ALB (console outline)
+
+1. **Cluster:** ECS → Fargate cluster (e.g. `modelaccuracy`).
+2. **Task definition:** Fargate, 1 vCPU / 2 GiB to start; container image = your ECR URI; container port **8080**; optional env vars above; **awslogs** driver.
+3. **Security groups:** ALB SG — inbound 443 (or 80 for tests); tasks SG — inbound **8080** from the ALB SG only.
+4. **ALB:** Internet-facing, HTTPS recommended; target group **IP**, protocol HTTP port **8080**, health check path **`/health`**.
+5. **Service:** Fargate, private subnets + NAT or public subnets + public IP as appropriate; attach to the target group; container port 8080.
+
+**Alternatives to ALB:** NLB (L4), API Gateway + VPC Link (more moving parts). CloudFront still needs an origin (ALB, NLB, etc.); it does not replace a load balancer for ECS tasks.
+
+### CloudFront (optional)
+
+Typical flow: `Browser → CloudFront → ALB → Fargate`. Use one distribution with two origins (S3 or similar for SPA; ALB for `/api/*` and optionally `/static/*`, `/data/*`, `/health`). **`POST /api/stats/*`** is not cached by default at the edge (appropriate). Align cache policies with long TTLs for versioned static assets if desired. For cross-origin setups only, add CORS via CloudFront response headers.
+
+### CI/CD example (GitHub Actions)
+
+```yaml
+name: Build and push API image
+on:
+  push:
+    branches: [main]
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.api.txt
+      - run: python export_static.py
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-west-1
+      - run: chmod +x deploy_fargate.sh && SKIP_EXPORT=1 IMAGE_TAG="${{ github.sha }}" ./deploy_fargate.sh
+      - run: aws ecs update-service --cluster modelaccuracy --service api --force-new-deployment
+```
+
+Adjust `pip install` / export steps if your export needs extra packages.
+
+### Data on EFS instead of the image
+
+If `static_export` is very large or changes often without rebuilding: create EFS, mount at e.g. `/app/static_export`, adjust the Dockerfile copy step (or use a placeholder), and populate EFS via a one-off task, DataSync, or CI. Ensure NFS (2049) security groups between tasks and EFS.
+
+### Troubleshooting
+
+| Symptom | Check |
+|--------|--------|
+| **`docker build` fails at verify** | Run `export_static.py`; ensure `static_export/data/<model>/grid.json` exists. |
+| Target **unhealthy** | SG: ALB → task on **8080**; health path **`/health`**. |
+| **403** from ALB | Listener rules / default action. |
+| Browser **CORS** | Use same-origin path routing or CloudFront CORS headers. |
+| **502** | CloudWatch Logs for the container. |
+| Stale code after deploy | New image pushed? `aws ecs update-service … --force-new-deployment`. |
+
+## Archived Lambda
+
+Previous Lambda zip/container scripts live under **[archive/lambda/](archive/lambda/README.md)** for reference. They are **not** part of the default workflow.
