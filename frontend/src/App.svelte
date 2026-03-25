@@ -121,6 +121,8 @@
       onperiodchange={handlePeriodChange}
       onmodelchange={handleModelChange}
     />
+
+    <footer class="app-credit">Kevin Toren 2026</footer>
   </div>
 </div>
 
@@ -158,6 +160,26 @@
     flex: 1;
     position: relative;
     min-height: 0;
+  }
+
+  .app-credit {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    z-index: 11;
+    margin: 0;
+    padding: 8px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--text-primary);
+    background: var(--panel-bg);
+    backdrop-filter: blur(16px) saturate(1.2);
+    -webkit-backdrop-filter: blur(16px) saturate(1.2);
+    border: 1px solid var(--panel-border);
+    border-radius: 12px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+    pointer-events: none;
   }
 
   .status-pill {
