@@ -7,8 +7,15 @@ const interpCtx = interpCanvas.getContext('2d');
 // Cache of loaded Image objects keyed by integer lead day
 const leadImages = {};
 
+/** LRU of composited lead-blend data URLs (see compositeToDataUrlCached). */
+const compositeDataUrlCache = new Map();
+const MAX_COMPOSITE_CACHE = 128;
+/** Quantize blend factor so scrubbing reuses canvas work (invisible at ~64 steps). */
+const COMPOSITE_T_STEPS = 64;
+
 export function clearLeadImages() {
   for (const key of Object.keys(leadImages)) delete leadImages[key];
+  compositeDataUrlCache.clear();
 }
 
 export function getLeadImage(lead) {
@@ -112,6 +119,43 @@ export function compositeToDataUrl(imgA, imgB, t) {
   }
   interpCtx.putImageData(dataA, 0, 0);
   return interpCanvas.toDataURL();
+}
+
+function quantizeBlendT(t) {
+  const n = COMPOSITE_T_STEPS;
+  const q = Math.round(Math.min(1, Math.max(0, t)) * n) / n;
+  return q;
+}
+
+function compositeCacheKey(meta, tq) {
+  const { model, statistic, period, month, season, lo, hi } = meta;
+  const pk =
+    period === 'monthly' ? `m:${month}` : period === 'seasonal' ? `s:${season}` : 'a';
+  return `${model}|${statistic}|${pk}|${lo}|${hi}|${tq}`;
+}
+
+/**
+ * Same pixels as compositeToDataUrl, but memoized by (model context, leads, quantized t).
+ * Interpolated frames are data: URLs — they are not HTTP-cached like /static/… PNGs, so
+ * DevTools only shows “cached” for the underlying tile images; this avoids redoing the
+ * expensive getImageData loop when the user revisits the same fractional lead.
+ */
+export function compositeToDataUrlCached(meta, imgA, imgB, t) {
+  const tq = quantizeBlendT(t);
+  const key = compositeCacheKey(meta, tq);
+  const hit = compositeDataUrlCache.get(key);
+  if (hit !== undefined) {
+    compositeDataUrlCache.delete(key);
+    compositeDataUrlCache.set(key, hit);
+    return hit;
+  }
+  const dataUrl = compositeToDataUrl(imgA, imgB, tq);
+  compositeDataUrlCache.set(key, dataUrl);
+  while (compositeDataUrlCache.size > MAX_COMPOSITE_CACHE) {
+    const oldest = compositeDataUrlCache.keys().next().value;
+    compositeDataUrlCache.delete(oldest);
+  }
+  return dataUrl;
 }
 
 /**
