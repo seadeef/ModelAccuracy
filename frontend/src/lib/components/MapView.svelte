@@ -17,6 +17,9 @@
   const sourceId = 'bias-source';
   const layerId = 'bias-layer';
 
+  /** Spacing between `updateImage` calls so rapid scrubbing does not abort every in-flight load (MapLibre AbortError). */
+  const OVERLAY_UPDATE_MIN_MS = 56;
+
   let mapContainer;
   let map = null;
   let initialLoad = true;
@@ -46,14 +49,28 @@
 
   let lastShownUrl = $state('');
 
+  /** Incremented on each overlay load; stale async composites skip `showOnMap`. */
+  let loadTilesetGen = 0;
+
+  let overlayApplyTimer = null;
+  let overlayPendingUrl = null;
+  let overlayLastApplyTime = 0;
+
   /** Tile URL, data URL, or blob URL of the raster on the map (for client-side PNG export). */
   export function getCurrentOverlayUrl() {
     return lastShownUrl;
   }
 
-  function showOnMap(url) {
+  function clearOverlayApplySchedule() {
+    if (overlayApplyTimer != null) {
+      clearTimeout(overlayApplyTimer);
+      overlayApplyTimer = null;
+    }
+    overlayPendingUrl = null;
+  }
+
+  function applyOverlayToMap(url) {
     if (!map) return;
-    if (url === lastShownUrl) return;
     lastShownUrl = url;
     const src = map.getSource(sourceId);
     if (src) {
@@ -64,12 +81,38 @@
     }
   }
 
+  function showOnMap(url) {
+    if (!map || url === lastShownUrl) return;
+    overlayPendingUrl = url;
+    const now = performance.now();
+    const since = now - overlayLastApplyTime;
+    if (since >= OVERLAY_UPDATE_MIN_MS && overlayApplyTimer == null) {
+      applyOverlayToMap(url);
+      overlayLastApplyTime = performance.now();
+      overlayPendingUrl = null;
+      return;
+    }
+    if (overlayApplyTimer != null) return;
+    const delay = Math.max(0, OVERLAY_UPDATE_MIN_MS - since);
+    overlayApplyTimer = window.setTimeout(() => {
+      overlayApplyTimer = null;
+      const u = overlayPendingUrl;
+      overlayPendingUrl = null;
+      if (u == null || !map || u === lastShownUrl) return;
+      applyOverlayToMap(u);
+      overlayLastApplyTime = performance.now();
+    }, delay);
+  }
+
   function resetOverlay() {
+    clearOverlayApplySchedule();
+    overlayLastApplyTime = 0;
     lastShownUrl = '';
   }
 
   export async function loadTilesetInterp(statistic, frac) {
     if (!map) return;
+    const gen = ++loadTilesetGen;
     const { min: leadMin, max: leadMax } = getModelLeadBounds(appConfig.models, ui.model);
     let lo = Math.floor(frac);
     let hi = Math.ceil(frac);
@@ -82,7 +125,9 @@
     const imgHi = getLeadImage(hi);
 
     if (t === 0 || lo === hi) {
-      if (imgLo) showOnMap(tileUrl(ui.model, statistic, lo, ui.period, ui.month, ui.season));
+      if (imgLo && gen === loadTilesetGen) {
+        showOnMap(tileUrl(ui.model, statistic, lo, ui.period, ui.month, ui.season));
+      }
     } else if (imgLo && imgHi) {
       const url = await compositeToDataUrlCached(
         {
@@ -98,13 +143,18 @@
         imgHi,
         t,
       );
+      if (gen !== loadTilesetGen) return;
       showOnMap(url);
     } else if (imgLo) {
-      showOnMap(tileUrl(ui.model, statistic, lo, ui.period, ui.month, ui.season));
+      if (gen === loadTilesetGen) {
+        showOnMap(tileUrl(ui.model, statistic, lo, ui.period, ui.month, ui.season));
+      }
     } else if (imgHi) {
-      showOnMap(tileUrl(ui.model, statistic, hi, ui.period, ui.month, ui.season));
+      if (gen === loadTilesetGen) {
+        showOnMap(tileUrl(ui.model, statistic, hi, ui.period, ui.month, ui.season));
+      }
     }
-    ui.statusMessage = 'Idle';
+    if (gen === loadTilesetGen) ui.statusMessage = 'Idle';
   }
 
   function applyLayerState() {
@@ -694,6 +744,13 @@
       center: [-98.5, 39.8],
       zoom: 3,
     });
+    map.on('error', (e) => {
+      const err = e.error;
+      if (!err) return;
+      if (err.name === 'AbortError') return;
+      const msg = String(err.message || '');
+      if (/abort/i.test(msg)) return;
+    });
     map.on('load', () => {
       if (!appConfig.maptilerApiKey) {
         ui.statusMessage = 'Using fallback basemap; set MAPTILER_API_KEY for MapTiler.';
@@ -730,6 +787,7 @@
   onDestroy(() => {
     document.removeEventListener('keydown', handleKeyDown);
     stopPulseAnimation();
+    clearOverlayApplySchedule();
     if (map) {
       map.remove();
       map = null;

@@ -31,6 +31,10 @@
   let winnersGen = 0;
   let leadFetchGen = 0;
 
+  /** Coalesce chart scrub → map updates to one per frame (reduces overlapping MapLibre `updateImage` / AbortError). */
+  let chartScrubRafId = 0;
+  let pendingScrubLead = null;
+
   /** Plot area insets; `PLOT_TOP` reserves space above the grid for the hover readout. */
   const PAD = { left: 48, right: 18, bottom: 26 };
   const PLOT_TOP = 34;
@@ -275,17 +279,33 @@
     return Math.round(lead * 10) / 10;
   }
 
+  function flushChartScrubLead() {
+    chartScrubRafId = 0;
+    const L = pendingScrubLead;
+    pendingScrubLead = null;
+    if (L == null || L === hoverLead) return;
+    hoverLead = L;
+    ui.leadFractional = L;
+    onleadchange?.(L);
+    drawChart();
+  }
+
   function handleChartMouseMove(e) {
     if (!canvasEl || leadData.length === 0 || leadScrubLocked) return;
     const lead = leadFromClientX(e.clientX);
     if (lead === hoverLead) return;
-    hoverLead = lead;
-    ui.leadFractional = lead;
-    onleadchange?.(lead);
-    drawChart();
+    pendingScrubLead = lead;
+    if (!chartScrubRafId) {
+      chartScrubRafId = requestAnimationFrame(flushChartScrubLead);
+    }
   }
 
   function handleChartMouseLeave() {
+    if (chartScrubRafId) {
+      cancelAnimationFrame(chartScrubRafId);
+      chartScrubRafId = 0;
+    }
+    pendingScrubLead = null;
     if (leadScrubLocked) return;
     hoverLead = null;
     drawChart();
