@@ -15,9 +15,9 @@
 </script>
 
 <div class="map-toolbar" role="toolbar" aria-label="Map tools">
-  <button type="button" class="btn-download" onclick={() => onExport?.()}>
+  <button type="button" class="btn-download" onclick={() => onExport?.()} aria-label="Download map image">
     <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">{@html glyphDownloadMap}</svg>
-    Download map
+    <span class="btn-download-label">Download map</span>
   </button>
 
   <div class="toolbar-sep" aria-hidden="true"></div>
@@ -62,7 +62,7 @@
   .map-toolbar {
     --toolbar-control-height: 32px;
     position: absolute;
-    top: 14px;
+    top: max(14px, env(safe-area-inset-top, 0px));
     left: 50%;
     transform: translateX(-50%);
     z-index: 11;
@@ -72,7 +72,7 @@
     justify-content: center;
     gap: 10px 12px;
     padding: 8px 14px 10px;
-    max-width: calc(100vw - 120px);
+    max-width: calc(100vw - 120px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
     background: var(--panel-bg);
     backdrop-filter: blur(20px) saturate(1.4);
     -webkit-backdrop-filter: blur(20px) saturate(1.4);
@@ -102,6 +102,39 @@
     background: linear-gradient(180deg, rgba(110, 181, 255, 0.32), rgba(110, 181, 255, 0.16));
     color: #e8f3ff;
     border-color: rgba(110, 181, 255, 0.5);
+  }
+  @media (max-width: 640px) {
+    .map-toolbar {
+      --toolbar-control-height: 40px;
+      left: max(56px, calc(env(safe-area-inset-left, 0px) + 48px));
+      right: max(8px, env(safe-area-inset-right, 0px));
+      transform: none;
+      max-width: none;
+      justify-content: flex-start;
+      row-gap: 8px;
+    }
+    .toolbar-sep {
+      display: none;
+    }
+    .opacity-row input[type='range'] {
+      width: min(120px, 28vw);
+    }
+    .btn-download-label {
+      display: none;
+    }
+    .btn-download {
+      min-width: 40px;
+      min-height: 40px;
+      padding: 10px;
+      justify-content: center;
+    }
+    .zip-field input[type='text'] {
+      font-size: 16px; /* reduces iOS zoom-on-focus */
+    }
+    .zip-go {
+      width: 40px;
+      height: 40px;
+    }
   }
   .toolbar-sep {
     width: 1px;

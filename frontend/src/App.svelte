@@ -144,16 +144,28 @@
     --fs-base: 15px;
   }
   :global(*) { box-sizing: border-box; }
+  :global(html) {
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
   :global(body) {
     margin: 0;
+    height: 100%;
+    min-height: 100dvh;
     font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
     font-size: var(--fs-base);
     background: #000;
     color: var(--text-primary);
     -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    overscroll-behavior: none;
+    padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0) env(safe-area-inset-bottom, 0)
+      env(safe-area-inset-left, 0);
   }
   .app {
-    height: 100vh;
+    height: 100%;
+    min-height: 100dvh;
     display: flex;
   }
   .map-fill {
@@ -164,8 +176,8 @@
 
   .app-credit {
     position: absolute;
-    top: 14px;
-    right: 14px;
+    top: max(14px, env(safe-area-inset-top, 0px));
+    right: max(14px, env(safe-area-inset-right, 0px));
     z-index: 11;
     margin: 0;
     padding: 8px 14px;
@@ -184,7 +196,7 @@
 
   .status-pill {
     position: absolute;
-    bottom: 20px;
+    bottom: max(20px, env(safe-area-inset-bottom, 0px));
     left: 50%;
     transform: translateX(-50%);
     z-index: 8;
@@ -261,5 +273,34 @@
     font-weight: 400;
     line-height: 1.35;
     color: var(--text-secondary);
+  }
+
+  @media (max-width: 640px) {
+    :global(body) {
+      font-size: 14px;
+    }
+    .app-credit {
+      top: auto;
+      bottom: max(10px, env(safe-area-inset-bottom, 0px));
+      right: max(10px, env(safe-area-inset-right, 0px));
+      font-size: 11px;
+      padding: 6px 10px;
+    }
+    .status-pill {
+      bottom: max(88px, calc(env(safe-area-inset-bottom, 0px) + 72px));
+      max-width: calc(100vw - 24px);
+      white-space: normal;
+      text-align: center;
+    }
+    .draw-guide {
+      max-width: calc(100vw - 20px);
+      padding: 18px 20px;
+    }
+    .draw-guide--with-panel {
+      top: min(28vh, calc(100dvh - 58vh - 48px));
+    }
+    .guide-text {
+      font-size: 15px;
+    }
   }
 </style>

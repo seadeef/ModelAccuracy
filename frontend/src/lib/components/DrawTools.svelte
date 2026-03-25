@@ -45,8 +45,8 @@
 <style>
   .toolbar {
     position: absolute;
-    top: 14px;
-    left: 14px;
+    top: max(14px, env(safe-area-inset-top, 0px));
+    left: max(14px, env(safe-area-inset-left, 0px));
     z-index: 10;
     display: flex;
     flex-direction: column;
@@ -79,5 +79,22 @@
   .tool-btn:hover:not(.active) {
     background: var(--hover-bg);
     color: var(--text-primary);
+  }
+  @media (max-width: 640px) {
+    .toolbar {
+      top: max(12px, env(safe-area-inset-top, 0px));
+      left: max(8px, env(safe-area-inset-left, 0px));
+      padding: 6px;
+      gap: 4px;
+    }
+    .tool-btn {
+      width: 44px;
+      height: 44px;
+      border-radius: 10px;
+    }
+    .tool-btn svg {
+      width: 18px;
+      height: 18px;
+    }
   }
 </style>

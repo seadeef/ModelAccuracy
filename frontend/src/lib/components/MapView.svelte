@@ -248,7 +248,18 @@
   let hasDrawnRectangle = $state(false);
   let hasDrawnPolygon = $state(false);
 
+  /** Primary input is touch / coarse pointer — show polygon “Done” (no physical Enter key). */
+  let coarsePointer = $state(
+    typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches,
+  );
+
   let pulseFrameId = 0;
+
+  /** Ignore synthetic mouse events shortly after touch (rectangle draw). */
+  let suppressMouseDrawUntil = 0;
+
+  let coarseMql = null;
+  let coarseMqlHandler = null;
 
   function emptyFeatureCollection() {
     return { type: 'FeatureCollection', features: [] };
@@ -609,6 +620,7 @@
   }
 
   function handleDrawMouseDown(e) {
+    if (performance.now() < suppressMouseDrawUntil) return;
     if (ui.activeTool !== 'rectangle') return;
     rectStart = { lng: e.lngLat.lng, lat: e.lngLat.lat };
     isDrawing = true;
@@ -637,11 +649,58 @@
   }
 
   function handleDrawMouseUp(e) {
+    if (performance.now() < suppressMouseDrawUntil) return;
     if (ui.activeTool === 'rectangle' && rectStart && isDrawing) {
       map.dragPan.enable();
       isDrawing = false;
       finishRectangle(rectStart, e.lngLat);
       rectStart = null;
+    }
+  }
+
+  function touchFingerCount(e) {
+    return e.originalEvent?.touches?.length ?? 0;
+  }
+
+  function lngLatFromTouchLike(e) {
+    if (e.lngLat) return e.lngLat;
+    const t = e.originalEvent?.changedTouches?.[0] ?? e.originalEvent?.touches?.[0];
+    if (!t || !map) return null;
+    const rect = map.getContainer().getBoundingClientRect();
+    return map.unproject([t.clientX - rect.left, t.clientY - rect.top]);
+  }
+
+  function handleDrawTouchStart(e) {
+    if (ui.activeTool !== 'rectangle') return;
+    if (touchFingerCount(e) !== 1) return;
+    handleDrawMouseDown(e);
+    suppressMouseDrawUntil = performance.now() + 700;
+  }
+
+  function handleDrawTouchMove(e) {
+    if (ui.activeTool !== 'rectangle' || !isDrawing) return;
+    if (touchFingerCount(e) !== 1) return;
+    handleDrawMouseMove(e);
+  }
+
+  function handleDrawTouchEnd(e) {
+    if (ui.activeTool !== 'rectangle' || !rectStart || !isDrawing) return;
+    const ll = lngLatFromTouchLike(e);
+    if (!ll) {
+      map?.dragPan.enable();
+      cancelInProgressDraw();
+      return;
+    }
+    map.dragPan.enable();
+    isDrawing = false;
+    finishRectangle(rectStart, ll);
+    rectStart = null;
+  }
+
+  function handleDrawTouchCancel() {
+    if (ui.activeTool === 'rectangle' && (isDrawing || rectStart)) {
+      map?.dragPan.enable();
+      cancelInProgressDraw();
     }
   }
 
@@ -766,8 +825,19 @@
     map.on('mousedown', handleDrawMouseDown);
     map.on('mousemove', handleDrawMouseMove);
     map.on('mouseup', handleDrawMouseUp);
+    map.on('touchstart', handleDrawTouchStart);
+    map.on('touchmove', handleDrawTouchMove);
+    map.on('touchend', handleDrawTouchEnd);
+    map.on('touchcancel', handleDrawTouchCancel);
     map.on('dblclick', handleDrawDblClick);
     document.addEventListener('keydown', handleKeyDown);
+
+    coarseMql = window.matchMedia('(pointer: coarse)');
+    coarseMqlHandler = () => {
+      coarsePointer = coarseMql.matches;
+    };
+    coarseMqlHandler();
+    coarseMql.addEventListener('change', coarseMqlHandler);
 
     map.on('click', (event) => {
       if (ui.activeTool) handleDrawClick(event);
@@ -785,6 +855,9 @@
   });
 
   onDestroy(() => {
+    if (coarseMql && coarseMqlHandler) {
+      coarseMql.removeEventListener('change', coarseMqlHandler);
+    }
     document.removeEventListener('keydown', handleKeyDown);
     stopPulseAnimation();
     clearOverlayApplySchedule();
@@ -797,6 +870,11 @@
 
 <div class="map-wrap">
   <div class="map" bind:this={mapContainer}></div>
+  {#if ui.activeTool === 'polygon' && !hasDrawnPolygon && polyPoints.length >= 3 && coarsePointer}
+    <div class="poly-done-wrap">
+      <button type="button" class="poly-done-btn" onclick={() => finishPolygon()}>Done — close polygon</button>
+    </div>
+  {/if}
   {#if ui.activeTool === 'polygon' && !hasDrawnPolygon}
     <div
       class="draw-hint"
@@ -813,9 +891,13 @@
       {/if}
       <div class="draw-hint-text">
         {#if polyPoints.length === 0}
-          Click to add polygon corners
+          Tap the map to add polygon corners
         {:else}
-          Press <kbd>Enter</kbd> to finish
+          {#if coarsePointer}
+            Tap <strong>Done</strong> below when you have at least 3 points
+          {:else}
+            Press <kbd>Enter</kbd> to finish
+          {/if}
           <span class="hint-detail">
             {#if polyPoints.length < 3}
               ({3 - polyPoints.length} more point{3 - polyPoints.length === 1 ? '' : 's'} needed)
@@ -843,9 +925,9 @@
       {/if}
       <div class="draw-hint-text">
         {#if !isDrawing}
-          Click & drag to draw a rectangle
+          {coarsePointer ? 'Touch and drag to draw a rectangle' : 'Click & drag to draw a rectangle'}
         {:else}
-          Release to finish
+          {coarsePointer ? 'Lift finger to finish' : 'Release to finish'}
           <span class="hint-detail">Press <kbd>Esc</kbd> to stop drawing</span>
         {/if}
       </div>
@@ -885,9 +967,46 @@
     max-width: min(340px, calc(100vw - 40px));
     animation: draw-tooltip-pulse 4s ease-in-out infinite;
   }
+  @media (max-width: 640px) {
+    .draw-hint {
+      max-width: calc(100vw - 20px);
+      padding: 18px 20px;
+    }
+    .draw-hint--with-panel {
+      top: min(32vh, calc(100dvh - 58vh - 40px));
+    }
+    .poly-done-wrap {
+      bottom: max(100px, calc(env(safe-area-inset-bottom, 0px) + 88px));
+    }
+  }
   .draw-hint--with-panel {
-    top: min(40vh, calc(100vh - 52vh - 56px));
+    top: min(40vh, calc(100dvh - 52vh - 56px));
     gap: 0;
+  }
+  .poly-done-wrap {
+    position: fixed;
+    left: 50%;
+    bottom: max(24px, env(safe-area-inset-bottom, 0px));
+    transform: translateX(-50%);
+    z-index: 12;
+    pointer-events: auto;
+  }
+  .poly-done-btn {
+    appearance: none;
+    border: 1px solid rgba(110, 181, 255, 0.45);
+    background: linear-gradient(180deg, rgba(110, 181, 255, 0.28), rgba(110, 181, 255, 0.12));
+    color: #e8f3ff;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    padding: 12px 20px;
+    border-radius: 12px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+    cursor: pointer;
+    min-height: 44px;
+  }
+  .poly-done-btn:active {
+    transform: scale(0.98);
   }
   .draw-hint-icon {
     width: 56px;
