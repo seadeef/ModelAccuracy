@@ -1,6 +1,12 @@
 <script>
   import { ui } from '../state.svelte.js';
   import { MONTH_NAMES, SEASON_NAMES } from '../constants.js';
+  import {
+    PERIOD_HELP,
+    SEASON_PERIOD_HELP,
+    currentPeriodTooltip,
+    monthlyPeriodTooltip,
+  } from '../helpText.js';
 
   let { onchange } = $props();
 
@@ -31,7 +37,11 @@
 <!-- svelte-ignore a11y_click_events_have_key_events -->
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="period-menu" onclick={(e) => { e.stopPropagation(); open = !open; }}>
-  <button class="period-trigger">
+  <button
+    type="button"
+    class="period-trigger"
+    title={currentPeriodTooltip(ui.period, ui.month, ui.season)}
+  >
     {periodLabel()}
     <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6l4 4 4-4"/></svg>
   </button>
@@ -39,27 +49,48 @@
     <div class="period-dropdown">
       <!-- svelte-ignore a11y_click_events_have_key_events -->
       <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div class="period-item" class:active={ui.period === 'yearly'} onclick={() => selectPeriod('yearly')}>Yearly</div>
-      <div class="period-item has-sub" class:active={ui.period === 'monthly'}>
+      <div
+        class="period-item"
+        class:active={ui.period === 'yearly'}
+        title={PERIOD_HELP.yearly}
+        onclick={() => selectPeriod('yearly')}
+      >Yearly</div>
+      <div
+        class="period-item has-sub"
+        class:active={ui.period === 'monthly'}
+        title={PERIOD_HELP.monthlyIntro}
+      >
         Monthly
         <div class="period-sub">
           {#each Array.from({length: 12}, (_, i) => i + 1) as m}
             {@const mm = String(m).padStart(2, '0')}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div class="period-sub-item" class:active={ui.period === 'monthly' && ui.month === mm}
-                 onclick={(e) => { e.stopPropagation(); selectPeriod('monthly', mm, null); }}>{MONTH_NAMES[m]}</div>
+            <div
+              class="period-sub-item"
+              class:active={ui.period === 'monthly' && ui.month === mm}
+              title={monthlyPeriodTooltip(mm)}
+              onclick={(e) => { e.stopPropagation(); selectPeriod('monthly', mm, null); }}
+            >{MONTH_NAMES[m]}</div>
           {/each}
         </div>
       </div>
-      <div class="period-item has-sub" class:active={ui.period === 'seasonal'}>
+      <div
+        class="period-item has-sub"
+        class:active={ui.period === 'seasonal'}
+        title={PERIOD_HELP.seasonalIntro}
+      >
         Seasonal
         <div class="period-sub">
           {#each Object.entries(SEASON_NAMES) as [key, name]}
             <!-- svelte-ignore a11y_click_events_have_key_events -->
             <!-- svelte-ignore a11y_no_static_element_interactions -->
-            <div class="period-sub-item" class:active={ui.period === 'seasonal' && ui.season === key}
-                 onclick={(e) => { e.stopPropagation(); selectPeriod('seasonal', null, key); }}>{name}</div>
+            <div
+              class="period-sub-item"
+              class:active={ui.period === 'seasonal' && ui.season === key}
+              title={SEASON_PERIOD_HELP[key] ?? PERIOD_HELP.seasonalIntro}
+              onclick={(e) => { e.stopPropagation(); selectPeriod('seasonal', null, key); }}
+            >{name}</div>
           {/each}
         </div>
       </div>

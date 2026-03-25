@@ -1,5 +1,10 @@
 <script>
   import { appConfig, ui, statLabel, accuracyStatKeys } from '../state.svelte.js';
+  import {
+    statisticTooltip,
+    PERIOD_HELP,
+    SEASON_PERIOD_HELP,
+  } from '../helpText.js';
   import { fetchStatsAllLeads, fetchLeadWinnersForRegion } from '../api.js';
   import { getModelLeadBounds } from '../tile.js';
   import { modelPalette } from '../modelPalette.js';
@@ -130,15 +135,40 @@
     return data[lo] + (data[hi] - data[lo]) * (i - lo);
   }
 
+  /**
+   * Y-axis uses the highlighted metric only so its variation fills the plot.
+   * Using min/max across all stats on one axis often makes every line look flat
+   * when magnitudes differ (e.g. bias vs NRMSE).
+   */
   function getYRange() {
-    let min = Infinity, max = -Infinity;
-    for (const stat of chartStats) {
-      for (const v of seriesFor(stat)) {
-        if (v !== null) { if (v < min) min = v; if (v > max) max = v; }
+    let min = Infinity;
+    let max = -Infinity;
+    for (const v of seriesFor(activeStat)) {
+      if (v !== null) {
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+    }
+    if (!isFinite(min)) {
+      for (const stat of chartStats) {
+        for (const v of seriesFor(stat)) {
+          if (v !== null) {
+            if (v < min) min = v;
+            if (v > max) max = v;
+          }
+        }
       }
     }
     if (!isFinite(min)) return { min: 0, max: 100 };
-    const pad = (max - min) * 0.1 || 1;
+    let span = max - min;
+    if (span < 1e-12) {
+      const c = min;
+      const inflate = Math.max(Math.abs(c) * 0.04, 0.01);
+      min = c - inflate;
+      max = c + inflate;
+      span = max - min;
+    }
+    const pad = Math.max(span * 0.05, 1e-9);
     return { min: min - pad, max: max + pad };
   }
 
@@ -171,6 +201,12 @@
     const w = rect.width, h = rect.height;
     const { min: yMin, max: yMax } = getYRange();
     const plotBottom = h - PAD.bottom;
+    const ySpan = yMax - yMin;
+    const yTickFmt =
+      ySpan < 0.01 ? (v) => v.toFixed(4)
+      : ySpan < 0.1 ? (v) => v.toFixed(3)
+      : ySpan < 2 ? (v) => v.toFixed(2)
+      : (v) => v.toFixed(1);
 
     const xForLead = lead => PAD.left + ((lead - leadMin) / (leadMax - leadMin)) * (w - PAD.left - PAD.right);
     const yForValue = val => PLOT_TOP + (1 - (val - yMin) / (yMax - yMin)) * (plotBottom - PLOT_TOP);
@@ -189,13 +225,18 @@
     ctx.textAlign = 'right';
     for (let i = 0; i <= 4; i++) {
       const v = yMin + (yMax - yMin) * i / 4;
-      ctx.fillText(v.toFixed(1), PAD.left - 6, yForValue(v) + 3);
+      ctx.fillText(yTickFmt(v), PAD.left - 6, yForValue(v) + 3);
     }
     ctx.textAlign = 'center';
     ctx.font = '10px "DM Sans", system-ui';
     for (let d = leadMin; d <= leadMax; d++) ctx.fillText(d, xForLead(d), h - 6);
 
-    // Lines
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(PAD.left, PLOT_TOP, w - PAD.left - PAD.right, plotBottom - PLOT_TOP);
+    ctx.clip();
+
+    // Lines (may extend outside Y when inactive stats differ in scale from activeStat)
     for (const stat of chartStats) {
       const isActive = stat === activeStat;
       const color = STAT_COLORS[stat] || '#888';
@@ -210,9 +251,11 @@
         ctx.fillStyle = color + '15'; ctx.fill();
       }
       ctx.beginPath(); drawSmoothLine(ctx, points);
-      ctx.strokeStyle = color; ctx.globalAlpha = isActive ? 1 : 0.2; ctx.lineWidth = isActive ? 2 : 1.2; ctx.stroke(); ctx.globalAlpha = 1;
+      ctx.strokeStyle = color; ctx.globalAlpha = isActive ? 1 : 0.2; ctx.lineWidth = isActive ? 2.6 : 1.2; ctx.stroke(); ctx.globalAlpha = 1;
       for (const p of points) { ctx.beginPath(); ctx.arc(p.x, p.y, isActive ? 2.5 : 1.5, 0, Math.PI*2); ctx.fillStyle = color; ctx.globalAlpha = isActive ? 1 : 0.2; ctx.fill(); ctx.globalAlpha = 1; }
     }
+
+    ctx.restore();
 
     // Lead cursor (scrub or locked position)
     const hl = chartLead;
@@ -424,11 +467,11 @@
   }
 
   const periodOptions = [
-    { key: 'yearly', label: 'Yearly' },
-    { key: 'djf', label: 'DJF', period: 'seasonal', season: 'djf' },
-    { key: 'mam', label: 'MAM', period: 'seasonal', season: 'mam' },
-    { key: 'jja', label: 'JJA', period: 'seasonal', season: 'jja' },
-    { key: 'son', label: 'SON', period: 'seasonal', season: 'son' },
+    { key: 'yearly', label: 'Yearly', title: PERIOD_HELP.yearly },
+    { key: 'djf', label: 'DJF', period: 'seasonal', season: 'djf', title: SEASON_PERIOD_HELP.djf },
+    { key: 'mam', label: 'MAM', period: 'seasonal', season: 'mam', title: SEASON_PERIOD_HELP.mam },
+    { key: 'jja', label: 'JJA', period: 'seasonal', season: 'jja', title: SEASON_PERIOD_HELP.jja },
+    { key: 'son', label: 'SON', period: 'seasonal', season: 'son', title: SEASON_PERIOD_HELP.son },
   ];
 
   function currentPeriodKey() {
@@ -570,8 +613,10 @@
         <div class="period-pills">
           {#each periodOptions as opt}
             <button
+              type="button"
               class="period-pill"
               class:active={currentPeriodKey() === opt.key}
+              title={opt.title}
               onclick={() => selectPeriod(opt.period || 'yearly', null, opt.season || null)}
             >{opt.label}</button>
           {/each}
@@ -591,7 +636,10 @@
       <div class="panel-body">
         <!-- Chart -->
         <div class="chart-section">
-          <div class="section-label">Accuracy vs. lead time</div>
+          <div
+            class="section-label"
+            title="Each colored line is one verification metric vs forecast lead day. Click a legend item or stat card to highlight it and rescale the vertical axis to that metric."
+          >Accuracy vs. lead time</div>
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="lead-chart"
@@ -613,6 +661,7 @@
                 class:active={activeStat === stat}
                 class:dimmed={activeStat !== stat}
                 style="--stat-color: {STAT_COLORS[stat] || '#888'}"
+                title={statisticTooltip(stat)}
                 onclick={() => { activeStat = stat; }}
               >
                 <div class="legend-dot"></div>
@@ -629,7 +678,12 @@
               {@const s = statAtHoverLead(stat)}
               <!-- svelte-ignore a11y_click_events_have_key_events -->
               <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <div class="stat-card" class:highlighted={activeStat === stat} onclick={() => { activeStat = stat; ui.statistic = stat; ui.activeWindow = null; onstatchange?.({ target: { value: stat } }); }}>
+              <div
+                class="stat-card"
+                class:highlighted={activeStat === stat}
+                title={statisticTooltip(stat)}
+                onclick={() => { activeStat = stat; ui.statistic = stat; ui.activeWindow = null; onstatchange?.({ target: { value: stat } }); }}
+              >
                 <div class="stat-label">{statLabel(stat)}</div>
                 <div class="stat-val {s ? colorClass(stat, s.value) : ''}">{s ? s.value.toFixed(2) : '\u2014'}</div>
                 <div class="stat-unit">{s?.units || ''}</div>
@@ -640,7 +694,10 @@
 
         <!-- Region-scoped best model per lead (API); each lead day is a column -->
         <div class="compare-section">
-          <div class="section-label compare-section-label">
+          <div
+            class="section-label compare-section-label"
+            title={`For each lead day, which model wins on ${statLabel(ui.statistic)} for this drawn region and accumulation window (use the period pills above). The map and this table both use the statistic you pick in the stat cards.`}
+          >
             <span>Best model by day — {statLabel(ui.statistic)}</span>
           </div>
           {#if !isAccuracyStatistic}
