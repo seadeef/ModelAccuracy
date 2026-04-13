@@ -622,75 +622,29 @@
             <span class="toolbar-heading" title="The chart shows only the highlighted metric. Click a stat card to switch.">Accuracy vs. lead time</span>
             <span class="toolbar-location">{regionLabel()}</span>
           </div>
-          <div class="toolbar-controls">
-            <label class="model-field">
-              <span class="model-field-label">Model</span>
-              <select class="panel-model-select" value={ui.model} onchange={onmodelchange}>
-                {#each appConfig.models as m}
-                  <option value={m.key}>{m.label}</option>
-                {/each}
-              </select>
-            </label>
-            <div class="period-seg">
-              {#each periodOptions as opt}
-                <button
-                  type="button"
-                  class="period-btn"
-                  class:active={currentPeriodKey() === opt.key}
-                  title={opt.title}
-                  onclick={() => selectPeriod(opt.period || 'yearly', null, opt.season || null)}
-                >{opt.label}</button>
-              {/each}
-            </div>
-            <button type="button" class="export-btn" title="Download statistics as CSV" onclick={handleExportStatsCsv}>
-              <svg class="export-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v2h8v-2"/><path d="M8 2v9"/><path d="M5 8l3 3 3-3"/></svg>
-              CSV
-            </button>
-            <button class="close-btn" type="button" title="Close panel" aria-label="Close panel" onclick={closePanel}>
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphPanelClose}</svg>
-            </button>
-          </div>
+          <button class="close-btn" type="button" title="Close panel" aria-label="Close panel" onclick={closePanel}>
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphPanelClose}</svg>
+          </button>
         </div>
 
         <div class="panel-content">
-        <div class="chart-section">
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div
-            class="lead-chart"
-            class:lead-locked={leadScrubLocked}
-            onmousemove={handleChartMouseMove}
-            onmouseleave={handleChartMouseLeave}
-            onpointerdown={handleLeadChartPointerDown}
-            onpointerup={handleLeadChartPointerUp}
-            onpointercancel={handleLeadChartPointerCancel}
-          >
-            <canvas bind:this={canvasEl}></canvas>
-          </div>
-        </div>
-
-        <div class="stats-section">
-          <div class="stat-grid">
-            {#each chartStats as stat}
-              {@const s = statAtHoverLead(stat)}
-              <!-- svelte-ignore a11y_click_events_have_key_events -->
+          <div class="chart-col">
+            <div class="chart-section">
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div
-                class="stat-card"
-                class:highlighted={activeStat === stat}
-                style="--stat-color: {STAT_COLORS[stat] || '#888'}"
-                title={statisticTooltip(stat)}
-                onclick={() => { activeStat = stat; ui.statistic = stat; ui.activeWindow = null; onstatchange?.({ target: { value: stat } }); }}
+                class="lead-chart"
+                class:lead-locked={leadScrubLocked}
+                onmousemove={handleChartMouseMove}
+                onmouseleave={handleChartMouseLeave}
+                onpointerdown={handleLeadChartPointerDown}
+                onpointerup={handleLeadChartPointerUp}
+                onpointercancel={handleLeadChartPointerCancel}
               >
-                <div class="stat-label">{statLabel(stat)}</div>
-                <div class="stat-val {s ? colorClass(stat, s.value) : ''}">{s ? s.value.toFixed(2) : '\u2014'}</div>
-                <div class="stat-unit">{s?.units || ''}</div>
+                <canvas bind:this={canvasEl}></canvas>
               </div>
-            {/each}
-          </div>
-        </div>
-        </div>
+            </div>
 
-        <div class="compare-section">
+            <div class="compare-section">
           <div
             class="section-label compare-section-label"
             title={`For each lead day, which model wins on ${statLabel(ui.statistic)} for this drawn region and accumulation window (use the period selector next to the chart). The map and this table both use the statistic you pick in the stat cards.`}
@@ -742,6 +696,51 @@
               </table>
             </div>
           {/if}
+            </div>
+          </div>
+
+          <div class="side-strip">
+            <div class="stat-grid">
+              {#each chartStats as stat}
+                {@const s = statAtHoverLead(stat)}
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <div
+                  class="stat-card"
+                  class:highlighted={activeStat === stat}
+                  style="--stat-color: {STAT_COLORS[stat] || '#888'}"
+                  title={statisticTooltip(stat)}
+                  onclick={() => { activeStat = stat; ui.statistic = stat; ui.activeWindow = null; onstatchange?.({ target: { value: stat } }); }}
+                >
+                  <div class="stat-label">{statLabel(stat)}</div>
+                  <div class="stat-val {s ? colorClass(stat, s.value) : ''}">{s ? s.value.toFixed(2) : '\u2014'}</div>
+                  <div class="stat-unit">{s?.units || ''}</div>
+                </div>
+              {/each}
+            </div>
+            <div class="strip-controls">
+              <select class="panel-model-select" value={ui.model} onchange={onmodelchange} aria-label="Model">
+                {#each appConfig.models as m}
+                  <option value={m.key}>{m.label}</option>
+                {/each}
+              </select>
+              <div class="period-seg">
+                {#each periodOptions as opt}
+                  <button
+                    type="button"
+                    class="period-btn"
+                    class:active={currentPeriodKey() === opt.key}
+                    title={opt.title}
+                    onclick={() => selectPeriod(opt.period || 'yearly', null, opt.season || null)}
+                  >{opt.label}</button>
+                {/each}
+              </div>
+              <button type="button" class="export-btn" title="Download statistics as CSV" onclick={handleExportStatsCsv}>
+                <svg class="export-icon" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v2h8v-2"/><path d="M8 2v9"/><path d="M5 8l3 3 3-3"/></svg>
+                Export CSV
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     {:else}
@@ -803,14 +802,14 @@
     padding: 4px 16px 12px;
   }
 
-  /* ── Toolbar row ── */
+  /* ── Toolbar (minimal: title + close) ── */
   .panel-toolbar {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
-    min-height: 30px;
-    padding: 2px 0;
+    min-height: 24px;
+    padding: 0 0 2px;
   }
   .toolbar-title {
     display: flex;
@@ -839,112 +838,9 @@
     text-overflow: ellipsis;
     min-width: 0;
   }
-  .toolbar-controls {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-shrink: 0;
-  }
-
-  /* ── Model selector (inline) ── */
-  .model-field {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-  }
-  .model-field-label {
-    font-size: 10px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
-    color: var(--text-secondary);
-  }
-  .panel-model-select {
-    background: var(--surface);
-    color: var(--text-primary);
-    border: 1px solid var(--panel-border);
-    border-radius: 6px;
-    font-size: 12px;
-    font-family: inherit;
-    font-weight: 500;
-    padding: 4px 22px 4px 8px;
-    cursor: pointer;
-    outline: none;
-    -webkit-appearance: none;
-    appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'%3E%3Cpath fill='%237a818c' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 5px center;
-    transition: border-color 0.15s;
-  }
-  .panel-model-select:focus { border-color: var(--accent); }
-  .panel-model-select option {
-    background: var(--panel-solid);
-    color: var(--text-primary);
-  }
-
-  /* ── Period segmented control ── */
-  .period-seg {
-    display: flex;
-    gap: 1px;
-    background: var(--surface);
-    border: 1px solid var(--panel-border);
-    border-radius: 6px;
-    padding: 2px;
-  }
-  .period-btn {
-    padding: 3px 9px;
-    font-size: 11px;
-    font-family: inherit;
-    font-weight: 500;
-    border: none;
-    border-radius: 4px;
-    background: transparent;
-    color: var(--text-secondary);
-    cursor: pointer;
-    transition: all 0.12s ease;
-    white-space: nowrap;
-    line-height: 1.4;
-  }
-  .period-btn.active {
-    background: var(--accent);
-    color: #0a0e14;
-    font-weight: 600;
-    box-shadow: 0 1px 4px rgba(110, 181, 255, 0.25);
-  }
-  .period-btn:hover:not(.active) {
-    color: var(--text-primary);
-    background: rgba(255,255,255,0.04);
-  }
-
-  /* ── Export button ── */
-  .export-btn {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    font-family: inherit;
-    font-size: 11px;
-    font-weight: 600;
-    padding: 4px 10px;
-    border-radius: 6px;
-    border: 1px solid var(--panel-border);
-    background: var(--surface);
-    color: var(--text-secondary);
-    cursor: pointer;
-    transition: all 0.15s;
-    white-space: nowrap;
-  }
-  .export-btn:hover {
-    color: var(--accent);
-    border-color: rgba(110, 181, 255, 0.3);
-    background: var(--accent-glow);
-  }
-  .export-icon { flex-shrink: 0; }
-
-  /* ── Close button ── */
   .close-btn {
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -962,14 +858,20 @@
     border-color: rgba(255, 107, 107, 0.28);
   }
 
-  /* ── Content row: chart + stat cards ── */
+  /* ── Content row: chart column + stat cards ── */
   .panel-content {
     display: flex;
     gap: 10px;
     min-height: 0;
   }
-  .chart-section {
+  .chart-col {
     flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .chart-section {
     min-width: 0;
   }
   .lead-chart {
@@ -986,17 +888,113 @@
   }
   .lead-chart canvas { width: 100%; height: 100%; }
 
-  /* ── Stat cards ── */
-  .stats-section {
+  /* ── Side strip: stats + controls ── */
+  .side-strip {
     flex-shrink: 0;
-    width: 210px;
+    width: 224px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
   }
   .stat-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 5px;
-    height: 100%;
   }
+  .strip-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  /* ── Model selector ── */
+  .panel-model-select {
+    width: 100%;
+    background: var(--surface);
+    color: var(--text-primary);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    font-size: 13px;
+    font-family: inherit;
+    font-weight: 500;
+    padding: 7px 26px 7px 10px;
+    cursor: pointer;
+    outline: none;
+    -webkit-appearance: none;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'%3E%3Cpath fill='%237a818c' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
+    transition: border-color 0.15s;
+  }
+  .panel-model-select:focus { border-color: var(--accent); }
+  .panel-model-select option {
+    background: var(--panel-solid);
+    color: var(--text-primary);
+  }
+
+  /* ── Period segmented control ── */
+  .period-seg {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1px;
+    background: var(--surface);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 2px;
+  }
+  .period-btn {
+    flex: 1 1 auto;
+    padding: 5px 0;
+    font-size: 11px;
+    font-family: inherit;
+    font-weight: 500;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.12s ease;
+    white-space: nowrap;
+    text-align: center;
+    min-width: 0;
+  }
+  .period-btn.active {
+    background: var(--accent);
+    color: #0a0e14;
+    font-weight: 600;
+    box-shadow: 0 1px 4px rgba(110, 181, 255, 0.25);
+  }
+  .period-btn:hover:not(.active) {
+    color: var(--text-primary);
+    background: rgba(255,255,255,0.04);
+  }
+
+  /* ── Export button ── */
+  .export-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 7px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--panel-border);
+    background: var(--surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+    white-space: nowrap;
+    width: 100%;
+  }
+  .export-btn:hover {
+    color: var(--accent);
+    border-color: rgba(110, 181, 255, 0.3);
+    background: var(--accent-glow);
+  }
+  .export-icon { flex-shrink: 0; }
   .stat-card {
     display: flex;
     flex-direction: column;
@@ -1067,9 +1065,9 @@
   .c-ok   { color: #fbbf24; }
   .c-bad  { color: #f87171; }
 
-  /* ── Model comparison table ── */
+  /* ── Model comparison table (inside chart column) ── */
   .compare-section {
-    margin-top: 2px;
+    min-width: 0;
   }
   .section-label {
     font-size: 10px;
@@ -1179,19 +1177,14 @@
       padding: 4px 12px calc(12px + env(safe-area-inset-bottom, 0px));
       gap: 10px;
     }
-    .panel-toolbar {
-      flex-wrap: wrap;
-      gap: 8px;
-    }
-    .toolbar-controls {
-      flex-wrap: wrap;
-      gap: 6px;
-    }
     .panel-content {
       flex-direction: column;
       gap: 10px;
     }
-    .stats-section {
+    .chart-col {
+      gap: 8px;
+    }
+    .side-strip {
       width: auto;
       order: -1;
     }
@@ -1199,19 +1192,36 @@
       grid-template-columns: 1fr 1fr;
       gap: 8px;
     }
-    .lead-chart { height: 140px; }
+    .strip-controls {
+      flex-direction: row;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .panel-model-select {
+      width: auto;
+      flex: 1;
+      min-width: 120px;
+      min-height: 40px;
+      font-size: 14px;
+    }
+    .period-seg {
+      flex: 1;
+      min-width: 0;
+    }
     .period-btn {
-      padding: 8px 10px;
+      padding: 8px 0;
       min-height: 40px;
       font-size: 12px;
-    }
-    .close-btn {
-      min-width: 44px;
-      min-height: 44px;
     }
     .export-btn {
       min-height: 40px;
       padding: 8px 12px;
+      flex: 1;
+    }
+    .lead-chart { height: 140px; }
+    .close-btn {
+      min-width: 44px;
+      min-height: 44px;
     }
   }
 </style>

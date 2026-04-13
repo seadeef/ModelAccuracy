@@ -73,6 +73,46 @@ export async function fetchZip(zip) {
   };
 }
 
+/** Returns true when the input looks like a bare 5-digit US ZIP code. */
+export function looksLikeZip(input) {
+  return /^\d{5}$/.test(input.trim());
+}
+
+/**
+ * Geocode a free-form US address via the Nominatim (OpenStreetMap) API.
+ * Returns { found, label, lat, lon, bounds? } matching the fetchZip shape.
+ */
+export async function geocodeAddress(query) {
+  const q = query.trim();
+  if (!q) return { found: false, label: '' };
+  const params = new URLSearchParams({
+    q,
+    format: 'jsonv2',
+    countrycodes: 'us',
+    limit: '1',
+  });
+  const resp = await fetch(
+    `https://nominatim.openstreetmap.org/search?${params}`,
+    { headers: { 'User-Agent': 'ModelAccuracyApp/1.0' } },
+  );
+  if (!resp.ok) return { found: false, label: q };
+  const results = await resp.json();
+  if (!results.length) return { found: false, label: q };
+  const r = results[0];
+  const result = {
+    found: true,
+    label: r.display_name,
+    lat: Number(r.lat),
+    lon: Number(r.lon),
+  };
+  if (r.boundingbox) {
+    // Nominatim returns [south, north, west, east] as strings
+    const [south, north, west, east] = r.boundingbox.map(Number);
+    result.bounds = [west, south, east, north];
+  }
+  return result;
+}
+
 /**
  * Fetch stats for every lead day from min to max (all verification statistics in one request).
  * Point regions use the nearest grid cell; rectangle/polygon use the spatial mean over masked cells.
