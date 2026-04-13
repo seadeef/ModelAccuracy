@@ -6,6 +6,7 @@
     SEASON_PERIOD_HELP,
   } from '../helpText.js';
   import { fetchStatsAllLeads, fetchLeadWinnersForRegion } from '../api.js';
+  import { downloadPanelStatsCsv } from '../exportPanelStatsCsv.js';
   import { getModelLeadBounds } from '../tile.js';
   import { modelPalette } from '../modelPalette.js';
   import { glyphPanelClose } from '../appIcons.js';
@@ -116,6 +117,13 @@
       .filter((k) => /^\d+$/.test(k))
       .map((day) => ({ day, winner: p.leads[day] }))
       .sort((a, b) => Number(a.day) - Number(b.day));
+  });
+
+  /** Map lead day string → winning model key (from in-memory winners payload; optional CSV column). */
+  const winnerByLeadMap = $derived.by(() => {
+    const rows = winnerTableRows;
+    if (!rows.length) return null;
+    return new Map(rows.map((r) => [String(r.day), r.winner]));
   });
 
   function seriesFor(statName) {
@@ -443,6 +451,27 @@
     ui.selectedRegion = null;
   }
 
+  function handleExportStatsCsv() {
+    if (!leadData.length) return;
+    const keys = chartStats;
+    const includeWinners =
+      isAccuracyStatistic && winnerByLeadMap && winnerByLeadMap.size > 0;
+    downloadPanelStatsCsv({
+      leadData,
+      statKeys: keys,
+      modelKey: ui.model,
+      models: appConfig.models,
+      period: ui.period,
+      month: ui.month,
+      season: ui.season,
+      region: ui.selectedRegion,
+      bestModelByLead: includeWinners ? winnerByLeadMap : null,
+      bestModelColumnHeader: includeWinners
+        ? `Best model (${statLabel(ui.statistic)})`
+        : null,
+    });
+  }
+
   function selectPeriod(period, month, season) {
     ui.period = period;
     if (month) ui.month = month;
@@ -620,10 +649,18 @@
       <div class="panel-body">
         <!-- Chart -->
         <div class="chart-section">
-          <div
-            class="section-label"
-            title="All verification metrics load together for this region; the chart shows only the highlighted metric (legend or stat cards) so scales do not mix. Stat cards use the current lead (scrub the chart or the map slider)."
-          >Accuracy vs. lead time</div>
+          <div class="section-label-row">
+            <div
+              class="section-label section-label--inline"
+              title="All verification metrics load together for this region; the chart shows only the highlighted metric (legend or stat cards) so scales do not mix. Stat cards use the current lead (scrub the chart or the map slider)."
+            >Accuracy vs. lead time</div>
+            <button
+              type="button"
+              class="export-csv-btn"
+              title="Download loaded verification statistics for this region as CSV (spreadsheet-friendly). Uses data already shown in the panel; no extra server request."
+              onclick={handleExportStatsCsv}
+            >Export CSV</button>
+          </div>
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="lead-chart"
@@ -907,6 +944,14 @@
     gap: 12px;
     padding: 4px 16px 16px;
   }
+  .section-label-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-bottom: 6px;
+    flex-wrap: wrap;
+  }
   .section-label {
     font-size: 11px;
     font-weight: 600;
@@ -914,6 +959,31 @@
     letter-spacing: 0.6px;
     color: var(--text-secondary);
     margin-bottom: 6px;
+  }
+  .section-label--inline {
+    margin-bottom: 0;
+    flex: 1;
+    min-width: 0;
+  }
+  .export-csv-btn {
+    flex-shrink: 0;
+    font-family: inherit;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.35px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--panel-border);
+    background: var(--surface);
+    color: var(--accent);
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    white-space: nowrap;
+  }
+  .export-csv-btn:hover {
+    background: var(--accent-glow);
+    border-color: rgba(110, 181, 255, 0.35);
   }
   .compare-section-label {
     display: flex;
