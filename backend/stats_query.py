@@ -155,6 +155,124 @@ def _point_in_polygon(lon: float, lat: float, ring: list[list[float]]) -> bool:
     return inside
 
 
+def _cell_axis_bounds(centers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Low/high edge of each grid cell along a 1D axis of cell-center coordinates."""
+    c = np.asarray(centers, dtype=np.float64)
+    n = int(c.size)
+    if n == 0:
+        return c, c
+    if n == 1:
+        span = 1.0
+        return np.array([c[0] - span / 2]), np.array([c[0] + span / 2])
+    low = np.empty(n, dtype=np.float64)
+    high = np.empty(n, dtype=np.float64)
+    low[0] = c[0] - (c[1] - c[0]) / 2
+    high[-1] = c[-1] + (c[-1] - c[-2]) / 2
+    mid = (c[:-1] + c[1:]) / 2
+    low[1:] = mid
+    high[:-1] = mid
+    return low, high
+
+
+def _mask_rectangle_overlap(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+) -> np.ndarray:
+    """Cells whose footprint overlaps the query rectangle (not only centers inside)."""
+    lat_low, lat_high = _cell_axis_bounds(lats)
+    lon_low, lon_high = _cell_axis_bounds(lons)
+    lat_ok = (lat_low <= north) & (lat_high >= south)
+    lon_ok = (lon_low <= east) & (lon_high >= west)
+    return np.outer(lat_ok, lon_ok).reshape(-1)
+
+
+def _polygon_mask_centers(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    n_lat: int,
+    n_lon: int,
+    ring: list[list[float]],
+) -> np.ndarray:
+    mask = np.zeros(n_lat * n_lon, dtype=bool)
+    lons_ring = [p[0] for p in ring]
+    lats_ring = [p[1] for p in ring]
+    min_lon = min(lons_ring)
+    max_lon = max(lons_ring)
+    min_lat = min(lats_ring)
+    max_lat = max(lats_ring)
+    for r, lat in enumerate(lats):
+        if lat < min_lat or lat > max_lat:
+            continue
+        base = r * n_lon
+        for c, lon in enumerate(lons):
+            if lon < min_lon or lon > max_lon:
+                continue
+            if _point_in_polygon(float(lon), float(lat), ring):
+                mask[base + c] = True
+    return mask
+
+
+def _polygon_mask_centers_or_corners(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    n_lat: int,
+    n_lon: int,
+    ring: list[list[float]],
+) -> np.ndarray:
+    """Include cells whose center or any corner lies inside the polygon."""
+    lat_low, lat_high = _cell_axis_bounds(lats)
+    lon_low, lon_high = _cell_axis_bounds(lons)
+    mask = np.zeros(n_lat * n_lon, dtype=bool)
+    lons_ring = [p[0] for p in ring]
+    lats_ring = [p[1] for p in ring]
+    min_lon = min(lons_ring)
+    max_lon = max(lons_ring)
+    min_lat = min(lats_ring)
+    max_lat = max(lats_ring)
+    corners_template = ((0, 0), (1, 0), (1, 1), (0, 1))
+
+    for r in range(n_lat):
+        if lat_high[r] < min_lat or lat_low[r] > max_lat:
+            continue
+        cy = float(lats[r])
+        y_lo, y_hi = float(lat_low[r]), float(lat_high[r])
+        base = r * n_lon
+        for c in range(n_lon):
+            if lon_high[c] < min_lon or lon_low[c] > max_lon:
+                continue
+            cx = float(lons[c])
+            x_lo, x_hi = float(lon_low[c]), float(lon_high[c])
+            if _point_in_polygon(cx, cy, ring):
+                mask[base + c] = True
+                continue
+            for ix, iy in corners_template:
+                x = x_lo if ix == 0 else x_hi
+                y = y_lo if iy == 0 else y_hi
+                if _point_in_polygon(x, y, ring):
+                    mask[base + c] = True
+                    break
+    return mask
+
+
+def _mask_nearest_cell(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    n_lat: int,
+    n_lon: int,
+    lon: float,
+    lat: float,
+) -> np.ndarray:
+    mask = np.zeros(n_lat * n_lon, dtype=bool)
+    r = int(np.argmin(np.abs(lats - lat)))
+    c = int(np.argmin(np.abs(lons - lon)))
+    mask[r * n_lon + c] = True
+    return mask
+
+
 def _build_region_mask(
     lats: np.ndarray,
     lons: np.ndarray,
@@ -167,31 +285,25 @@ def _build_region_mask(
 
     if region_type == "rectangle":
         west, south, east, north = region["bounds"]
-        lat_sel = (lats >= south) & (lats <= north)
-        lon_sel = (lons >= west) & (lons <= east)
-        if not np.any(lat_sel) or not np.any(lon_sel):
-            return mask
-        return np.outer(lat_sel, lon_sel).reshape(-1)
+        mask = _mask_rectangle_overlap(lats, lons, west, south, east, north)
+        if not np.any(mask):
+            cx = (west + east) / 2
+            cy = (south + north) / 2
+            mask = _mask_nearest_cell(lats, lons, n_lat, n_lon, cx, cy)
+        return mask
 
     if region_type == "polygon":
         ring = [[float(p[0]), float(p[1])] for p in region.get("coordinates", [])]
         if len(ring) < 3:
             return mask
-        lons_ring = [p[0] for p in ring]
-        lats_ring = [p[1] for p in ring]
-        min_lon = min(lons_ring)
-        max_lon = max(lons_ring)
-        min_lat = min(lats_ring)
-        max_lat = max(lats_ring)
-        for r, lat in enumerate(lats):
-            if lat < min_lat or lat > max_lat:
-                continue
-            base = r * n_lon
-            for c, lon in enumerate(lons):
-                if lon < min_lon or lon > max_lon:
-                    continue
-                if _point_in_polygon(float(lon), float(lat), ring):
-                    mask[base + c] = True
+        mask = _polygon_mask_centers(lats, lons, n_lat, n_lon, ring)
+        if not np.any(mask):
+            mask = _polygon_mask_centers_or_corners(lats, lons, n_lat, n_lon, ring)
+        if not np.any(mask):
+            cx = sum(p[0] for p in ring) / len(ring)
+            cy = sum(p[1] for p in ring) / len(ring)
+            mask = _mask_nearest_cell(lats, lons, n_lat, n_lon, cx, cy)
+        return mask
     return mask
 
 
