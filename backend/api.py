@@ -18,6 +18,7 @@ from starlette.requests import Request
 
 from model_registry import MODEL_REGISTRY
 from backend.request_models import LeadWinnersRequest, StatsQueryRequest
+from backend.shapes_router import create_shapes_router
 from backend.static_store import store_from_env
 from backend.stats_service import query_lead_winners_payload, query_stats_payload
 
@@ -99,6 +100,10 @@ def query_stats(
         header_model=x_model,
         now_month=datetime.now(timezone.utc).month,
     )
+
+
+# Saved shapes (requires authentication)
+app.include_router(create_shapes_router())
 
 
 @app.post("/api/stats/lead-winners")

@@ -17,6 +17,13 @@
 #   ECS_CLUSTER / ECS_CLUSTER_ARN   only used with --force-redeploy; prompted before data export if unset
 #   ECS_SERVICE / ECS_SERVICE_ARN   only used with --force-redeploy; prompted before data export if unset
 #
+# ECS Task Definition environment variables (set in AWS, not this script):
+#   COGNITO_USER_POOL_ID        Cognito User Pool ID (required for auth)
+#   COGNITO_APP_CLIENT_ID       Cognito App Client ID (required for auth)
+#   COGNITO_REGION              Cognito region (defaults to AWS_REGION / us-west-1)
+#   DYNAMODB_USER_ITEMS_TABLE   DynamoDB table for saved shapes (default ModelAccuracy-UserItems)
+#   MODELACCURACY_DEV_AUTH      Set to 1 for dev-mode auth (X-Dev-User-Id header, no Cognito)
+#
 # Flags:
 #   --tag-latest       push IMAGE_TAG and also push the same image as :latest
 #   --force-redeploy   aws ecs update-service --force-new-deployment (needs cluster + service)
