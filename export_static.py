@@ -22,13 +22,15 @@ Reads from stats_output/ and tiles_output/, writes to static_export/:
                 {model}/{stat}/monthly/{MM}.json
                 {model}/{stat}/seasonal/{djf|…}.json
 
-Use ``--skip-frontend-build`` / ``--no-deploy-site`` to skip ``npm run build``;
-``static_export/static/`` and ``static_export/data/`` are still written.
+Build modes (at most one; omit all for a full export):
 
-Use ``--frontend-only`` to rebuild only the Vite SPA (removes old ``index.html`` and
-``assets/`` under the site root, then runs ``npm run build``). Does not touch
-``static/`` or ``data/``. Cannot be combined with ``--clean`` (full clean would
-delete those trees).
+* ``--static`` — only ``static_export/static/`` (config.json, zip JSON, tile PNGs, ranges).
+* ``--data`` — only ``static_export/data/`` (``.bin`` layers, ``grid.json``).
+* ``--frontend`` — only site-root Vite output (``index.html``, ``assets/``); refreshes
+  ``export_manifest.json``. Removes prior SPA artifacts first.
+
+``--clean`` deletes the entire output directory first; only allowed for a **full** export
+(no ``--static`` / ``--data`` / ``--frontend``).
 
 The .bin files are raw float32 arrays (row-major, height × width).
 
@@ -432,6 +434,13 @@ def write_export_manifest(site_root: Path) -> None:
 
 # ── main ────────────────────────────────────────────────────────────
 
+def _maptiler_key() -> str:
+    maptiler_key_file = Path(".maptiler_key")
+    if maptiler_key_file.is_file():
+        return maptiler_key_file.read_text().strip()
+    return os.getenv("MAPTILER_API_KEY", "")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export static files for serverless deployment.",
@@ -442,36 +451,33 @@ def main() -> None:
     )
     parser.add_argument(
         "--clean", action="store_true",
-        help="Delete output directory before exporting",
+        help="Delete output directory before exporting (full export only)",
     )
     parser.add_argument(
-        "--skip-frontend-build",
-        "--no-deploy-site",
-        action="store_true",
-        dest="skip_frontend_build",
-        help="Skip npm/Vite (no index.html/assets); still writes static_export/static/ and data/.",
+        "--static", action="store_true",
+        help="Only rebuild static_export/static/ (config, zip, tiles, ranges)",
     )
     parser.add_argument(
-        "--frontend-only",
-        action="store_true",
-        dest="frontend_only",
-        help=(
-            "Only rebuild the SPA: delete site-root index.html and assets/, run Vite, "
-            "refresh export_manifest.json. Leaves static/ and data/ unchanged."
-        ),
+        "--data", action="store_true",
+        help="Only rebuild static_export/data/ (.bin layers and grid.json)",
+    )
+    parser.add_argument(
+        "--frontend", action="store_true",
+        help="Only rebuild site-root Vite SPA (index.html, assets/) and export_manifest.json",
     )
     args = parser.parse_args()
 
-    if args.clean and args.frontend_only:
-        parser.error("--clean cannot be used with --frontend-only (use --frontend-only alone to replace SPA files).")
-    if args.skip_frontend_build and args.frontend_only:
-        parser.error("--skip-frontend-build conflicts with --frontend-only.")
+    mode_count = int(args.static) + int(args.data) + int(args.frontend)
+    if mode_count > 1:
+        parser.error("Use at most one of --static, --data, --frontend.")
+    if args.clean and mode_count:
+        parser.error("--clean applies only to a full export (omit --static, --data, and --frontend).")
 
     site_root = Path(args.output)
 
-    if args.frontend_only:
+    if args.frontend:
         site_root.mkdir(parents=True, exist_ok=True)
-        print("Frontend-only: clearing old Vite output...")
+        print("--frontend: clearing old Vite output...")
         clear_site_frontend_artifacts(site_root)
         print("Building static frontend...")
         build_static_frontend(site_root)
@@ -483,7 +489,38 @@ def main() -> None:
             and "data" not in f.relative_to(site_root).parts[:1]
             and "static" not in f.relative_to(site_root).parts[:1]
         )
-        print(f"\nDone (frontend only). Site-root SPA + manifest ~ {spa_bytes / (1024 * 1024):.2f} MB under {site_root}")
+        print(f"\nDone (--frontend). Site-root SPA + manifest ~ {spa_bytes / (1024 * 1024):.2f} MB under {site_root}")
+        return
+
+    if args.static:
+        site_root.mkdir(parents=True, exist_ok=True)
+        assets_dir = site_root / STATIC_ASSETS_DIR_NAME
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        maptiler_key = _maptiler_key()
+        print("--static: exporting config...")
+        export_config(assets_dir, maptiler_key)
+        print("--static: exporting ZIP directory...")
+        export_zip_directory(assets_dir, _PROJECT_ROOT / "backend" / "zip_lookup.csv")
+        print("--static: exporting tiles...")
+        export_tiles(assets_dir)
+        print("--static: exporting legend ranges...")
+        export_value_ranges(assets_dir)
+        write_export_manifest(site_root)
+        print(f"\nDone (--static). Assets under {assets_dir}")
+        return
+
+    if args.data:
+        site_root.mkdir(parents=True, exist_ok=True)
+        data_root = site_root / DATA_DIR_NAME
+        data_root.mkdir(parents=True, exist_ok=True)
+        print("--data: exporting data layers...")
+        export_data_layers(data_root)
+        print("--data: exporting forecast data layers...")
+        export_forecast_data_layers(data_root)
+        print("--data: exporting model grids...")
+        export_model_grids(data_root)
+        write_export_manifest(site_root)
+        print(f"\nDone (--data). Data under {data_root}")
         return
 
     if args.clean and site_root.exists():
@@ -494,13 +531,7 @@ def main() -> None:
     assets_dir.mkdir(parents=True, exist_ok=True)
     data_root.mkdir(parents=True, exist_ok=True)
 
-    # Read MapTiler key if available.
-    maptiler_key_file = Path(".maptiler_key")
-    maptiler_key = (
-        maptiler_key_file.read_text().strip()
-        if maptiler_key_file.is_file()
-        else os.getenv("MAPTILER_API_KEY", "")
-    )
+    maptiler_key = _maptiler_key()
     print("Exporting config...")
     export_config(assets_dir, maptiler_key)
 
@@ -522,9 +553,8 @@ def main() -> None:
     print("Exporting legend ranges (for client map download)...")
     export_value_ranges(assets_dir)
 
-    if not args.skip_frontend_build:
-        print("Building static frontend...")
-        build_static_frontend(site_root)
+    print("Building static frontend...")
+    build_static_frontend(site_root)
 
     write_export_manifest(site_root)
 

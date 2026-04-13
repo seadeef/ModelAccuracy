@@ -1,5 +1,5 @@
 # ModelAccuracy API + static_export (disk-backed stats, same as local dev).
-# Build after: python export_static.py, or ./deploy_fargate.sh (export + verify + build [+ ECR]).
+# Build after: python export_static.py --data (or full export_static.py), or ./deploy_fargate.sh.
 FROM python:3.12-slim
 
 WORKDIR /app

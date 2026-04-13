@@ -87,7 +87,14 @@ Generates tiles for yearly, current month, and current season. Forecast tiles ar
 
 ### `export_static.py`
 
-Builds `static_export/` for disk-backed serving: Vite SPA (`index.html`, `assets/`), `static_export/static/` (config, zip lookups, tiles, ranges), and `static_export/data/` (grid metadata and `.bin` arrays). Run this before `docker build` or local API use. See `python export_static.py --help` for flags.
+Builds `static_export/` for disk-backed serving: Vite SPA (`index.html`, `assets/`), `static_export/static/` (config, zip lookups, tiles, ranges), and `static_export/data/` (grid metadata and `.bin` arrays). Run this before `docker build` or local API use.
+
+- `python export_static.py` — full export (all of the above).
+- `python export_static.py --static` — only `static_export/static/` (config, zip, tiles, ranges).
+- `python export_static.py --data` — only `static_export/data/`.
+- `python export_static.py --frontend` — only site-root SPA + `export_manifest.json`.
+
+Use `python export_static.py --help` for `--output` and `--clean` (full export only).
 
 ## Statistics
 
@@ -124,9 +131,9 @@ Models are registered in `model_registry.py`. Currently: **GFS** (0.25° global,
 | Artifact | Role |
 |----------|------|
 | [Dockerfile](Dockerfile) | Image build; verifies `static_export/data/<model>/grid.json` exists |
-| [deploy_fargate.sh](deploy_fargate.sh) | Runs `export_static.py`, verifies data, `docker build`, ECR push (us-west-1 default) |
+| [deploy_fargate.sh](deploy_fargate.sh) | Runs `export_static.py --data`, verifies data, `docker build`, ECR push (us-west-1 default) |
 
-The Docker image **fails to build** if `static_export/data/<model>/grid.json` is missing. Always run `export_static.py` first.
+The Docker image **fails to build** if `static_export/data/<model>/grid.json` is missing. Fargate deploy refreshes **data** only; run a full `export_static.py` (or `--static` / `--frontend`) when those parts change.
 
 ```bash
 chmod +x deploy_fargate.sh
@@ -136,7 +143,7 @@ chmod +x deploy_fargate.sh
 Common flags:
 
 - `IMAGE_TAG=v1.2.3 ./deploy_fargate.sh`
-- `SKIP_EXPORT=1 ./deploy_fargate.sh` — use existing `static_export/`
+- `SKIP_EXPORT=1 ./deploy_fargate.sh` — use existing `static_export/data/`
 - `SKIP_PUSH=1 ./deploy_fargate.sh` — build only, no ECR push
 - `AWS_REGION=us-east-1 ECR_REPOSITORY=my-api ./deploy_fargate.sh`
 - `DOCKER_PLATFORM=linux/arm64 ./deploy_fargate.sh` — only if running ARM/Graviton; default is `linux/amd64`
