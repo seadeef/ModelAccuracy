@@ -15,9 +15,6 @@ export const FALLBACK_STYLE_URL = 'https://demotiles.maplibre.org/style.json';
 /** Config, zip, tiles → ``static_export/static`` (``/static``). */
 export const STATIC_BASE = '/static';
 
-/** Grid and .bin layers → ``static_export/data`` (``/data``). */
-export const DATA_BASE = '/data';
-
 // Keep in sync with backend/tile_overlay_constants.py TILE_IMAGE_BOUNDS_WGS84.
 export const TILE_IMAGE_BOUNDS_WGS84 = [
   -125.0,

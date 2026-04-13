@@ -1,7 +1,7 @@
 import { MONTH_NAMES } from './constants.js';
 
 /** Hover copy: full name + whether higher or lower is better (bias: near zero). */
-export const STATISTIC_HELP = {
+const STATISTIC_HELP = {
   bias: 'Bias (mean model minus observation). Near zero is best.',
   nrmse: 'Normalized root mean square error. Lower is better.',
   nmad: 'Normalized mean absolute deviation. Lower is better.',

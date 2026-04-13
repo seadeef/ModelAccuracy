@@ -10,9 +10,6 @@ export const drawToolGlyph = {
   polygon: '<path d="M8 2L14 6L12 14H4L2 6Z"/>',
 };
 
-/** Clear selection X (DrawTools); parent stroke-width="1.5" */
-export const clearSelectionGlyph = '<path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/>';
-
 /** Map toolbar download; parent stroke-width="1.5" */
 export const glyphDownloadMap = '<path d="M2 10v3h12v-3"/><path d="M8 2v8M5 7l3 3 3-3"/>';
 

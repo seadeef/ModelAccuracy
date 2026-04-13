@@ -1,11 +1,4 @@
-import { STATIC_BASE, MONTH_NAMES } from './constants.js';
-
-const SEASON_LABELS = {
-  djf: 'Winter (DJF)',
-  mam: 'Spring (MAM)',
-  jja: 'Summer (JJA)',
-  son: 'Autumn (SON)',
-};
+import { STATIC_BASE, MONTH_NAMES, SEASON_NAMES } from './constants.js';
 
 function rangeJsonUrl(model, statistic, period, month, season) {
   const b = `${STATIC_BASE}/ranges/${model}/${statistic}`;
@@ -104,7 +97,7 @@ export async function exportMapImage({
     const mi = parseInt(month, 10);
     periodLabel = MONTH_NAMES[mi] && mi >= 1 && mi <= 12 ? MONTH_NAMES[mi] : month;
   } else if (period === 'seasonal' && season) {
-    periodLabel = SEASON_LABELS[season] ?? season.toUpperCase();
+    periodLabel = SEASON_NAMES[season] ? `${SEASON_NAMES[season]} (${season.toUpperCase()})` : season.toUpperCase();
   }
 
   const title = `${modelLabel} ${statLabel} (${units})  \u2014  ${leadLabel}  \u2014  ${periodLabel}`;
