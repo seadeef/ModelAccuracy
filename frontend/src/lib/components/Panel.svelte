@@ -15,9 +15,9 @@
 
   const STAT_COLORS = {
     nrmse: '#6eb5ff',
-    bias: '#ffd93d',
-    sacc: '#a78bfa',
-    nmad: '#ff6b6b',
+    bias: '#e0a4ff',
+    sacc: '#5ce0d6',
+    nmad: '#f0a07a',
   };
 
   let canvasEl;
@@ -610,36 +610,6 @@
   <div class="panel" class:entering={panelEntering}>
     <div class="panel-handle"></div>
 
-    <div class="panel-header">
-      <div class="header-left">
-        <span class="panel-title">{regionLabel()}</span>
-      </div>
-      <div class="header-controls">
-        <label class="model-field">
-          <span class="model-field-label">Model</span>
-          <select class="panel-model-select" value={ui.model} onchange={onmodelchange}>
-            {#each appConfig.models as m}
-              <option value={m.key}>{m.label}</option>
-            {/each}
-          </select>
-        </label>
-        <div class="period-pills">
-          {#each periodOptions as opt}
-            <button
-              type="button"
-              class="period-pill"
-              class:active={currentPeriodKey() === opt.key}
-              title={opt.title}
-              onclick={() => selectPeriod(opt.period || 'yearly', null, opt.season || null)}
-            >{opt.label}</button>
-          {/each}
-        </div>
-        <button class="icon-btn close-btn" type="button" title="Close panel" aria-label="Close panel" onclick={closePanel}>
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphPanelClose}</svg>
-        </button>
-      </div>
-    </div>
-
     {#if loading}
       <div class="panel-loading">
         <div class="loading-dot"></div>
@@ -647,20 +617,43 @@
       </div>
     {:else if leadData.length > 0}
       <div class="panel-body">
-        <!-- Chart -->
-        <div class="chart-section">
-          <div class="section-label-row">
-            <div
-              class="section-label section-label--inline"
-              title="All verification metrics load together for this region; the chart shows only the highlighted metric (legend or stat cards) so scales do not mix. Stat cards use the current lead (scrub the chart or the map slider)."
-            >Accuracy vs. lead time</div>
-            <button
-              type="button"
-              class="export-csv-btn"
-              title="Download loaded verification statistics for this region as CSV (spreadsheet-friendly). Uses data already shown in the panel; no extra server request."
-              onclick={handleExportStatsCsv}
-            >Export CSV</button>
+        <div class="panel-toolbar">
+          <div class="toolbar-title">
+            <span class="toolbar-heading" title="The chart shows only the highlighted metric. Click a stat card to switch.">Accuracy vs. lead time</span>
+            <span class="toolbar-location">{regionLabel()}</span>
           </div>
+          <div class="toolbar-controls">
+            <label class="model-field">
+              <span class="model-field-label">Model</span>
+              <select class="panel-model-select" value={ui.model} onchange={onmodelchange}>
+                {#each appConfig.models as m}
+                  <option value={m.key}>{m.label}</option>
+                {/each}
+              </select>
+            </label>
+            <div class="period-seg">
+              {#each periodOptions as opt}
+                <button
+                  type="button"
+                  class="period-btn"
+                  class:active={currentPeriodKey() === opt.key}
+                  title={opt.title}
+                  onclick={() => selectPeriod(opt.period || 'yearly', null, opt.season || null)}
+                >{opt.label}</button>
+              {/each}
+            </div>
+            <button type="button" class="export-btn" title="Download statistics as CSV" onclick={handleExportStatsCsv}>
+              <svg class="export-icon" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v2h8v-2"/><path d="M8 2v9"/><path d="M5 8l3 3 3-3"/></svg>
+              CSV
+            </button>
+            <button class="close-btn" type="button" title="Close panel" aria-label="Close panel" onclick={closePanel}>
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphPanelClose}</svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="panel-content">
+        <div class="chart-section">
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
             class="lead-chart"
@@ -673,31 +666,8 @@
           >
             <canvas bind:this={canvasEl}></canvas>
           </div>
-          <div class="chart-legend">
-            {#each chartStats as stat}
-              <!-- svelte-ignore a11y_click_events_have_key_events -->
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <div
-                class="legend-item"
-                class:active={activeStat === stat}
-                class:dimmed={activeStat !== stat}
-                style="--stat-color: {STAT_COLORS[stat] || '#888'}"
-                title={statisticTooltip(stat)}
-                onclick={() => {
-                  activeStat = stat;
-                  ui.statistic = stat;
-                  ui.activeWindow = null;
-                  onstatchange?.({ target: { value: stat } });
-                }}
-              >
-                <div class="legend-dot"></div>
-                {statLabel(stat)}
-              </div>
-            {/each}
-          </div>
         </div>
 
-        <!-- Stats at hover lead -->
         <div class="stats-section">
           <div class="stat-grid">
             {#each chartStats as stat}
@@ -707,6 +677,7 @@
               <div
                 class="stat-card"
                 class:highlighted={activeStat === stat}
+                style="--stat-color: {STAT_COLORS[stat] || '#888'}"
                 title={statisticTooltip(stat)}
                 onclick={() => { activeStat = stat; ui.statistic = stat; ui.activeWindow = null; onstatchange?.({ target: { value: stat } }); }}
               >
@@ -717,12 +688,12 @@
             {/each}
           </div>
         </div>
+        </div>
 
-        <!-- Region-scoped best model per lead (API); each lead day is a column -->
         <div class="compare-section">
           <div
             class="section-label compare-section-label"
-            title={`For each lead day, which model wins on ${statLabel(ui.statistic)} for this drawn region and accumulation window (use the period pills above). The map and this table both use the statistic you pick in the stat cards.`}
+            title={`For each lead day, which model wins on ${statLabel(ui.statistic)} for this drawn region and accumulation window (use the period selector next to the chart). The map and this table both use the statistic you pick in the stat cards.`}
           >
             <span>Best model by day — {statLabel(ui.statistic)}</span>
           </div>
@@ -780,6 +751,7 @@
 {/if}
 
 <style>
+  /* ── Panel shell ── */
   .panel {
     position: absolute;
     bottom: 0;
@@ -789,63 +761,96 @@
     background: var(--panel-bg);
     backdrop-filter: blur(24px) saturate(1.4);
     -webkit-backdrop-filter: blur(24px) saturate(1.4);
-    border-top: 1px solid var(--panel-border);
-    border-radius: 16px 16px 0 0;
+    border-top: 1px solid rgba(255,255,255,0.06);
+    border-radius: 14px 14px 0 0;
     max-height: min(52vh, 100dvh - 20%);
     overflow-y: auto;
     z-index: 20;
     -webkit-overflow-scrolling: touch;
+  }
+  .panel::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 32px;
+    right: 32px;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent) 30%, var(--accent) 70%, transparent);
+    opacity: 0.25;
+    border-radius: 1px;
+    pointer-events: none;
   }
   .panel.entering {
     animation: slideUp 0.4s cubic-bezier(0.16, 1, 0.3, 1);
   }
   @keyframes slideUp {
     from { transform: translateY(100%); opacity: 0.5; }
-    to { transform: translateY(0); opacity: 1; }
+    to   { transform: translateY(0);    opacity: 1; }
   }
   .panel-handle {
-    width: 32px;
+    width: 28px;
     height: 3px;
     background: rgba(255,255,255,0.1);
     border-radius: 2px;
-    margin: 10px auto 0;
+    margin: 7px auto 0;
   }
 
-  /* Header */
-  .panel-header {
-    padding: 10px 16px 8px;
+  /* ── Body layout ── */
+  .panel-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px 16px 12px;
+  }
+
+  /* ── Toolbar row ── */
+  .panel-toolbar {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
+    min-height: 30px;
+    padding: 2px 0;
   }
-  .header-left {
+  .toolbar-title {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 8px;
     min-width: 0;
+    flex-shrink: 1;
+    overflow: hidden;
   }
-  .panel-title {
-    font-size: 15px;
+  .toolbar-heading {
+    font-size: 11px;
     font-weight: 600;
-    color: #fff;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .toolbar-location {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-primary);
+    opacity: 0.55;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    min-width: 0;
   }
-  .header-controls {
+  .toolbar-controls {
     display: flex;
-    align-items: flex-end;
-    gap: 8px;
+    align-items: center;
+    gap: 6px;
     flex-shrink: 0;
-    flex-wrap: wrap;
-    justify-content: flex-end;
   }
+
+  /* ── Model selector (inline) ── */
   .model-field {
     display: flex;
-    flex-direction: column;
-    gap: 2px;
-    align-items: flex-start;
+    align-items: center;
+    gap: 5px;
   }
   .model-field-label {
     font-size: 10px;
@@ -862,143 +867,114 @@
     font-size: 12px;
     font-family: inherit;
     font-weight: 500;
-    padding: 5px 24px 5px 9px;
+    padding: 4px 22px 4px 8px;
     cursor: pointer;
     outline: none;
-    max-width: 8.5rem;
     -webkit-appearance: none;
     appearance: none;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'%3E%3Cpath fill='%237a818c' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
     background-repeat: no-repeat;
-    background-position: right 6px center;
+    background-position: right 5px center;
+    transition: border-color 0.15s;
   }
-  .panel-model-select:focus {
-    border-color: var(--accent);
-  }
+  .panel-model-select:focus { border-color: var(--accent); }
   .panel-model-select option {
     background: var(--panel-solid);
     color: var(--text-primary);
   }
-  .period-pills {
+
+  /* ── Period segmented control ── */
+  .period-seg {
     display: flex;
-    gap: 2px;
+    gap: 1px;
     background: var(--surface);
+    border: 1px solid var(--panel-border);
     border-radius: 6px;
     padding: 2px;
   }
-  .period-pill {
-    padding: 5px 11px;
-    font-size: 12px;
+  .period-btn {
+    padding: 3px 9px;
+    font-size: 11px;
     font-family: inherit;
     font-weight: 500;
     border: none;
-    border-radius: 5px;
+    border-radius: 4px;
     background: transparent;
     color: var(--text-secondary);
     cursor: pointer;
-    transition: all 0.15s;
+    transition: all 0.12s ease;
     white-space: nowrap;
+    line-height: 1.4;
   }
-  .period-pill.active {
-    background: var(--accent-glow);
-    color: var(--accent);
+  .period-btn.active {
+    background: var(--accent);
+    color: #0a0e14;
+    font-weight: 600;
+    box-shadow: 0 1px 4px rgba(110, 181, 255, 0.25);
   }
-  .period-pill:hover:not(.active) {
+  .period-btn:hover:not(.active) {
     color: var(--text-primary);
-  }
-  .icon-btn {
-    width: 30px;
-    height: 30px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border: none;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--text-secondary);
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-  .icon-btn:hover { background: var(--hover-bg); color: var(--text-primary); }
-  .close-btn {
-    width: 36px;
-    height: 36px;
-    flex-shrink: 0;
-    border-radius: 8px;
-    border: 1px solid var(--panel-border);
-    background: var(--surface);
-    color: var(--text-primary);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
-  }
-  .close-btn:hover {
-    color: #ff8a8a;
-    background: rgba(255, 107, 107, 0.14);
-    border-color: rgba(255, 107, 107, 0.35);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    background: rgba(255,255,255,0.04);
   }
 
-  /* Body */
-  .panel-body {
-    display: grid;
-    grid-template-columns: 1fr 238px;
-    gap: 12px;
-    padding: 4px 16px 16px;
-  }
-  .section-label-row {
+  /* ── Export button ── */
+  .export-btn {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-    margin-bottom: 6px;
-    flex-wrap: wrap;
-  }
-  .section-label {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.6px;
-    color: var(--text-secondary);
-    margin-bottom: 6px;
-  }
-  .section-label--inline {
-    margin-bottom: 0;
-    flex: 1;
-    min-width: 0;
-  }
-  .export-csv-btn {
-    flex-shrink: 0;
+    gap: 4px;
     font-family: inherit;
     font-size: 11px;
     font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.35px;
-    padding: 5px 10px;
+    padding: 4px 10px;
     border-radius: 6px;
     border: 1px solid var(--panel-border);
     background: var(--surface);
-    color: var(--accent);
+    color: var(--text-secondary);
     cursor: pointer;
-    transition: background 0.15s, border-color 0.15s;
+    transition: all 0.15s;
     white-space: nowrap;
   }
-  .export-csv-btn:hover {
+  .export-btn:hover {
+    color: var(--accent);
+    border-color: rgba(110, 181, 255, 0.3);
     background: var(--accent-glow);
-    border-color: rgba(110, 181, 255, 0.35);
   }
-  .compare-section-label {
+  .export-icon { flex-shrink: 0; }
+
+  /* ── Close button ── */
+  .close-btn {
+    width: 28px;
+    height: 28px;
     display: flex;
-    align-items: baseline;
-    gap: 8px;
-    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+  .close-btn:hover {
+    color: #ff8a8a;
+    background: rgba(255, 107, 107, 0.1);
+    border-color: rgba(255, 107, 107, 0.28);
   }
 
-  /* Chart */
+  /* ── Content row: chart + stat cards ── */
+  .panel-content {
+    display: flex;
+    gap: 10px;
+    min-height: 0;
+  }
   .chart-section {
+    flex: 1;
     min-width: 0;
   }
   .lead-chart {
     width: 100%;
-    height: 156px;
+    height: 150px;
     position: relative;
     cursor: crosshair;
     touch-action: none;
@@ -1009,46 +985,17 @@
     cursor: pointer;
   }
   .lead-chart canvas { width: 100%; height: 100%; }
-  .chart-legend {
-    display: flex;
-    gap: 4px;
-    margin-top: 8px;
-    flex-wrap: wrap;
-  }
-  .legend-item {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    font-size: 11px;
-    padding: 3px 8px;
-    border-radius: 5px;
-    cursor: pointer;
-    transition: all 0.15s;
-    border: 1px solid transparent;
-    user-select: none;
-    color: var(--stat-color);
-  }
-  .legend-item:hover { background: rgba(255,255,255,0.03); }
-  .legend-item.active { border-color: var(--stat-color); background: rgba(255,255,255,0.03); }
-  .legend-item.dimmed { opacity: 0.3; }
-  .legend-dot {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: var(--stat-color);
-    flex-shrink: 0;
-  }
 
-  /* Stats */
+  /* ── Stat cards ── */
   .stats-section {
-    display: flex;
-    flex-direction: column;
+    flex-shrink: 0;
+    width: 210px;
   }
   .stat-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 6px;
-    flex: 1;
+    gap: 5px;
+    height: 100%;
   }
   .stat-card {
     display: flex;
@@ -1056,122 +1003,143 @@
     align-items: center;
     justify-content: center;
     text-align: center;
-    min-height: 5.75rem;
-    padding: 10px 8px;
+    padding: 8px 6px;
     border-radius: 8px;
     background: var(--surface);
     border: 1px solid transparent;
     cursor: pointer;
     transition: all 0.15s;
-    gap: 5px;
+    gap: 3px;
+    position: relative;
+    overflow: hidden;
   }
-  .stat-card:hover { border-color: var(--panel-border); }
-  .stat-card.highlighted { border-color: rgba(110,181,255,0.2); background: var(--accent-glow); }
+  .stat-card::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 25%;
+    right: 25%;
+    height: 2px;
+    background: var(--stat-color);
+    opacity: 0;
+    transition: all 0.15s;
+    border-radius: 1px;
+  }
+  .stat-card:hover {
+    border-color: var(--panel-border);
+  }
+  .stat-card:hover::after {
+    opacity: 0.4;
+    left: 15%;
+    right: 15%;
+  }
+  .stat-card.highlighted {
+    border-color: color-mix(in srgb, var(--stat-color) 35%, transparent);
+    background: color-mix(in srgb, var(--stat-color) 7%, transparent);
+  }
+  .stat-card.highlighted::after {
+    opacity: 1;
+    left: 10%;
+    right: 10%;
+  }
   .stat-label {
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.4px;
+    letter-spacing: 0.5px;
     color: var(--text-secondary);
     margin: 0;
     line-height: 1.2;
   }
   .stat-val {
-    font-size: 19px;
+    font-size: 18px;
     font-weight: 600;
     line-height: 1.1;
     margin: 0;
   }
   .stat-unit {
-    font-size: 10px;
-    color: rgba(255,255,255,0.28);
+    font-size: 9px;
+    color: rgba(255,255,255,0.22);
     margin: 0;
     line-height: 1.2;
   }
   .c-good { color: #4ade80; }
-  .c-ok { color: #fbbf24; }
-  .c-bad { color: #f87171; }
+  .c-ok   { color: #fbbf24; }
+  .c-bad  { color: #f87171; }
 
-  /* Model comparison */
+  /* ── Model comparison table ── */
   .compare-section {
-    grid-column: 1 / -1;
-    margin-top: 4px;
+    margin-top: 2px;
+  }
+  .section-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary);
+    margin-bottom: 5px;
+  }
+  .compare-section-label {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .winners-loading {
+    font-size: 12px;
+    color: var(--text-secondary);
+    padding: 4px 0;
+  }
+  .winners-table-wrap {
+    overflow-x: auto;
+    border-radius: 6px;
+    border: 1px solid var(--panel-border);
   }
   .compare-table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 13px;
+    font-size: 12px;
   }
   .compare-table th {
-    text-align: left;
-    padding: 6px 10px;
-    color: var(--text-secondary);
-    font-weight: 600;
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
-    border-bottom: 1px solid var(--panel-border);
-  }
-  .compare-table td {
-    padding: 8px 10px;
-    border-bottom: 1px solid rgba(255,255,255,0.03);
-  }
-  .compare-table tr:last-child td {
-    border-bottom: none;
-  }
-  .compare-nodata {
-    color: rgba(255,255,255,0.15);
-  }
-
-  .winners-table-wrap {
-    max-height: min(220px, 40vh);
-    overflow: auto;
-    border-radius: 8px;
-    border: 1px solid var(--panel-border);
-  }
-  .winners-table-wrap .compare-table {
-    margin: 0;
-  }
-  .winners-table-cols th,
-  .winners-table-cols td {
     text-align: center;
     vertical-align: middle;
-    min-width: 3.25rem;
-    padding: 6px 4px;
-  }
-  .winners-day-head {
-    font-size: 10px;
+    padding: 5px 4px;
+    color: var(--text-secondary);
     font-weight: 600;
-    text-transform: uppercase;
+    font-size: 10px;
     letter-spacing: 0.2px;
+    border-bottom: 1px solid var(--panel-border);
+    min-width: 3rem;
   }
+  .compare-table td {
+    text-align: center;
+    vertical-align: middle;
+    padding: 5px 4px;
+    min-width: 3rem;
+  }
+  .compare-table tr:last-child td { border-bottom: none; }
+  .compare-nodata { color: rgba(255,255,255,0.12); }
   .winners-table-cols th.winners-col-current,
   .winners-table-cols td.winners-col-current {
-    background: rgba(110, 181, 255, 0.1);
-    box-shadow: inset 0 0 0 1px rgba(110, 181, 255, 0.2);
-  }
-
-  .winners-loading {
-    padding: 10px 10px 4px;
-    font-size: 12px;
-    color: var(--text-secondary);
+    background: rgba(110, 181, 255, 0.08);
+    box-shadow: inset 0 0 0 1px rgba(110, 181, 255, 0.15);
   }
   .winner-pill {
     display: inline-block;
-    padding: 4px 10px;
-    border-radius: 6px;
-    font-size: 13px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 11px;
     font-weight: 600;
     border: 1px solid transparent;
-  }
-  .winner-pill-compact {
-    padding: 3px 6px;
-    font-size: 11px;
-    border-radius: 4px;
-    max-width: 100%;
     white-space: nowrap;
+    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .winner-pill-compact {
+    padding: 2px 6px;
+    font-size: 11px;
+    border-radius: 4px;
   }
   .winner-pill-fallback {
     background: var(--surface);
@@ -1179,8 +1147,9 @@
     border-color: var(--panel-border);
   }
 
+  /* ── Loading state ── */
   .panel-loading {
-    padding: 24px;
+    padding: 20px;
     text-align: center;
     color: var(--text-secondary);
     font-size: 13px;
@@ -1198,57 +1167,51 @@
   }
   @keyframes pulse {
     0%, 100% { opacity: 0.3; }
-    50% { opacity: 1; }
+    50%      { opacity: 1; }
   }
 
+  /* ── Mobile ── */
   @media (max-width: 720px) {
     .panel {
       max-height: min(62dvh, 100dvh - 15%);
     }
-    .panel-header {
-      flex-direction: column;
-      align-items: stretch;
+    .panel-body {
+      padding: 4px 12px calc(12px + env(safe-area-inset-bottom, 0px));
       gap: 10px;
     }
-    .header-controls {
+    .panel-toolbar {
       flex-wrap: wrap;
-      justify-content: space-between;
-      align-items: center;
+      gap: 8px;
     }
-    .period-pills {
+    .toolbar-controls {
       flex-wrap: wrap;
-      flex: 1;
-      min-width: 0;
+      gap: 6px;
     }
-    .period-pill {
-      padding: 8px 10px;
-      min-height: 40px;
-    }
-    .panel-body {
-      grid-template-columns: 1fr;
-      padding: 4px 12px calc(12px + env(safe-area-inset-bottom, 0px));
+    .panel-content {
+      flex-direction: column;
+      gap: 10px;
     }
     .stats-section {
+      width: auto;
       order: -1;
     }
     .stat-grid {
       grid-template-columns: 1fr 1fr;
       gap: 8px;
     }
-    .stat-card {
-      min-height: 5rem;
-      padding: 12px 8px;
-    }
-    .lead-chart {
-      height: 140px;
+    .lead-chart { height: 140px; }
+    .period-btn {
+      padding: 8px 10px;
+      min-height: 40px;
+      font-size: 12px;
     }
     .close-btn {
       min-width: 44px;
       min-height: 44px;
     }
-    .legend-item {
-      padding: 8px 10px;
+    .export-btn {
       min-height: 40px;
+      padding: 8px 12px;
     }
   }
 </style>

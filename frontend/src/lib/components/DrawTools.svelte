@@ -51,18 +51,18 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    padding: 5px;
+    padding: 4px;
     background: var(--panel-bg);
     backdrop-filter: blur(20px) saturate(1.4);
     -webkit-backdrop-filter: blur(20px) saturate(1.4);
     border: 1px solid var(--panel-border);
-    border-radius: var(--radius);
-    box-shadow: 0 4px 16px rgba(0,0,0,0.35);
+    border-radius: 10px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.4);
   }
   .tool-btn {
-    width: 36px;
-    height: 36px;
-    border: none;
+    width: 34px;
+    height: 34px;
+    border: 1px solid transparent;
     border-radius: 7px;
     background: transparent;
     color: var(--text-secondary);
@@ -71,21 +71,25 @@
     align-items: center;
     justify-content: center;
     transition: all 0.15s;
+    position: relative;
   }
   .tool-btn.active {
-    background: var(--accent-glow);
+    background: rgba(110, 181, 255, 0.12);
     color: var(--accent);
+    border-color: rgba(110, 181, 255, 0.2);
+    box-shadow: 0 0 8px rgba(110, 181, 255, 0.1);
   }
   .tool-btn:hover:not(.active) {
     background: var(--hover-bg);
     color: var(--text-primary);
+    border-color: var(--panel-border);
   }
   @media (max-width: 640px) {
     .toolbar {
       top: max(12px, env(safe-area-inset-top, 0px));
       left: max(8px, env(safe-area-inset-left, 0px));
-      padding: 6px;
-      gap: 4px;
+      padding: 5px;
+      gap: 3px;
     }
     .tool-btn {
       width: 44px;
