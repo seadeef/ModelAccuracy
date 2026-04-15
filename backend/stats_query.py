@@ -570,6 +570,89 @@ def lead_winners_for_region(
     }
 
 
+def forecast_all_models(
+    *,
+    store: StaticStore,
+    region: dict,
+) -> dict[str, object]:
+    """Forecast values for all models × all leads for a region (yearly only).
+
+    Returns ``{models: {<model>: {leads: {<lead>: {value, units, no_data}}}}}``
+    in a single request suitable for one-time frontend caching.
+    """
+    model_order = tuple(sorted(MODEL_REGISTRY.keys()))
+    stat_name = "forecast"
+    units = STATISTICS_BY_NAME[stat_name].spec.units
+
+    # Prefetch grids.
+    for mk in model_order:
+        _get_grid(store, mk)
+
+    # Build (model, lead_key) tasks covering each model's full lead range.
+    tasks: list[tuple[str, str]] = []
+    for mk in model_order:
+        cfg = MODEL_REGISTRY[mk]
+        for lead in range(cfg.lead_days_min, cfg.lead_days_max + 1):
+            tasks.append((mk, str(lead)))
+
+    # Fan out all reads in parallel.
+    bin_results: dict[tuple[str, str], np.ndarray | None] = {}
+    max_workers = min(len(tasks), 20)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_key = {
+            ex.submit(
+                _read_bin_or_none, store, mk, stat_name, lead_key,
+                period="yearly", month=None, season=None,
+            ): (mk, lead_key)
+            for mk, lead_key in tasks
+        }
+        for fut in as_completed(future_to_key):
+            bin_results[future_to_key[fut]] = fut.result()
+
+    # Build per-model results.
+    models_out: dict[str, dict] = {}
+    for mk in model_order:
+        cfg = MODEL_REGISTRY[mk]
+        lats, lons, n_lat, n_lon = _get_grid(store, mk)
+
+        region_type = region.get("type")
+        if region_type == "point":
+            lon = float(region["coordinates"][0])
+            lat = float(region["coordinates"][1])
+            lat_idx = int(np.argmin(np.abs(lats - lat)))
+            lon_idx = int(np.argmin(np.abs(lons - lon)))
+            flat_idx = lat_idx * n_lon + lon_idx
+            mask = None
+        else:
+            flat_idx = None
+            mask = _build_region_mask(lats, lons, n_lat, n_lon, region)
+
+        leads_out: dict[str, dict] = {}
+        for lead in range(cfg.lead_days_min, cfg.lead_days_max + 1):
+            lead_key = str(lead)
+            values = bin_results.get((mk, lead_key))
+            if values is None or values.size != n_lat * n_lon:
+                leads_out[lead_key] = {"value": None, "units": units, "no_data": True}
+                continue
+
+            if flat_idx is not None:
+                v = float(values[flat_idx])
+                if not np.isfinite(v):
+                    leads_out[lead_key] = {"value": None, "units": units, "no_data": True}
+                else:
+                    leads_out[lead_key] = {"value": v, "units": units, "no_data": False}
+            else:
+                v = _masked_mean(values, mask)
+                if v is None:
+                    leads_out[lead_key] = {"value": None, "units": units, "no_data": True}
+                else:
+                    leads_out[lead_key] = {"value": v, "units": units, "no_data": False}
+
+        models_out[mk] = {"leads": leads_out}
+
+    return {"models": models_out}
+
+
 def stats_for_region_all_leads(
     *,
     static_root: Path | None = None,

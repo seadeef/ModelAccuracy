@@ -17,10 +17,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
 from model_registry import MODEL_REGISTRY
-from backend.request_models import LeadWinnersRequest, StatsQueryRequest
+from backend.request_models import ForecastAllModelsRequest, LeadWinnersRequest, StatsQueryRequest
 from backend.shapes_router import create_shapes_router
 from backend.static_store import store_from_env
-from backend.stats_service import query_lead_winners_payload, query_stats_payload
+from backend.stats_service import query_forecast_all_models_payload, query_lead_winners_payload, query_stats_payload
 
 
 STATIC_SITE_ROOT = _project_root / "static_export"
@@ -114,3 +114,9 @@ def lead_winners(payload: LeadWinnersRequest):
         store=STATIC_STORE,
         now_month=datetime.now(timezone.utc).month,
     )
+
+
+@app.post("/api/stats/forecast")
+def forecast_all_models(payload: ForecastAllModelsRequest):
+    """Forecast values for all models across all leads for a region (load once, cache)."""
+    return query_forecast_all_models_payload(payload, store=STATIC_STORE)

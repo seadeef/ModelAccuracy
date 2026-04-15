@@ -6,9 +6,10 @@ from fastapi.responses import JSONResponse
 
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from statistics_plugins.registry import STATISTICS_BY_NAME, VERIFICATION_STATISTICS
-from backend.request_models import LeadWinnersRequest, StatsQueryRequest
+from backend.request_models import ForecastAllModelsRequest, LeadWinnersRequest, StatsQueryRequest
 from backend.static_store import LocalStaticStore, StaticStore, default_static_site_root
 from backend.stats_query import (
+    forecast_all_models,
     lead_winners_for_region,
     stats_for_region,
     stats_for_region_all_leads,
@@ -187,4 +188,22 @@ def query_lead_winners_payload(
         season=season,
         min_lead=payload.minLead,
         max_lead=payload.maxLead,
+    )
+
+
+def query_forecast_all_models_payload(
+    payload: ForecastAllModelsRequest,
+    *,
+    store: StaticStore | None = None,
+):
+    resolved_store = store or LocalStaticStore(default_static_site_root())
+    if not _data_exists(resolved_store):
+        return JSONResponse(
+            {"error": _stats_data_missing_message(resolved_store)},
+            status_code=500,
+        )
+
+    return forecast_all_models(
+        store=resolved_store,
+        region=payload.region.model_dump(),
     )

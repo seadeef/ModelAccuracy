@@ -59,6 +59,18 @@ class LeadWinnersRequest(BaseModel):
         return self
 
 
+class ForecastAllModelsRequest(BaseModel):
+    """Forecast values for all models across all leads for a given region."""
+
+    region: StatsRegion
+
+    @model_validator(mode="after")
+    def validate_region_type(self) -> ForecastAllModelsRequest:
+        if self.region.type not in {"point", "rectangle", "polygon"}:
+            raise ValueError("region.type must be point, rectangle, or polygon")
+        return self
+
+
 class ExportImageRequest(BaseModel):
     model: str
     statistic: str
