@@ -8,19 +8,13 @@
   import { fetchStatsAllLeads, fetchLeadWinnersForRegion } from '../api.js';
   import { downloadPanelStatsCsv } from '../exportPanelStatsCsv.js';
   import { getModelLeadBounds } from '../tile.js';
-  import { modelPalette } from '../modelPalette.js';
+  import { modelPalette, statColor } from '../palette.js';
   import { glyphPanelClose } from '../appIcons.js';
 
   let { onleadchange, onstatchange, onperiodchange, onmodelchange } = $props();
 
-  const STAT_COLORS = {
-    nrmse: '#6eb5ff',
-    bias: '#e0a4ff',
-    sacc: '#5ce0d6',
-    nmad: '#f0a07a',
-  };
-
   let canvasEl;
+  let dummyCanvasEl;
   let loading = $state(false);
   let leadData = $state([]);
   /** Chart / card highlight; must match `ui.statistic` when the panel opens (map layer). */
@@ -41,9 +35,9 @@
   let chartScrubRafId = 0;
   let pendingScrubLead = null;
 
-  /** Plot area insets; `PLOT_TOP` reserves space above the grid for the hover readout. */
-  const PAD = { left: 48, right: 18, bottom: 26 };
-  const PLOT_TOP = 34;
+  /** Plot area insets; y-labels drawn inline over chart, no reserved margins needed. */
+  const PAD = { left: 4, right: 4, bottom: 6 };
+  const PLOT_TOP = 26;
   const HOVER_LABEL_Y = 16;
 
   function regionCenter() {
@@ -89,6 +83,8 @@
   const leadMax = $derived(bounds.max);
 
   const palette = $derived(modelPalette(appConfig.models));
+  /** Number of lead-day columns; shared by charts and winners table for alignment. */
+  const nLeadCols = $derived(leadMax - leadMin + 1);
 
   const chartLead = $derived(hoverLead ?? ui.leadFractional);
 
@@ -206,39 +202,41 @@
       : ySpan < 2 ? (v) => v.toFixed(2)
       : (v) => v.toFixed(1);
 
-    const xForLead = lead => PAD.left + ((lead - leadMin) / (leadMax - leadMin)) * (w - PAD.left - PAD.right);
+    // Column-aligned x: each lead day maps to center of its table column
+    const nCols = leadMax - leadMin + 1;
+    const colW = w / nCols;
+    const plotLeft = colW / 2;
+    const plotRight = colW / 2;
+    const xForLead = lead => (lead - leadMin + 0.5) * colW;
     const yForValue = val => PLOT_TOP + (1 - (val - yMin) / (yMax - yMin)) * (plotBottom - PLOT_TOP);
 
     ctx.clearRect(0, 0, w, h);
 
-    // Grid
+    // Full-width grid
     ctx.strokeStyle = 'rgba(255,255,255,0.035)';
     ctx.lineWidth = 1;
     for (let i = 0; i <= 4; i++) {
       const y = yForValue(yMin + (yMax - yMin) * i / 4);
-      ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(w - PAD.right, y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
     }
-    ctx.fillStyle = '#444';
-    ctx.font = '10px "DM Sans", system-ui';
-    ctx.textAlign = 'right';
-    for (let i = 0; i <= 4; i++) {
-      const v = yMin + (yMax - yMin) * i / 4;
-      ctx.fillText(yTickFmt(v), PAD.left - 6, yForValue(v) + 3);
-    }
-    ctx.textAlign = 'center';
-    ctx.font = '10px "DM Sans", system-ui';
-    for (let d = leadMin; d <= leadMax; d++) ctx.fillText(d, xForLead(d), h - 6);
-
     ctx.save();
     ctx.beginPath();
-    ctx.rect(PAD.left, PLOT_TOP, w - PAD.left - PAD.right, plotBottom - PLOT_TOP);
+    ctx.rect(0, PLOT_TOP, w, plotBottom - PLOT_TOP);
     ctx.clip();
 
     const stat = activeStat;
-    const color = STAT_COLORS[stat] || '#888';
+    const color = statColor(stat);
     const data = seriesFor(stat);
     const points = [];
-    for (let i = 0; i < data.length; i++) if (data[i] !== null) points.push({ x: xForLead(leadMin + i), y: yForValue(data[i]) });
+    let firstDataVal = null;
+    let lastDataVal = null;
+    for (let i = 0; i < data.length; i++) {
+      if (data[i] !== null) {
+        points.push({ x: xForLead(leadMin + i), y: yForValue(data[i]) });
+        if (firstDataVal === null) firstDataVal = data[i];
+        lastDataVal = data[i];
+      }
+    }
     if (points.length >= 2) {
       ctx.beginPath(); drawSmoothLine(ctx, points);
       ctx.lineTo(points[points.length - 1].x, yForValue(yMin)); ctx.lineTo(points[0].x, yForValue(yMin)); ctx.closePath();
@@ -252,6 +250,73 @@
 
     ctx.restore();
 
+    // Y-axis labels: left margin at x=0
+    ctx.font = '9px "DM Sans", system-ui';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    for (let i = 0; i <= 4; i++) {
+      const v = yMin + (yMax - yMin) * i / 4;
+      const y = yForValue(v);
+      const txt = yTickFmt(v);
+      ctx.fillStyle = 'rgba(140,148,160,0.55)';
+      ctx.fillText(txt, 2, y);
+    }
+
+    // Right margin: spread bar between first and last values
+    if (firstDataVal !== null && lastDataVal !== null) {
+      const y1 = yForValue(firstDataVal);
+      const y2 = yForValue(lastDataVal);
+      const yTop = Math.min(y1, y2);
+      const yBot = Math.max(y1, y2);
+      const barX = w - plotRight / 2;
+
+      // Vertical spread bar
+      ctx.strokeStyle = color + '44';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(barX, yTop); ctx.lineTo(barX, yBot); ctx.stroke();
+
+      // End caps
+      const capW = 4;
+      ctx.strokeStyle = color + '88';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(barX - capW, yTop); ctx.lineTo(barX + capW, yTop); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(barX - capW, yBot); ctx.lineTo(barX + capW, yBot); ctx.stroke();
+
+      // Labels at top and bottom
+      ctx.font = '600 8px "DM Sans", system-ui';
+      ctx.textAlign = 'center';
+      const topVal = firstDataVal > lastDataVal ? firstDataVal : lastDataVal;
+      const botVal = firstDataVal > lastDataVal ? lastDataVal : firstDataVal;
+      ctx.textBaseline = 'bottom';
+      ctx.fillStyle = color + 'cc';
+      ctx.fillText(yTickFmt(topVal), barX, yTop - 2);
+      ctx.textBaseline = 'top';
+      ctx.fillText(yTickFmt(botVal), barX, yBot + 2);
+
+      // Per-day rate in the middle of the bar
+      const nDays = leadMax - leadMin;
+      if (nDays > 0 && yBot - yTop > 20) {
+        const delta = lastDataVal - firstDataVal;
+        const perDay = delta / nDays;
+        const sign = perDay >= 0 ? '+' : '';
+        const arrow = perDay > 0 ? '\u2191' : perDay < 0 ? '\u2193' : '';
+        const rateTxt = `${arrow}${sign}${perDay.toFixed(2)}/d`;
+        ctx.font = '600 7px "DM Sans", system-ui';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const midY = (yTop + yBot) / 2;
+        // Backdrop pill
+        const tw = ctx.measureText(rateTxt).width;
+        ctx.fillStyle = 'rgba(12,15,22,0.85)';
+        ctx.fillRect(barX - tw / 2 - 3, midY - 6, tw + 6, 12);
+        ctx.fillStyle = color + 'cc';
+        ctx.fillText(rateTxt, barX, midY);
+      }
+    }
+
+
+    ctx.textBaseline = 'alphabetic';
+
     // Lead cursor (scrub or locked position)
     const hl = chartLead;
     if (hl >= leadMin && hl <= leadMax) {
@@ -263,12 +328,12 @@
         const st = activeStat;
         const val = interpValue(seriesFor(st), hl);
         if (val !== null) {
-          const c = STAT_COLORS[st] || '#888';
+          const c = statColor(st);
           const y = yForValue(val);
           ctx.beginPath(); ctx.arc(hx, y, 7, 0, Math.PI * 2); ctx.fillStyle = c + '20'; ctx.fill();
           ctx.beginPath(); ctx.arc(hx, y, 4, 0, Math.PI * 2); ctx.fillStyle = c; ctx.fill();
           const units = leadData[0]?.stats?.[st]?.units || '';
-          const label = `${val.toFixed(2)} ${units}`;
+          const label = `Day ${Math.round(hl)} · ${val.toFixed(2)} ${units}`;
           ctx.save();
           ctx.font = '600 11px "DM Sans", system-ui';
           ctx.textAlign = 'center';
@@ -278,8 +343,8 @@
           const padY = 10;
           const halfW = tw / 2 + padX;
           let lx = hx;
-          const xMin = PAD.left + halfW + 2;
-          const xMax = w - PAD.right - halfW - 2;
+          const xMin = plotLeft + halfW + 2;
+          const xMax = w - plotRight - halfW - 2;
           if (lx < xMin) lx = xMin;
           if (lx > xMax) lx = xMax;
           const bx = lx - tw / 2 - padX;
@@ -309,7 +374,9 @@
     if (!canvasEl) return ui.leadFractional;
     const rect = canvasEl.parentElement.getBoundingClientRect();
     const mx = clientX - rect.left;
-    let lead = leadMin + ((mx - PAD.left) / (rect.width - PAD.left - PAD.right)) * (leadMax - leadMin);
+    const nCols = leadMax - leadMin + 1;
+    const colW = rect.width / nCols;
+    let lead = leadMin + mx / colW - 0.5;
     lead = Math.max(leadMin, Math.min(leadMax, lead));
     return Math.round(lead * 10) / 10;
   }
@@ -600,16 +667,151 @@
     });
   });
 
+  function drawDummyChart() {
+    if (!dummyCanvasEl) return;
+    const rect = dummyCanvasEl.parentElement.getBoundingClientRect();
+    if (!rect.width) return;
+    const dpr = window.devicePixelRatio || 1;
+    dummyCanvasEl.width = rect.width * dpr;
+    dummyCanvasEl.height = rect.height * dpr;
+    dummyCanvasEl.style.width = rect.width + 'px';
+    dummyCanvasEl.style.height = rect.height + 'px';
+    const ctx = dummyCanvasEl.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const w = rect.width, h = rect.height;
+    const plotBottom = h - PAD.bottom;
+
+    const models = appConfig.models;
+    if (!models.length) return;
+    const n = leadMax - leadMin + 1;
+    if (n < 2) return;
+
+    // Deterministic mock data per model: each gets a unique curve
+    const allSeries = models.map((m, mi) => {
+      const seed = mi * 2.7 + 0.3;
+      return Array.from({ length: n }, (_, i) => {
+        const t = i / Math.max(1, n - 1);
+        return 4.2 + t * (9 + mi * 1.8) + Math.sin(i * 1.9 + seed) * 0.9 + Math.cos(i * 0.7 + seed * 1.3) * 0.6 + mi * 1.5;
+      });
+    });
+
+    // Global y range across all model series
+    let gMin = Infinity, gMax = -Infinity;
+    for (const s of allSeries) for (const v of s) { if (v < gMin) gMin = v; if (v > gMax) gMax = v; }
+    const yMin = gMin - 0.5;
+    const yMax = gMax + 0.5;
+    const ySpan = yMax - yMin;
+    const yTickFmt = ySpan < 2 ? v => v.toFixed(2) : v => v.toFixed(1);
+
+    // Column-aligned x: matches primary chart and table columns
+    const colW = w / n;
+    const plotLeft = colW / 2;
+    const plotRight = colW / 2;
+    const xForLead = lead => (lead - leadMin + 0.5) * colW;
+    const yForValue = val => PLOT_TOP + (1 - (val - yMin) / ySpan) * (plotBottom - PLOT_TOP);
+
+    ctx.clearRect(0, 0, w, h);
+
+    // Full-width grid
+    ctx.strokeStyle = 'rgba(255,255,255,0.035)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = yForValue(yMin + ySpan * i / 4);
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    }
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, PLOT_TOP, w, plotBottom - PLOT_TOP);
+    ctx.clip();
+
+    const activeModelKey = ui.model;
+    const termLabels = []; // { y, label, color, active }
+
+    // Draw dimmed lines first, then highlighted on top
+    const drawOrder = models.map((m, mi) => ({ m, mi, active: m.key === activeModelKey }));
+    drawOrder.sort((a, b) => (a.active ? 1 : 0) - (b.active ? 1 : 0));
+
+    for (const { m, mi, active } of drawOrder) {
+      const color = palette[m.key]?.border || '#888';
+      const values = allSeries[mi];
+      const points = values.map((v, i) => ({ x: xForLead(leadMin + i), y: yForValue(v) }));
+
+      const alpha = active ? 1.0 : 0.25;
+      const lineW = active ? 2.6 : 1.4;
+      const dotR = active ? 2.5 : 0;
+
+      // Fill under curve (active only)
+      if (active) {
+        ctx.beginPath(); drawSmoothLine(ctx, points);
+        ctx.lineTo(points[points.length - 1].x, yForValue(yMin));
+        ctx.lineTo(points[0].x, yForValue(yMin));
+        ctx.closePath();
+        ctx.fillStyle = color + '15'; ctx.fill();
+      }
+
+      ctx.globalAlpha = alpha;
+      ctx.beginPath(); drawSmoothLine(ctx, points);
+      ctx.strokeStyle = color; ctx.lineWidth = lineW; ctx.stroke();
+
+      if (dotR > 0) {
+        for (const p of points) {
+          ctx.beginPath(); ctx.arc(p.x, p.y, dotR, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+        }
+      }
+      ctx.globalAlpha = 1.0;
+
+      // Collect terminal label at last point
+      const lastVal = values[values.length - 1];
+      const shortLabel = m.label.length > 6 ? m.label.slice(0, 5) + '\u2026' : m.label;
+      termLabels.push({ y: yForValue(lastVal), label: shortLabel, color, active });
+    }
+
+    ctx.restore();
+
+    // Y-axis labels: left margin at x=0
+    ctx.font = '9px "DM Sans", system-ui';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    for (let i = 0; i <= 4; i++) {
+      const v = yMin + ySpan * i / 4;
+      const y = yForValue(v);
+      const txt = yTickFmt(v);
+      ctx.fillStyle = 'rgba(140,148,160,0.55)';
+      ctx.fillText(txt, 2, y);
+    }
+
+    // Right margin: terminal labels with collision resolution
+    termLabels.sort((a, b) => a.y - b.y);
+    const minGap = 10;
+    for (let pass = 0; pass < 4; pass++) {
+      for (let i = 1; i < termLabels.length; i++) {
+        const gap = termLabels[i].y - termLabels[i - 1].y;
+        if (gap < minGap) {
+          const nudge = (minGap - gap) / 2;
+          termLabels[i - 1].y -= nudge;
+          termLabels[i].y += nudge;
+        }
+      }
+    }
+    const marginCenterX = w - plotRight / 2;
+    ctx.font = '600 8px "DM Sans", system-ui';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (const t of termLabels) {
+      ctx.fillStyle = t.active ? t.color : t.color + '66';
+      ctx.fillText(t.label, marginCenterX, t.y);
+    }
+
+  }
+
   $effect(() => {
     const _ = [leadData, activeStat, winnerLeadKey, leadScrubLocked, chartLead];
-    requestAnimationFrame(() => drawChart());
+    requestAnimationFrame(() => { drawChart(); drawDummyChart(); });
   });
 </script>
 
 {#if ui.selectedRegion}
   <div class="panel" class:entering={panelEntering}>
-    <div class="panel-handle"></div>
-
     {#if loading}
       <div class="panel-loading">
         <div class="loading-dot"></div>
@@ -617,19 +819,17 @@
       </div>
     {:else if leadData.length > 0}
       <div class="panel-body">
-        <div class="panel-toolbar">
-          <div class="toolbar-title">
-            <span class="toolbar-heading" title="The chart shows only the highlighted metric. Click a stat card to switch.">Accuracy vs. lead time</span>
-            <span class="toolbar-location">{regionLabel()}</span>
-          </div>
-          <button class="close-btn" type="button" title="Close panel" aria-label="Close panel" onclick={closePanel}>
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphPanelClose}</svg>
-          </button>
-        </div>
-
         <div class="panel-content">
           <div class="chart-col">
             <div class="chart-section">
+              <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Ensemble Forecast</div>
+              <div class="lead-chart">
+                <canvas bind:this={dummyCanvasEl}></canvas>
+              </div>
+            </div>
+
+            <div class="chart-section">
+              <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Accuracy vs time — <span style:color={statColor(activeStat)}>{statLabel(activeStat) || activeStat}</span></div>
               <!-- svelte-ignore a11y_no_static_element_interactions -->
               <div
                 class="lead-chart"
@@ -647,9 +847,10 @@
             <div class="compare-section">
           <div
             class="section-label compare-section-label"
+            style:padding-left="{50 / nLeadCols}%"
             title={`For each lead day, which model wins on ${statLabel(ui.statistic)} for this drawn region and accumulation window (use the period selector next to the chart). The map and this table both use the statistic you pick in the stat cards.`}
           >
-            <span>Best model by day — {statLabel(ui.statistic)}</span>
+            <span>Best model by day — <span style:color={statColor(ui.statistic)}>{statLabel(ui.statistic)}</span></span>
           </div>
           {#if !isAccuracyStatistic}
             <div class="winners-loading">Domain winners apply to accuracy metrics only.</div>
@@ -700,6 +901,9 @@
           </div>
 
           <div class="side-strip">
+            <button class="close-btn" type="button" title="Close panel" aria-label="Close panel" onclick={closePanel}>
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphPanelClose}</svg>
+            </button>
             <div class="stat-grid">
               {#each chartStats as stat}
                 {@const s = statAtHoverLead(stat)}
@@ -708,7 +912,7 @@
                 <div
                   class="stat-card"
                   class:highlighted={activeStat === stat}
-                  style="--stat-color: {STAT_COLORS[stat] || '#888'}"
+                  style="--stat-color: {statColor(stat)}"
                   title={statisticTooltip(stat)}
                   onclick={() => { activeStat = stat; ui.statistic = stat; ui.activeWindow = null; onstatchange?.({ target: { value: stat } }); }}
                 >
@@ -719,9 +923,16 @@
               {/each}
             </div>
             <div class="strip-controls">
-              <select class="panel-model-select" value={ui.model} onchange={onmodelchange} aria-label="Model">
+              <select
+                class="panel-model-select"
+                value={ui.model}
+                onchange={onmodelchange}
+                aria-label="Forecast model for map and lead scrubber"
+                title={`Model driving the map overlay and lead slider. Lead days available for this model: ${leadMin}–${leadMax}.`}
+              >
                 {#each appConfig.models as m}
-                  <option value={m.key}>{m.label}</option>
+                  {@const lb = getModelLeadBounds(appConfig.models, m.key)}
+                  <option value={m.key}>{m.label} (leads {lb.min}–{lb.max})</option>
                 {/each}
               </select>
               <div class="period-seg">
@@ -771,11 +982,11 @@
     content: '';
     position: absolute;
     top: 0;
-    left: 32px;
-    right: 32px;
+    left: 40px;
+    right: 40px;
     height: 1px;
-    background: linear-gradient(90deg, transparent, var(--accent) 30%, var(--accent) 70%, transparent);
-    opacity: 0.25;
+    background: linear-gradient(90deg, transparent, var(--accent) 20%, var(--accent) 80%, transparent);
+    opacity: 0.2;
     border-radius: 1px;
     pointer-events: none;
   }
@@ -786,76 +997,12 @@
     from { transform: translateY(100%); opacity: 0.5; }
     to   { transform: translateY(0);    opacity: 1; }
   }
-  .panel-handle {
-    width: 28px;
-    height: 3px;
-    background: rgba(255,255,255,0.1);
-    border-radius: 2px;
-    margin: 7px auto 0;
-  }
-
   /* ── Body layout ── */
   .panel-body {
     display: flex;
     flex-direction: column;
-    gap: 6px;
-    padding: 4px 16px 12px;
-  }
-
-  /* ── Toolbar (minimal: title + close) ── */
-  .panel-toolbar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 12px;
-    min-height: 24px;
-    padding: 0 0 2px;
-  }
-  .toolbar-title {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    min-width: 0;
-    flex-shrink: 1;
-    overflow: hidden;
-  }
-  .toolbar-heading {
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    color: var(--text-secondary);
-    white-space: nowrap;
-    flex-shrink: 0;
-  }
-  .toolbar-location {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text-primary);
-    opacity: 0.55;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    min-width: 0;
-  }
-  .close-btn {
-    width: 26px;
-    height: 26px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border: 1px solid var(--panel-border);
-    border-radius: 6px;
-    background: var(--surface);
-    color: var(--text-secondary);
-    cursor: pointer;
-    transition: all 0.15s;
-    flex-shrink: 0;
-  }
-  .close-btn:hover {
-    color: #ff8a8a;
-    background: rgba(255, 107, 107, 0.1);
-    border-color: rgba(255, 107, 107, 0.28);
+    gap: 0;
+    padding: 6px 16px 10px;
   }
 
   /* ── Content row: chart column + stat cards ── */
@@ -873,20 +1020,29 @@
   }
   .chart-section {
     min-width: 0;
+    position: relative;
+  }
+  .chart-label {
+    position: absolute;
+    top: 6px;
+    pointer-events: none;
   }
   .lead-chart {
     width: 100%;
-    height: 150px;
+    height: 100px;
     position: relative;
     cursor: crosshair;
     touch-action: none;
-    border-radius: 8px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
   .lead-chart.lead-locked {
     box-shadow: inset 0 0 0 1px rgba(110, 181, 255, 0.35);
     cursor: pointer;
   }
-  .lead-chart canvas { width: 100%; height: 100%; }
+  .lead-chart canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 
   /* ── Side strip: stats + controls ── */
   .side-strip {
@@ -895,6 +1051,27 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
+  }
+  .close-btn {
+    align-self: flex-end;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--panel-border);
+    border-radius: 5px;
+    background: var(--surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+    flex-shrink: 0;
+    margin-bottom: 2px;
+  }
+  .close-btn:hover {
+    color: #ff8a8a;
+    background: rgba(255, 107, 107, 0.1);
+    border-color: rgba(255, 107, 107, 0.28);
   }
   .stat-grid {
     display: grid;
@@ -910,22 +1087,28 @@
   /* ── Model selector ── */
   .panel-model-select {
     width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
     background: var(--surface);
     color: var(--text-primary);
-    border: 1px solid var(--panel-border);
+    border: 1px solid color-mix(in srgb, var(--panel-border) 85%, transparent);
     border-radius: 6px;
-    font-size: 13px;
+    font-size: 12px;
     font-family: inherit;
-    font-weight: 500;
-    padding: 7px 26px 7px 10px;
+    font-weight: 400;
+    padding: 5px 22px 5px 8px;
     cursor: pointer;
     outline: none;
     -webkit-appearance: none;
     appearance: none;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'%3E%3Cpath fill='%237a818c' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
     background-repeat: no-repeat;
-    background-position: right 8px center;
-    transition: border-color 0.15s;
+    background-position: right 7px center;
+    transition: border-color 0.15s, background-color 0.15s;
+  }
+  .panel-model-select:hover {
+    border-color: var(--panel-border);
+    background-color: color-mix(in srgb, var(--surface) 92%, #fff 8%);
   }
   .panel-model-select:focus { border-color: var(--accent); }
   .panel-model-select option {
@@ -1198,11 +1381,14 @@
       gap: 6px;
     }
     .panel-model-select {
-      width: auto;
-      flex: 1;
-      min-width: 120px;
-      min-height: 40px;
-      font-size: 14px;
+      flex: 1 1 auto;
+      min-width: 0;
+      max-width: min(220px, 100%);
+      width: 100%;
+      min-height: 36px;
+      font-size: 12px;
+      padding-top: 6px;
+      padding-bottom: 6px;
     }
     .period-seg {
       flex: 1;
@@ -1218,7 +1404,7 @@
       padding: 8px 12px;
       flex: 1;
     }
-    .lead-chart { height: 140px; }
+    .lead-chart { height: 90px; }
     .close-btn {
       min-width: 44px;
       min-height: 44px;

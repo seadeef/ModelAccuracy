@@ -253,7 +253,7 @@
     typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches,
   );
 
-  let pulseFrameId = 0;
+  let pinPulseFrameId = 0;
 
   /** Ignore synthetic mouse events shortly after touch (rectangle draw). */
   let suppressMouseDrawUntil = 0;
@@ -365,7 +365,7 @@
     return ringSignedArea2(ring) < 0 ? [...ring].reverse() : ring;
   }
 
-  /** Dim outside selection: viewport-sized fill with a hole. Point: no dim (pin pulse only). */
+  /** Dim outside selection: viewport-sized fill with a hole. Point: no dim. */
   function dimMaskGeoJson(region) {
     if (!region) return emptyFeatureCollection();
     if (region.type === 'point') return emptyFeatureCollection();
@@ -405,53 +405,42 @@
   }
 
   const DEFAULT_LINE_WIDTH = 2;
-  const DEFAULT_LINE_OPACITY = 1;
   const DEFAULT_POINT_RADIUS = 6;
   const DEFAULT_POINT_OPACITY = 1;
 
-  function stopPulseAnimation() {
-    if (pulseFrameId) {
-      cancelAnimationFrame(pulseFrameId);
-      pulseFrameId = 0;
+  function stopPinPulse() {
+    if (pinPulseFrameId) {
+      cancelAnimationFrame(pinPulseFrameId);
+      pinPulseFrameId = 0;
     }
     if (!map) return;
-    if (map.getLayer(drawLineLayerId)) {
-      map.setPaintProperty(drawLineLayerId, 'line-width', DEFAULT_LINE_WIDTH);
-      map.setPaintProperty(drawLineLayerId, 'line-opacity', DEFAULT_LINE_OPACITY);
-    }
     if (map.getLayer(drawPointLayerId)) {
       map.setPaintProperty(drawPointLayerId, 'circle-radius', DEFAULT_POINT_RADIUS);
       map.setPaintProperty(drawPointLayerId, 'circle-opacity', DEFAULT_POINT_OPACITY);
     }
   }
 
-  function startPulseAnimation() {
-    stopPulseAnimation();
-    if (!map || !ui.selectedRegion) return;
+  /** Breathing animation for the map pin only (not rectangle / polygon outlines). */
+  function startPinPulse() {
+    stopPinPulse();
+    if (!map || ui.selectedRegion?.type !== 'point') return;
 
     const tick = (t) => {
-      if (!map || !ui.selectedRegion) {
-        stopPulseAnimation();
+      if (!map || ui.selectedRegion?.type !== 'point') {
+        stopPinPulse();
         return;
       }
       const phase = (t / 1000) * Math.PI * 2;
       const s = 0.5 + 0.5 * Math.sin(phase);
-      const lineW = 1.6 + 1.4 * s;
-      const lineOp = 0.62 + 0.38 * (0.5 + 0.5 * Math.sin(phase + 0.6));
       const ptR = 5 + 4 * s;
       const ptOp = 0.72 + 0.28 * (0.5 + 0.5 * Math.sin(phase + 0.4));
-
-      if (map.getLayer(drawLineLayerId)) {
-        map.setPaintProperty(drawLineLayerId, 'line-width', lineW);
-        map.setPaintProperty(drawLineLayerId, 'line-opacity', lineOp);
-      }
       if (map.getLayer(drawPointLayerId)) {
         map.setPaintProperty(drawPointLayerId, 'circle-radius', ptR);
         map.setPaintProperty(drawPointLayerId, 'circle-opacity', ptOp);
       }
-      pulseFrameId = requestAnimationFrame(tick);
+      pinPulseFrameId = requestAnimationFrame(tick);
     };
-    pulseFrameId = requestAnimationFrame(tick);
+    pinPulseFrameId = requestAnimationFrame(tick);
   }
 
   function initDrawLayers() {
@@ -461,7 +450,7 @@
     map.addLayer({
       id: drawFillLayerId, type: 'fill', source: drawSourceId,
       filter: ['any', ['==', '$type', 'Polygon']],
-      paint: { 'fill-color': '#ff6b35', 'fill-opacity': 0.22 },
+      paint: { 'fill-color': '#26d9e8', 'fill-opacity': 0.22 },
     });
     map.addLayer(
       {
@@ -475,20 +464,25 @@
       },
       drawFillLayerId,
     );
+    const lineFilter = ['any', ['==', '$type', 'Polygon'], ['==', '$type', 'LineString']];
     map.addLayer({
       id: drawLineLayerId, type: 'line', source: drawSourceId,
-      filter: ['any', ['==', '$type', 'Polygon'], ['==', '$type', 'LineString']],
-      paint: { 'line-color': '#ff4500', 'line-width': 2 },
+      filter: lineFilter,
+      paint: { 'line-color': '#26d9e8', 'line-width': DEFAULT_LINE_WIDTH },
     });
     map.addLayer({
       id: drawPointLayerId, type: 'circle', source: drawSourceId,
       filter: ['==', '$type', 'Point'],
-      paint: { 'circle-radius': 6, 'circle-color': '#ff6b35', 'circle-stroke-color': '#fff', 'circle-stroke-width': 2 },
+      paint: {
+        'circle-radius': DEFAULT_POINT_RADIUS,
+        'circle-color': '#26d9e8',
+        'circle-stroke-color': '#fff',
+        'circle-stroke-width': 2,
+      },
     });
-    // `map` is not reactive; sync dim/pulse once layers exist.
+    // `map` is not reactive; sync dim once layers exist.
     updateDimMask();
-    if (ui.selectedRegion) startPulseAnimation();
-    else stopPulseAnimation();
+    if (ui.selectedRegion?.type === 'point') startPinPulse();
   }
 
   function updateDrawSource(geojson) {
@@ -743,13 +737,13 @@
     }
   });
 
-  // Dim outside selection + pulse draw outline while a region is active
+  // Dim outside selection; pulse the pin only when the saved region is a point
   $effect(() => {
     const region = ui.selectedRegion;
     if (!map?.getSource(dimSourceId)) return;
     updateDimMask();
-    if (region) startPulseAnimation();
-    else stopPulseAnimation();
+    if (region?.type === 'point') startPinPulse();
+    else stopPinPulse();
   });
 
   // Reactive opacity
@@ -859,7 +853,7 @@
       coarseMql.removeEventListener('change', coarseMqlHandler);
     }
     document.removeEventListener('keydown', handleKeyDown);
-    stopPulseAnimation();
+    stopPinPulse();
     clearOverlayApplySchedule();
     if (map) {
       map.remove();
@@ -965,7 +959,6 @@
     border-radius: 16px;
     box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
     max-width: min(340px, calc(100vw - 40px));
-    animation: draw-tooltip-pulse 4s ease-in-out infinite;
   }
   @media (max-width: 640px) {
     .draw-hint {
@@ -1018,10 +1011,6 @@
     border: 2px dashed rgba(255, 255, 255, 0.25);
     border-radius: 14px;
     color: var(--accent, #6eb5ff);
-  }
-  @keyframes draw-tooltip-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.8; }
   }
   .draw-hint-text {
     font-size: 16px;
