@@ -5,7 +5,7 @@
     PERIOD_HELP,
     SEASON_PERIOD_HELP,
   } from '../helpText.js';
-  import { fetchStatsAllLeads, fetchLeadWinnersForRegion } from '../api.js';
+  import { fetchStatsAllLeads, fetchLeadWinnersForRegion, fetchForecastAllModels } from '../api.js';
   import { downloadPanelStatsCsv } from '../exportPanelStatsCsv.js';
   import { getModelLeadBounds } from '../tile.js';
   import { modelPalette, statColor } from '../palette.js';
@@ -14,7 +14,9 @@
   let { onleadchange, onstatchange, onperiodchange, onmodelchange } = $props();
 
   let canvasEl;
-  let dummyCanvasEl;
+  let ensembleForecastCanvasEl;
+  /** Wraps forecast + accuracy chart sections; shared X for lead scrub / hover. */
+  let chartTrackRegionEl;
   let loading = $state(false);
   let leadData = $state([]);
   /** Chart / card highlight; must match `ui.statistic` when the panel opens (map layer). */
@@ -30,6 +32,11 @@
   let winnersLoading = $state(false);
   let winnersGen = 0;
   let leadFetchGen = 0;
+
+  /** ``POST /api/stats/forecast`` — all models × leads for the map region (yearly precip). */
+  let forecastPayload = $state(null);
+  let lastForecastGeoKey = '';
+  let forecastFetchGen = 0;
 
   /** Coalesce chart scrub → map updates to one per frame (reduces overlapping MapLibre `updateImage` / AbortError). */
   let chartScrubRafId = 0;
@@ -137,6 +144,106 @@
     if (data[lo] === null) return data[hi];
     if (data[hi] === null) return data[lo];
     return data[lo] + (data[hi] - data[lo]) * (i - lo);
+  }
+
+  /** Per-lead forecast values for one model (aligned to leadMin..leadMax). */
+  function forecastSeriesArray(modelKey) {
+    const leadsObj = forecastPayload?.models?.[modelKey]?.leads;
+    if (!leadsObj) return null;
+    const n = leadMax - leadMin + 1;
+    const arr = [];
+    for (let i = 0; i < n; i++) {
+      const cell = leadsObj[String(leadMin + i)];
+      if (!cell || cell.no_data || cell.value == null) arr.push(null);
+      else {
+        const v = Number(cell.value);
+        arr.push(Number.isFinite(v) ? v : null);
+      }
+    }
+    return arr;
+  }
+
+  function forecastUnitsForModel(modelKey) {
+    const leadsObj = forecastPayload?.models?.[modelKey]?.leads;
+    if (!leadsObj) return '';
+    for (let d = leadMin; d <= leadMax; d++) {
+      const u = leadsObj[String(d)]?.units;
+      if (u) return u;
+    }
+    return '';
+  }
+
+  function forecastAtChartLead(modelKey, hl) {
+    const arr = forecastSeriesArray(modelKey);
+    if (!arr) return null;
+    const v = interpValue(arr, hl);
+    if (v === null) return null;
+    return { value: v, units: forecastUnitsForModel(modelKey) };
+  }
+
+  /** Validity date for forecast lead (API rule: ``initDate`` + ``lead`` calendar days, UTC). */
+  function forecastValidDateIso(modelKey, leadDay) {
+    const pm = forecastPayload?.forecast_calendar?.per_model?.[modelKey];
+    const init = pm?.initDate;
+    if (!init || typeof init !== 'string') return null;
+    const parts = init.trim().split('-').map((p) => parseInt(p, 10));
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) return null;
+    const [yy, mm, dd] = parts;
+    const lead = Math.round(Number(leadDay));
+    const ms = Date.UTC(yy, mm - 1, dd) + lead * 86400000;
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+
+  function forecastValidDateDisplay(modelKey, leadDay) {
+    const iso = forecastValidDateIso(modelKey, leadDay);
+    if (!iso) return null;
+    const [y, m, d] = iso.split('-').map((x) => parseInt(x, 10));
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    return dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+  }
+
+  /** Short date without year (e.g. "Mar 15"). */
+  function forecastDateShort(modelKey, leadDay) {
+    const iso = forecastValidDateIso(modelKey, leadDay);
+    if (!iso) return null;
+    const [y, m, d] = iso.split('-').map((x) => parseInt(x, 10));
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    return dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+  }
+
+  /**
+   * Whole days between today (UTC) and the forecast valid date for ``leadDay``.
+   * Not the same as ``leadDay`` once the app stays open past a model cycle: e.g.
+   * a 12Z run from "yesterday" with lead=2 is only T+1d from today.
+   */
+  function leadFromToday(modelKey, leadDay) {
+    const iso = forecastValidDateIso(modelKey, leadDay);
+    if (!iso) return null;
+    const [y, m, d] = iso.split('-').map((x) => parseInt(x, 10));
+    const validMs = Date.UTC(y, m - 1, d);
+    const now = new Date();
+    const todayMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+    return Math.round((validMs - todayMs) / 86400000);
+  }
+
+  function formatLeadFromToday(modelKey, leadDay, fallbackRoundLead) {
+    const n = leadFromToday(modelKey, leadDay);
+    if (n == null) return `Day ${fallbackRoundLead}`;
+    return `T${n >= 0 ? '+' : ''}${n}d`;
+  }
+
+  /** Date range string for a model's lead bounds (e.g. "Mar 15 – Mar 29"). */
+  function forecastDateRange(modelKey) {
+    const lb = getModelLeadBounds(appConfig.models, modelKey);
+    const start = forecastDateShort(modelKey, lb.min);
+    const end = forecastDateShort(modelKey, lb.max);
+    if (start && end) return `${start} – ${end}`;
+    return null;
+  }
+
+  function redrawLeadCharts() {
+    drawChart();
+    drawEnsembleForecastChart();
   }
 
   /**
@@ -333,7 +440,7 @@
           ctx.beginPath(); ctx.arc(hx, y, 7, 0, Math.PI * 2); ctx.fillStyle = c + '20'; ctx.fill();
           ctx.beginPath(); ctx.arc(hx, y, 4, 0, Math.PI * 2); ctx.fillStyle = c; ctx.fill();
           const units = leadData[0]?.stats?.[st]?.units || '';
-          const label = `Day ${Math.round(hl)} · ${val.toFixed(2)} ${units}`;
+          const label = units ? `${val.toFixed(2)} ${units}` : val.toFixed(2);
           ctx.save();
           ctx.font = '600 11px "DM Sans", system-ui';
           ctx.textAlign = 'center';
@@ -371,8 +478,9 @@
   }
 
   function leadFromClientX(clientX) {
-    if (!canvasEl) return ui.leadFractional;
-    const rect = canvasEl.parentElement.getBoundingClientRect();
+    const trackEl = chartTrackRegionEl ?? canvasEl?.parentElement;
+    if (!trackEl) return ui.leadFractional;
+    const rect = trackEl.getBoundingClientRect();
     const mx = clientX - rect.left;
     const nCols = leadMax - leadMin + 1;
     const colW = rect.width / nCols;
@@ -389,10 +497,10 @@
     hoverLead = L;
     ui.leadFractional = L;
     onleadchange?.(L);
-    drawChart();
+    redrawLeadCharts();
   }
 
-  function handleChartMouseMove(e) {
+  function handleChartsTrackMouseMove(e) {
     if (!canvasEl || leadData.length === 0 || leadScrubLocked) return;
     const lead = leadFromClientX(e.clientX);
     if (lead === hoverLead) return;
@@ -402,7 +510,7 @@
     }
   }
 
-  function handleChartMouseLeave() {
+  function handleChartsTrackMouseLeave() {
     if (chartScrubRafId) {
       cancelAnimationFrame(chartScrubRafId);
       chartScrubRafId = 0;
@@ -410,10 +518,10 @@
     pendingScrubLead = null;
     if (leadScrubLocked) return;
     hoverLead = null;
-    drawChart();
+    redrawLeadCharts();
   }
 
-  function handleLeadChartPointerDown(e) {
+  function handleChartsTrackPointerDown(e) {
     if (e.button !== 0 || leadData.length === 0) return;
     scrubPointerDown = { x: e.clientX, y: e.clientY, t: Date.now() };
     try {
@@ -423,7 +531,7 @@
     }
   }
 
-  function handleLeadChartPointerUp(e) {
+  function handleChartsTrackPointerUp(e) {
     if (e.button !== 0 || leadData.length === 0) return;
     const down = scrubPointerDown;
     scrubPointerDown = null;
@@ -439,7 +547,7 @@
 
     if (leadScrubLocked) {
       leadScrubLocked = false;
-      drawChart();
+      redrawLeadCharts();
       return;
     }
     const lead = leadFromClientX(e.clientX);
@@ -447,10 +555,10 @@
     hoverLead = null;
     ui.leadFractional = lead;
     onleadchange?.(lead);
-    drawChart();
+    redrawLeadCharts();
   }
 
-  function handleLeadChartPointerCancel(e) {
+  function handleChartsTrackPointerCancel(e) {
     scrubPointerDown = null;
     try {
       e.currentTarget.releasePointerCapture(e.pointerId);
@@ -667,16 +775,43 @@
     });
   });
 
-  function drawDummyChart() {
-    if (!dummyCanvasEl) return;
-    const rect = dummyCanvasEl.parentElement.getBoundingClientRect();
+  $effect(() => {
+    const region = ui.selectedRegion;
+    if (!region) {
+      lastForecastGeoKey = '';
+      forecastFetchGen += 1;
+      forecastPayload = null;
+      return;
+    }
+    const geo = regionGeometryKey(region);
+    if (!geo) {
+      lastForecastGeoKey = '';
+      forecastFetchGen += 1;
+      forecastPayload = null;
+      return;
+    }
+    if (geo === lastForecastGeoKey) return;
+    lastForecastGeoKey = geo;
+    const fid = forecastFetchGen + 1;
+    forecastFetchGen = fid;
+    queueMicrotask(async () => {
+      const data = await fetchForecastAllModels({ region });
+      if (fid !== forecastFetchGen) return;
+      forecastPayload = data?.models ? data : null;
+    });
+  });
+
+  /** Multi-model forecast curves from ``POST /api/stats/forecast`` only (no synthetic data). */
+  function drawEnsembleForecastChart() {
+    if (!ensembleForecastCanvasEl) return;
+    const rect = ensembleForecastCanvasEl.parentElement.getBoundingClientRect();
     if (!rect.width) return;
     const dpr = window.devicePixelRatio || 1;
-    dummyCanvasEl.width = rect.width * dpr;
-    dummyCanvasEl.height = rect.height * dpr;
-    dummyCanvasEl.style.width = rect.width + 'px';
-    dummyCanvasEl.style.height = rect.height + 'px';
-    const ctx = dummyCanvasEl.getContext('2d');
+    ensembleForecastCanvasEl.width = rect.width * dpr;
+    ensembleForecastCanvasEl.height = rect.height * dpr;
+    ensembleForecastCanvasEl.style.width = rect.width + 'px';
+    ensembleForecastCanvasEl.style.height = rect.height + 'px';
+    const ctx = ensembleForecastCanvasEl.getContext('2d');
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const w = rect.width, h = rect.height;
     const plotBottom = h - PAD.bottom;
@@ -686,21 +821,55 @@
     const n = leadMax - leadMin + 1;
     if (n < 2) return;
 
-    // Deterministic mock data per model: each gets a unique curve
-    const allSeries = models.map((m, mi) => {
-      const seed = mi * 2.7 + 0.3;
+    const byModel = forecastPayload?.models;
+    if (!byModel || typeof byModel !== 'object') {
+      ctx.clearRect(0, 0, w, h);
+      ctx.strokeStyle = 'rgba(255,255,255,0.035)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++) {
+        const y = PLOT_TOP + ((plotBottom - PLOT_TOP) * i) / 4;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+      }
+      return;
+    }
+
+    const allSeries = models.map((m) => {
+      const leadsObj = byModel[m.key]?.leads;
       return Array.from({ length: n }, (_, i) => {
-        const t = i / Math.max(1, n - 1);
-        return 4.2 + t * (9 + mi * 1.8) + Math.sin(i * 1.9 + seed) * 0.9 + Math.cos(i * 0.7 + seed * 1.3) * 0.6 + mi * 1.5;
+        const leadDay = leadMin + i;
+        const cell = leadsObj?.[String(leadDay)];
+        if (!cell || cell.no_data || cell.value == null) return null;
+        const v = Number(cell.value);
+        return Number.isFinite(v) ? v : null;
       });
     });
 
-    // Global y range across all model series
-    let gMin = Infinity, gMax = -Infinity;
-    for (const s of allSeries) for (const v of s) { if (v < gMin) gMin = v; if (v > gMax) gMax = v; }
-    const yMin = gMin - 0.5;
-    const yMax = gMax + 0.5;
-    const ySpan = yMax - yMin;
+    let gMin = Infinity;
+    let gMax = -Infinity;
+    for (const s of allSeries) {
+      for (const v of s) {
+        if (v != null && Number.isFinite(v)) {
+          if (v < gMin) gMin = v;
+          if (v > gMax) gMax = v;
+        }
+      }
+    }
+    if (!Number.isFinite(gMin) || !Number.isFinite(gMax)) {
+      ctx.clearRect(0, 0, w, h);
+      ctx.strokeStyle = 'rgba(255,255,255,0.035)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++) {
+        const y = PLOT_TOP + ((plotBottom - PLOT_TOP) * i) / 4;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+      }
+      return;
+    }
+    const pad = Math.max((gMax - gMin) * 0.06, 1e-6);
+    gMin -= pad;
+    gMax += pad;
+    const yMin = gMin;
+    const yMax = gMax;
+    const ySpan = yMax - yMin || 1e-9;
     const yTickFmt = ySpan < 2 ? v => v.toFixed(2) : v => v.toFixed(1);
 
     // Column-aligned x: matches primary chart and table columns
@@ -724,6 +893,9 @@
     ctx.rect(0, PLOT_TOP, w, plotBottom - PLOT_TOP);
     ctx.clip();
 
+    /** Match stats chart area fill: ``fillStyle = hex + '15'`` (~8.2% alpha). Model colors are `hsl()`, so use alpha here. */
+    const FORECAST_AREA_FILL_ALPHA = 0x15 / 255;
+
     const activeModelKey = ui.model;
     const termLabels = []; // { y, label, color, active }
 
@@ -734,36 +906,47 @@
     for (const { m, mi, active } of drawOrder) {
       const color = palette[m.key]?.border || '#888';
       const values = allSeries[mi];
-      const points = values.map((v, i) => ({ x: xForLead(leadMin + i), y: yForValue(v) }));
+      const points = [];
+      for (let i = 0; i < values.length; i++) {
+        const v = values[i];
+        if (v != null) points.push({ x: xForLead(leadMin + i), y: yForValue(v) });
+      }
+      if (points.length === 0) continue;
 
-      const alpha = active ? 1.0 : 0.25;
-      const lineW = active ? 2.6 : 1.4;
+      const alpha = active ? 1.0 : 0.48;
+      const lineW = active ? 2.6 : 1.85;
       const dotR = active ? 2.5 : 0;
 
-      // Fill under curve (active only)
-      if (active) {
+      if (active && points.length >= 2) {
         ctx.beginPath(); drawSmoothLine(ctx, points);
         ctx.lineTo(points[points.length - 1].x, yForValue(yMin));
         ctx.lineTo(points[0].x, yForValue(yMin));
         ctx.closePath();
-        ctx.fillStyle = color + '15'; ctx.fill();
+        ctx.fillStyle = color;
+        ctx.globalAlpha = FORECAST_AREA_FILL_ALPHA;
+        ctx.fill();
+        ctx.globalAlpha = 1;
       }
 
       ctx.globalAlpha = alpha;
-      ctx.beginPath(); drawSmoothLine(ctx, points);
-      ctx.strokeStyle = color; ctx.lineWidth = lineW; ctx.stroke();
+      if (points.length >= 2) {
+        ctx.beginPath(); drawSmoothLine(ctx, points);
+        ctx.strokeStyle = color; ctx.lineWidth = lineW; ctx.stroke();
+      } else if (points.length === 1) {
+        ctx.beginPath(); ctx.arc(points[0].x, points[0].y, active ? 2.5 : 1.5, 0, Math.PI * 2);
+        ctx.fillStyle = color; ctx.fill();
+      }
 
-      if (dotR > 0) {
+      if (dotR > 0 && points.length >= 2) {
         for (const p of points) {
           ctx.beginPath(); ctx.arc(p.x, p.y, dotR, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
         }
       }
       ctx.globalAlpha = 1.0;
 
-      // Collect terminal label at last point
-      const lastVal = values[values.length - 1];
+      const lastPt = points[points.length - 1];
       const shortLabel = m.label.length > 6 ? m.label.slice(0, 5) + '\u2026' : m.label;
-      termLabels.push({ y: yForValue(lastVal), label: shortLabel, color, active });
+      termLabels.push({ y: lastPt.y, label: shortLabel, color, active });
     }
 
     ctx.restore();
@@ -798,15 +981,87 @@
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     for (const t of termLabels) {
-      ctx.fillStyle = t.active ? t.color : t.color + '66';
+      ctx.fillStyle = t.color;
+      ctx.globalAlpha = t.active ? 1 : 0.5;
       ctx.fillText(t.label, marginCenterX, t.y);
     }
+    ctx.globalAlpha = 1;
 
+    ctx.textBaseline = 'alphabetic';
+
+    const hlFc = chartLead;
+    if (hlFc >= leadMin && hlFc <= leadMax) {
+      const hx = xForLead(hlFc);
+      ctx.setLineDash([3, 3]);
+      ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(hx, PLOT_TOP);
+      ctx.lineTo(hx, plotBottom);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      const fc = forecastAtChartLead(ui.model, hlFc);
+      if (fc !== null) {
+        const c = palette[ui.model]?.border || '#6eb5ff';
+        const yPt = yForValue(fc.value);
+        ctx.beginPath();
+        ctx.arc(hx, yPt, 7, 0, Math.PI * 2);
+        ctx.fillStyle = c;
+        ctx.globalAlpha = 0x20 / 255;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.beginPath();
+        ctx.arc(hx, yPt, 4, 0, Math.PI * 2);
+        ctx.fillStyle = c;
+        ctx.fill();
+
+        const u = fc.units ? ` ${fc.units}` : '';
+        const leadStr = formatLeadFromToday(ui.model, hlFc, Math.round(hlFc));
+        const label = `${leadStr} · ${fc.value.toFixed(2)}${u}`;
+        ctx.save();
+        ctx.font = '600 11px "DM Sans", system-ui';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const tw = ctx.measureText(label).width;
+        const padX = 9;
+        const padY = 10;
+        const halfW = tw / 2 + padX;
+        let lx = hx;
+        const xMin = plotLeft + halfW + 2;
+        const xMax = w - plotRight - halfW - 2;
+        if (lx < xMin) lx = xMin;
+        if (lx > xMax) lx = xMax;
+        const bx = lx - tw / 2 - padX;
+        const by = HOVER_LABEL_Y - padY;
+        const bw = tw + padX * 2;
+        const bh = padY * 2;
+        ctx.fillStyle = 'rgba(12, 14, 20, 0.94)';
+        ctx.strokeStyle = c;
+        ctx.globalAlpha = 1;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(bx, by, bw, bh, 6);
+        } else {
+          ctx.rect(bx, by, bw, bh);
+        }
+        ctx.fill();
+        ctx.globalAlpha = 0x66 / 255;
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = c;
+        ctx.fillText(label, lx, HOVER_LABEL_Y);
+        ctx.restore();
+      }
+    }
   }
 
   $effect(() => {
-    const _ = [leadData, activeStat, winnerLeadKey, leadScrubLocked, chartLead];
-    requestAnimationFrame(() => { drawChart(); drawDummyChart(); });
+    // `ui.model` must be read here so the ensemble forecast chart re-highlights when the map model changes
+    // (forecast payload is keyed by region only, so it does not update on model-only changes).
+    const _ = [leadData, activeStat, winnerLeadKey, leadScrubLocked, chartLead, forecastPayload, ui.model];
+    requestAnimationFrame(() => { drawChart(); drawEnsembleForecastChart(); });
   });
 </script>
 
@@ -821,26 +1076,30 @@
       <div class="panel-body">
         <div class="panel-content">
           <div class="chart-col">
-            <div class="chart-section">
-              <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Ensemble Forecast</div>
-              <div class="lead-chart">
-                <canvas bind:this={dummyCanvasEl}></canvas>
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <div
+              class="charts-track-region"
+              class:lead-locked={leadScrubLocked}
+              bind:this={chartTrackRegionEl}
+              onmousemove={handleChartsTrackMouseMove}
+              onmouseleave={handleChartsTrackMouseLeave}
+              onpointerdown={handleChartsTrackPointerDown}
+              onpointerup={handleChartsTrackPointerUp}
+              onpointercancel={handleChartsTrackPointerCancel}
+              role="presentation"
+            >
+              <div class="chart-section">
+                <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Ensemble Forecast</div>
+                <div class="lead-chart">
+                  <canvas bind:this={ensembleForecastCanvasEl}></canvas>
+                </div>
               </div>
-            </div>
 
-            <div class="chart-section">
-              <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Accuracy vs time — <span style:color={statColor(activeStat)}>{statLabel(activeStat) || activeStat}</span></div>
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <div
-                class="lead-chart"
-                class:lead-locked={leadScrubLocked}
-                onmousemove={handleChartMouseMove}
-                onmouseleave={handleChartMouseLeave}
-                onpointerdown={handleLeadChartPointerDown}
-                onpointerup={handleLeadChartPointerUp}
-                onpointercancel={handleLeadChartPointerCancel}
-              >
-                <canvas bind:this={canvasEl}></canvas>
+              <div class="chart-section">
+                <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Accuracy vs time — <span style:color={statColor(activeStat)}>{statLabel(activeStat) || activeStat}</span></div>
+                <div class="lead-chart">
+                  <canvas bind:this={canvasEl}></canvas>
+                </div>
               </div>
             </div>
 
@@ -864,10 +1123,12 @@
                 <thead>
                   <tr>
                     {#each winnerTableRows as row}
+                      {@const dayDate = forecastDateShort(ui.model, row.day)}
                       <th
                         class="winners-day-head"
                         class:winners-col-current={row.day === winnerLeadKey}
-                      >{row.day}</th>
+                        title={dayDate ? `Lead ${row.day} — ${dayDate}` : `Lead ${row.day}`}
+                      >{dayDate ?? row.day}</th>
                     {/each}
                   </tr>
                 </thead>
@@ -927,12 +1188,13 @@
                 class="panel-model-select"
                 value={ui.model}
                 onchange={onmodelchange}
-                aria-label="Forecast model for map and lead scrubber"
-                title={`Model driving the map overlay and lead slider. Lead days available for this model: ${leadMin}–${leadMax}.`}
+                aria-label="Forecast model"
+                title={`Model driving the map overlay and lead slider. Leads ${leadMin}–${leadMax}.`}
               >
                 {#each appConfig.models as m}
+                  {@const dateRange = forecastDateRange(m.key)}
                   {@const lb = getModelLeadBounds(appConfig.models, m.key)}
-                  <option value={m.key}>{m.label} (leads {lb.min}–{lb.max})</option>
+                  <option value={m.key}>{m.label} ({dateRange ?? `leads ${lb.min}–${lb.max}`})</option>
                 {/each}
               </select>
               <div class="period-seg">
@@ -1018,6 +1280,19 @@
     flex-direction: column;
     gap: 4px;
   }
+  .charts-track-region {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+    cursor: crosshair;
+    touch-action: none;
+    border-radius: 6px;
+  }
+  .charts-track-region.lead-locked {
+    box-shadow: inset 0 0 0 1px rgba(110, 181, 255, 0.35);
+    cursor: pointer;
+  }
   .chart-section {
     min-width: 0;
     position: relative;
@@ -1037,10 +1312,6 @@
     display: flex;
     align-items: center;
     justify-content: center;
-  }
-  .lead-chart.lead-locked {
-    box-shadow: inset 0 0 0 1px rgba(110, 181, 255, 0.35);
-    cursor: pointer;
   }
   .lead-chart canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
 

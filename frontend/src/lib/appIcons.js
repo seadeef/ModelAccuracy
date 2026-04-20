@@ -25,3 +25,9 @@ export const glyphZipChevron = '<path d="M6 2l6 6-6 6"/>';
 
 /** Panel close; parent stroke-width="1.5" */
 export const glyphPanelClose = '<path d="M4 4l8 8M12 4l-8 8"/>';
+
+/** Save (floppy disk); parent fill="none" stroke="currentColor" stroke-width="1.3" */
+export const glyphSave = '<path d="M3 2.5h8.5L13.5 4.5V13a.5.5 0 01-.5.5H3a.5.5 0 01-.5-.5V3a.5.5 0 01.5-.5z"/><path d="M5 2.5V6h5.5V2.5"/><rect x="4.5" y="8.5" width="7" height="4" rx=".5"/>';
+
+/** Folder-open / load; parent fill="none" stroke="currentColor" stroke-width="1.3" */
+export const glyphLoad = '<path d="M2.5 4.5V12a1 1 0 001 1h9a1 1 0 001-1V6.5a1 1 0 00-1-1H8L6.5 4H3.5a1 1 0 00-1 .5z"/><path d="M2.5 7h11"/>';

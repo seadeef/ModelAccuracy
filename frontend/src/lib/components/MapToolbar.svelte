@@ -1,4 +1,9 @@
 <script>
+  import {
+    authSession,
+    beginCognitoSignIn,
+    signOutCognito,
+  } from '../authSession.svelte.js';
   import { ui } from '../state.svelte.js';
   import {
     glyphDownloadMap,
@@ -56,6 +61,22 @@
       <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphZipChevron}</svg>
     </button>
   </div>
+
+  {#if authSession.ready && authSession.mode === 'cognito'}
+    <div class="toolbar-sep auth-sep" aria-hidden="true"></div>
+    <div class="auth-block">
+      {#if authSession.hasSession}
+        <span class="auth-label" title={authSession.userLabel ?? 'Signed in'}>
+          {authSession.userLabel ?? 'Signed in'}
+        </span>
+        <button type="button" class="auth-btn" onclick={() => signOutCognito()}>Sign out</button>
+      {:else}
+        <button type="button" class="auth-btn auth-btn--primary" onclick={() => beginCognitoSignIn()}>
+          Sign in
+        </button>
+      {/if}
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -103,6 +124,47 @@
     color: #e8f3ff;
     border-color: rgba(110, 181, 255, 0.5);
   }
+  .auth-block {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    max-width: min(200px, 32vw);
+  }
+  .auth-label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .auth-btn {
+    flex-shrink: 0;
+    padding: 6px 12px;
+    border-radius: 9px;
+    border: 1px solid var(--panel-border);
+    background: var(--surface);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 600;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .auth-btn:hover {
+    background: var(--hover-bg);
+    border-color: rgba(255, 255, 255, 0.14);
+    color: var(--accent);
+  }
+  .auth-btn--primary {
+    background: linear-gradient(180deg, rgba(110, 181, 255, 0.2), rgba(110, 181, 255, 0.08));
+    border-color: rgba(110, 181, 255, 0.35);
+    color: #b8d9ff;
+  }
+  .auth-btn--primary:hover {
+    border-color: rgba(110, 181, 255, 0.5);
+    color: #e8f3ff;
+  }
   @media (max-width: 640px) {
     .map-toolbar {
       --toolbar-control-height: 40px;
@@ -113,7 +175,16 @@
       justify-content: flex-start;
       row-gap: 8px;
     }
-    .toolbar-sep {
+    .toolbar-sep:not(.auth-sep) {
+      display: none;
+    }
+    .auth-sep {
+      display: none;
+    }
+    .auth-block {
+      max-width: min(160px, 40vw);
+    }
+    .auth-label {
       display: none;
     }
     .opacity-row input[type='range'] {
