@@ -13,3 +13,4 @@ archive
 .venv
 venv
 *.md
+static_export/forecast

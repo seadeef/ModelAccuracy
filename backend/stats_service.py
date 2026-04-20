@@ -195,6 +195,7 @@ def query_forecast_all_models_payload(
     payload: ForecastAllModelsRequest,
     *,
     store: StaticStore | None = None,
+    forecast_store: StaticStore | None = None,
 ):
     resolved_store = store or LocalStaticStore(default_static_site_root())
     if not _data_exists(resolved_store):
@@ -202,8 +203,18 @@ def query_forecast_all_models_payload(
             {"error": _stats_data_missing_message(resolved_store)},
             status_code=500,
         )
+    if forecast_store is None:
+        return JSONResponse(
+            {
+                "error": "Forecast data is not configured. Run export_static.py --forecast "
+                "(local dev) or ensure the stats S3 bucket has a forecast/ prefix populated "
+                "(production; derived from MODELACCURACY_DATA_S3_URI)."
+            },
+            status_code=500,
+        )
 
     return forecast_all_models(
         store=resolved_store,
+        forecast_store=forecast_store,
         region=payload.region.model_dump(),
     )

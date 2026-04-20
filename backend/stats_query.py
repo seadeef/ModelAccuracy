@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -19,6 +20,50 @@ from statistics_plugins.registry import STATISTICS_BY_NAME
 _grid_cache: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, int, int]] = {}
 _bin_cache: dict[tuple, np.ndarray] = {}
 
+# Forecast data lives in a separate store (S3 prefix) updated daily without
+# redeploying the container.  TTL caches ensure new data is picked up.
+_FORECAST_TTL = 300
+_forecast_bin_cache: dict[tuple, tuple[np.ndarray, float]] = {}
+_forecast_calendar_cache: dict[str, tuple[dict | None, float]] = {}
+
+
+def _read_forecast_calendar(store: StaticStore) -> dict | None:
+    key = store.cache_key
+    cached = _forecast_calendar_cache.get(key)
+    if cached is not None:
+        val, ts = cached
+        if time.monotonic() - ts < _FORECAST_TTL:
+            return val
+    try:
+        raw = store.read_text("forecast_calendar.json")
+        cal = json.loads(raw)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        cal = None
+    _forecast_calendar_cache[key] = (cal, time.monotonic())
+    return cal
+
+
+def _get_forecast_bin(store: StaticStore, model: str, lead_key: str) -> np.ndarray:
+    cache_key = (store.cache_key, model, lead_key)
+    cached = _forecast_bin_cache.get(cache_key)
+    if cached is not None:
+        arr, ts = cached
+        if time.monotonic() - ts < _FORECAST_TTL:
+            return arr
+    raw_bytes = store.read_bytes(f"{model}/lead_{lead_key}.bin")
+    arr = np.frombuffer(raw_bytes, dtype=np.float32)
+    _forecast_bin_cache[cache_key] = (arr, time.monotonic())
+    return arr
+
+
+def _read_forecast_bin_or_none(
+    store: StaticStore, model: str, lead_key: str,
+) -> np.ndarray | None:
+    try:
+        return _get_forecast_bin(store, model, lead_key)
+    except (FileNotFoundError, OSError):
+        return None
+
 
 def _data_bin_relative_path(
     model: str,
@@ -28,11 +73,10 @@ def _data_bin_relative_path(
     month: str | None = None,
     season: str | None = None,
 ) -> Path:
-    effective_period = "yearly" if stat_name == "forecast" else period
     path = Path("data") / model / stat_name
-    if effective_period == "monthly" and month is not None:
+    if period == "monthly" and month is not None:
         path = path / "monthly" / month
-    elif effective_period == "seasonal" and season is not None:
+    elif period == "seasonal" and season is not None:
         path = path / "seasonal" / season
     return path / f"lead_{lead_key}.bin"
 
@@ -573,18 +617,20 @@ def lead_winners_for_region(
 def forecast_all_models(
     *,
     store: StaticStore,
+    forecast_store: StaticStore,
     region: dict,
 ) -> dict[str, object]:
     """Forecast values for all models × all leads for a region (yearly only).
 
-    Returns ``{models: {<model>: {leads: {<lead>: {value, units, no_data}}}}}``
-    in a single request suitable for one-time frontend caching.
+    *store* provides grids (``data/{model}/grid.json``).  *forecast_store* is
+    the separate forecast tree (``{model}/lead_{n}.bin``,
+    ``forecast_calendar.json``) that can be updated on S3 daily without
+    redeploying the container.
     """
     model_order = tuple(sorted(MODEL_REGISTRY.keys()))
-    stat_name = "forecast"
-    units = STATISTICS_BY_NAME[stat_name].spec.units
+    units = STATISTICS_BY_NAME["forecast"].spec.units
 
-    # Prefetch grids.
+    # Prefetch grids (from the stats store).
     for mk in model_order:
         _get_grid(store, mk)
 
@@ -595,14 +641,13 @@ def forecast_all_models(
         for lead in range(cfg.lead_days_min, cfg.lead_days_max + 1):
             tasks.append((mk, str(lead)))
 
-    # Fan out all reads in parallel.
+    # Fan out all reads in parallel (from the forecast store).
     bin_results: dict[tuple[str, str], np.ndarray | None] = {}
     max_workers = min(len(tasks), 20)
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         future_to_key = {
             ex.submit(
-                _read_bin_or_none, store, mk, stat_name, lead_key,
-                period="yearly", month=None, season=None,
+                _read_forecast_bin_or_none, forecast_store, mk, lead_key,
             ): (mk, lead_key)
             for mk, lead_key in tasks
         }
@@ -650,7 +695,11 @@ def forecast_all_models(
 
         models_out[mk] = {"leads": leads_out}
 
-    return {"models": models_out}
+    forecast_calendar = _read_forecast_calendar(forecast_store)
+    result: dict[str, object] = {"models": models_out}
+    if forecast_calendar is not None:
+        result["forecast_calendar"] = forecast_calendar
+    return result
 
 
 def stats_for_region_all_leads(

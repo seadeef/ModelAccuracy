@@ -309,12 +309,13 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
 
         # Convert GRIB2 → cropped .npy and delete GRIB2.
         # cfgrib is not thread-safe, so this runs sequentially.
+        # Pick up both freshly downloaded and previously stranded .grib2 files.
         grib_files = []
         for task, status in results:
-            if status.startswith("downloaded"):
-                grib = self._output_grib(task.init_date, task.fhour, task.level)
-                if grib.exists():
-                    grib_files.append(grib)
+            grib = self._output_grib(task.init_date, task.fhour, task.level)
+            npy = self._output_npy(task.init_date, task.fhour, task.level)
+            if grib.exists() and not npy.exists():
+                grib_files.append(grib)
         if grib_files:
             print(f"Converting {len(grib_files)} GRIB2 files to .npy...")
             for i, grib in enumerate(grib_files, 1):

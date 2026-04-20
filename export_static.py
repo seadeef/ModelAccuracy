@@ -6,10 +6,16 @@ Reads from stats_output/ and tiles_output/, writes to static_export/:
     static_export/                 ← upload this folder as the site root (S3, etc.)
         index.html
         assets/
-        data/                      ← URL prefix /data (grid, .bin only)
+        data/                      ← URL prefix /data (grid, verification .bin only)
             {model}/
                 grid.json
-                {stat}/…
+                {stat}/…           (bias, rmse, … — NOT forecast)
+        forecast/                  ← separate tree for forecast data (daily S3 uploads)
+            forecast_calendar.json
+            {model}/
+                lead_1.bin
+                lead_2.bin
+                …
         static/                    ← URL prefix /static (config, zip, tiles, ranges)
             config.json
             zip/
@@ -26,11 +32,17 @@ Build modes (at most one; omit all for a full export):
 
 * ``--static`` — only ``static_export/static/`` (config.json, zip JSON, tile PNGs, ranges).
 * ``--data`` — only ``static_export/data/`` (``.bin`` layers, ``grid.json``).
+* ``--forecast`` — only forecast layers + ``forecast_calendar.json`` under
+  ``static_export/forecast/``.  Designed for the daily update workflow: run
+  ``download.py --forecast``, then ``export_static.py --forecast``, then sync
+  ``static_export/forecast/`` to the ``forecast/`` prefix of the stats S3 bucket
+  (same bucket as ``MODELACCURACY_DATA_S3_URI``).  The running container picks
+  up new data within ~5 minutes.
 * ``--frontend`` — only site-root Vite output (``index.html``, ``assets/``); refreshes
   ``export_manifest.json``. Removes prior SPA artifacts first.
 
-``--clean`` deletes the entire output directory first; only allowed for a **full** export
-(no ``--static`` / ``--data`` / ``--frontend``).
+``--clean`` deletes the entire output directory first; only allowed for a **full**
+export (no ``--static`` / ``--data`` / ``--forecast`` / ``--frontend``).
 
 The .bin files are raw float32 arrays (row-major, height × width).
 
@@ -66,6 +78,7 @@ FRONTEND_ROOT = _PROJECT_ROOT / "frontend"
 # Served at /static (config, zip, tiles). ``data/`` is top-level → /data.
 STATIC_ASSETS_DIR_NAME = "static"
 DATA_DIR_NAME = "data"
+FORECAST_DIR_NAME = "forecast"
 
 
 def _get_forecast_init_date(model_key: str) -> str | None:
@@ -167,7 +180,7 @@ def export_data_layers(data_root: Path) -> None:
         for plugin in ENABLED_STATISTICS:
             stat_name = plugin.spec.name
             if stat_name == "forecast":
-                # Yearly precip only, under ``{model}/forecast/`` — see ``export_forecast_data_layers``.
+                # Separate tree (``static_export/forecast/``) — see ``export_forecast_data_layers``.
                 continue
             field = plugin.spec.render_field
             stat_dir = model_stats / stat_name
@@ -242,21 +255,40 @@ def _export_layer(npz_path: Path, field: str, out_dir: Path) -> int:
     return 1
 
 
-def export_forecast_data_layers(data_root: Path) -> None:
-    """Export ``stats_output/{model}/forecast/lead_*.npz`` → ``data/{model}/forecast/*.bin``.
+def export_forecast_data_layers(forecast_root: Path) -> None:
+    """Export ``stats_output/{model}/forecast/lead_*.npz`` → ``forecast/{model}/*.bin``.
 
-    Forecast tiles use the same tree; static stats queries need these bins in forecast mode.
+    Writes to a separate ``forecast/`` tree (not under ``data/``) so forecast
+    data can be uploaded to S3 independently and is never baked into the
+    Fargate image.
     """
     field = STATISTICS_BY_NAME["forecast"].spec.render_field
-    data_dir = data_root
     total = 0
     for model_key in MODEL_REGISTRY:
         forecast_dir = STATS_ROOT / model_key / "forecast"
         if not forecast_dir.is_dir():
             continue
         for npz_path in sorted(forecast_dir.glob("lead_*.npz")):
-            total += _export_layer(npz_path, field, data_dir / model_key / "forecast")
-    print(f"  {total} forecast .bin files (data/{{model}}/forecast/)")
+            total += _export_layer(npz_path, field, forecast_root / model_key)
+    print(f"  {total} forecast .bin files (forecast/{{model}}/)")
+
+
+def export_forecast_calendar(forecast_root: Path) -> None:
+    """Write ``forecast/forecast_calendar.json`` with per-model init dates."""
+    per_model: dict[str, dict] = {}
+    for key, config in sorted(MODEL_REGISTRY.items()):
+        init_date = _get_forecast_init_date(key)
+        if init_date is None:
+            continue
+        per_model[key] = {
+            "initDate": init_date,
+            "leadDaysMin": config.lead_days_min,
+            "leadDaysMax": config.lead_days_max,
+        }
+
+    out = forecast_root / "forecast_calendar.json"
+    out.write_text(json.dumps({"per_model": per_model}, indent=2))
+    print(f"  {out}")
 
 
 # ── tiles (copy PNGs) ──────────────────────────────────────────────
@@ -462,16 +494,20 @@ def main() -> None:
         help="Only rebuild static_export/data/ (.bin layers and grid.json)",
     )
     parser.add_argument(
+        "--forecast", action="store_true",
+        help="Only rebuild forecast bins + forecast_calendar.json under static_export/data/",
+    )
+    parser.add_argument(
         "--frontend", action="store_true",
         help="Only rebuild site-root Vite SPA (index.html, assets/) and export_manifest.json",
     )
     args = parser.parse_args()
 
-    mode_count = int(args.static) + int(args.data) + int(args.frontend)
+    mode_count = int(args.static) + int(args.data) + int(args.forecast) + int(args.frontend)
     if mode_count > 1:
-        parser.error("Use at most one of --static, --data, --frontend.")
+        parser.error("Use at most one of --static, --data, --forecast, --frontend.")
     if args.clean and mode_count:
-        parser.error("--clean applies only to a full export (omit --static, --data, and --frontend).")
+        parser.error("--clean applies only to a full export (omit --static, --data, --forecast, and --frontend).")
 
     site_root = Path(args.output)
 
@@ -515,12 +551,22 @@ def main() -> None:
         data_root.mkdir(parents=True, exist_ok=True)
         print("--data: exporting data layers...")
         export_data_layers(data_root)
-        print("--data: exporting forecast data layers...")
-        export_forecast_data_layers(data_root)
         print("--data: exporting model grids...")
         export_model_grids(data_root)
         write_export_manifest(site_root)
         print(f"\nDone (--data). Data under {data_root}")
+        return
+
+    if args.forecast:
+        site_root.mkdir(parents=True, exist_ok=True)
+        forecast_root = site_root / FORECAST_DIR_NAME
+        forecast_root.mkdir(parents=True, exist_ok=True)
+        print("--forecast: exporting forecast data layers...")
+        export_forecast_data_layers(forecast_root)
+        print("--forecast: exporting forecast calendar...")
+        export_forecast_calendar(forecast_root)
+        write_export_manifest(site_root)
+        print(f"\nDone (--forecast). Forecast data under {forecast_root}")
         return
 
     if args.clean and site_root.exists():
@@ -528,8 +574,10 @@ def main() -> None:
     site_root.mkdir(parents=True, exist_ok=True)
     assets_dir = site_root / STATIC_ASSETS_DIR_NAME
     data_root = site_root / DATA_DIR_NAME
+    forecast_root = site_root / FORECAST_DIR_NAME
     assets_dir.mkdir(parents=True, exist_ok=True)
     data_root.mkdir(parents=True, exist_ok=True)
+    forecast_root.mkdir(parents=True, exist_ok=True)
 
     maptiler_key = _maptiler_key()
     print("Exporting config...")
@@ -542,7 +590,10 @@ def main() -> None:
     export_data_layers(data_root)
 
     print("Exporting forecast data layers...")
-    export_forecast_data_layers(data_root)
+    export_forecast_data_layers(forecast_root)
+
+    print("Exporting forecast calendar...")
+    export_forecast_calendar(forecast_root)
 
     print("Exporting model grids (for static stats queries)...")
     export_model_grids(data_root)

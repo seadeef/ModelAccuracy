@@ -14,8 +14,10 @@ def default_static_site_root() -> Path:
 
 try:
     import boto3
+    from backend.aws_session import client as _aws_client
 except ImportError:  # pragma: no cover - optional for local dev
     boto3 = None
+    _aws_client = None  # type: ignore[assignment]
 
 
 class StaticStore(Protocol):
@@ -57,9 +59,9 @@ class S3StaticStore:
         if not bucket:
             raise ValueError("S3 bucket is required")
         if client is None:
-            if boto3 is None:
+            if boto3 is None or _aws_client is None:
                 raise RuntimeError("boto3 is required for S3StaticStore")
-            client = boto3.client("s3")
+            client = _aws_client("s3")
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self.client = client
@@ -144,8 +146,8 @@ def _running_on_aws_lambda() -> bool:
     return bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
 
 
-def _s3_store_from_data_uri() -> StaticStore | None:
-    """``MODELACCURACY_DATA_S3_URI=s3://bucket`` or ``s3://bucket/prefix`` — prefix is the stats root (``<model>/…``)."""
+def _stats_s3_bucket_and_prefix() -> tuple[str, str] | None:
+    """Parse ``MODELACCURACY_DATA_S3_URI=s3://bucket[/prefix]`` — prefix is the stats root (``<model>/…``)."""
     uri = os.getenv("MODELACCURACY_DATA_S3_URI", "").strip()
     if not uri:
         return None
@@ -154,19 +156,14 @@ def _s3_store_from_data_uri() -> StaticStore | None:
         raise ValueError(
             "MODELACCURACY_DATA_S3_URI must look like s3://bucket or s3://bucket/optional/prefix"
         )
-    bucket = parsed.netloc
-    prefix = (parsed.path or "").strip("/")
-    return _s3_stats_store(bucket=bucket, prefix=prefix)
+    return parsed.netloc, (parsed.path or "").strip("/")
 
 
-def _s3_store_from_legacy_env(*, default_mode: str = "") -> StaticStore | None:
-    mode = os.getenv("MODELACCURACY_STATIC_STORE", default_mode).strip().lower()
-    if mode != "s3":
+def _s3_store_from_data_uri() -> StaticStore | None:
+    loc = _stats_s3_bucket_and_prefix()
+    if loc is None:
         return None
-    bucket = os.getenv("MODELACCURACY_STATIC_S3_BUCKET", "").strip()
-    if not bucket:
-        return None
-    prefix = os.getenv("MODELACCURACY_STATIC_S3_PREFIX", "").strip()
+    bucket, prefix = loc
     return _s3_stats_store(bucket=bucket, prefix=prefix)
 
 
@@ -175,21 +172,16 @@ def _lambda_s3_store_or_raise() -> StaticStore:
     store = _s3_store_from_data_uri()
     if store is not None:
         return store
-    store = _s3_store_from_legacy_env(default_mode="")
-    if store is not None:
-        return store
     raise RuntimeError(
         "Lambda is configured to read stats only from S3. Set MODELACCURACY_DATA_S3_URI to "
         "s3://bucket/prefix where that prefix holds the exported stats tree (same layout as "
-        "static_export/data/: <model>/grid.json and .bin paths), or set MODELACCURACY_STATIC_STORE=s3 "
-        "with MODELACCURACY_STATIC_S3_BUCKET (and optional MODELACCURACY_STATIC_S3_PREFIX)."
+        "static_export/data/: <model>/grid.json and .bin paths)."
     )
 
 
 def store_from_env(
     *,
     default_local_root: Path | None = None,
-    default_mode: str = "local",
 ) -> StaticStore:
     if _running_on_aws_lambda():
         return _lambda_s3_store_or_raise()
@@ -197,8 +189,33 @@ def store_from_env(
     s3_from_uri = _s3_store_from_data_uri()
     if s3_from_uri is not None:
         return s3_from_uri
-    legacy = _s3_store_from_legacy_env(default_mode=default_mode)
-    if legacy is not None:
-        return legacy
     root = default_local_root or default_static_site_root()
     return LocalStaticStore(root)
+
+
+def forecast_store_from_env(
+    *,
+    default_local_root: Path | None = None,
+) -> StaticStore | None:
+    """Return a store for forecast data, or ``None`` if unavailable.
+
+    Forecasts live in the same S3 bucket as the stats tree, in a ``forecast/``
+    folder that is a **sibling** of the stats prefix (not nested inside it).
+    For ``MODELACCURACY_DATA_S3_URI=s3://bucket/static`` the forecast objects
+    are at ``s3://bucket/forecast/{model}/lead_*.bin``; for ``s3://bucket``
+    they are at ``s3://bucket/forecast/…``.
+
+    Local dev falls back to *default_local_root* (typically
+    ``static_export/forecast/``).
+    """
+    stats_loc = _stats_s3_bucket_and_prefix()
+    if stats_loc is not None:
+        bucket, stats_prefix = stats_loc
+        parent = stats_prefix.rsplit("/", 1)[0] if "/" in stats_prefix else ""
+        forecast_prefix = f"{parent}/forecast" if parent else "forecast"
+        return S3StaticStore(bucket=bucket, prefix=forecast_prefix)
+
+    root = default_local_root or (default_static_site_root() / "forecast")
+    if root.is_dir():
+        return LocalStaticStore(root)
+    return None

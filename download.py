@@ -139,12 +139,12 @@ def _run_catchup(models: list[ModelConfig]) -> None:
 
 
 def _forecast_dir_has_data(config: ModelConfig, date: datetime) -> bool:
-    """Check whether the init directory has assembled lead files (GRIB and/or .npy)."""
+    """Check whether the init directory has converted .npy lead files ready for extraction."""
     date_str = date.strftime("%Y%m%d")
     init_dir = Path(config.data_dir) / str(date.year) / f"{date_str}_{config.cycle_hour:02d}z"
     if not init_dir.exists():
         return False
-    return any(init_dir.glob("f*_*.grib2")) or any(init_dir.glob("f*_*.npy"))
+    return any(init_dir.glob("f*_*.npy"))
 
 
 def _run_forecast(config: ModelConfig) -> None:
@@ -157,13 +157,14 @@ def _run_forecast(config: ModelConfig) -> None:
     defaults = dict(config.downloader_defaults)
     downloader = cls(**defaults)
 
-    # Skip download if data already exists; still need to extract below.
+    resolved_date = None
     if _forecast_dir_has_data(config, today):
         print(f"\nForecast data for model '{config.key}' already downloaded ({today.date()}).")
+        resolved_date = today
     elif _forecast_dir_has_data(config, yesterday):
         print(f"\nForecast data for model '{config.key}' already downloaded ({yesterday.date()}).")
+        resolved_date = yesterday
     else:
-        # Try today first; if no files were downloaded, fall back to yesterday.
         for attempt_date in [today, yesterday]:
             date_str = attempt_date.strftime("%Y-%m-%d")
             print(f"\n--- Downloading forecast for model '{config.key}' ({date_str}) ---")
@@ -173,19 +174,18 @@ def _run_forecast(config: ModelConfig) -> None:
                 forecast_hours=forecast_hours,
             )
             if _forecast_dir_has_data(config, attempt_date):
+                resolved_date = attempt_date
                 break
-            # Remove empty init directory so it doesn't confuse extract_forecast.
             date_str_compact = attempt_date.strftime("%Y%m%d")
             empty_dir = Path(config.data_dir) / str(attempt_date.year) / f"{date_str_compact}_{config.cycle_hour:02d}z"
-            if empty_dir.exists() and not (
-                any(empty_dir.glob("f*_*.grib2")) or any(empty_dir.glob("f*_*.npy"))
-            ):
+            if empty_dir.exists() and not any(empty_dir.iterdir()):
                 empty_dir.rmdir()
             print(f"No forecast data available for {date_str}, trying previous day...")
 
     output_root = Path("stats_output") / config.key
     print(f"\n--- Extracting forecast for model '{config.key}' ---")
     downloader.extract_forecast(
+        init_date=resolved_date,
         forecast_hours=forecast_hours,
         lead_windows=list(config.lead_windows),
         output_root=output_root,
