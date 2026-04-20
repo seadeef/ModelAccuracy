@@ -11,6 +11,10 @@ _this_dir = Path(__file__).resolve().parent
 _project_root = _this_dir.parent
 sys.path.insert(0, str(_project_root))
 
+from dotenv import load_dotenv
+
+load_dotenv(_project_root / ".env", override=True)
+
 from fastapi import FastAPI, Header
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -18,15 +22,27 @@ from starlette.requests import Request
 
 from model_registry import MODEL_REGISTRY
 from backend.request_models import ForecastAllModelsRequest, LeadWinnersRequest, StatsQueryRequest
+from backend.auth import public_auth_config
 from backend.shapes_router import create_shapes_router
-from backend.static_store import store_from_env
+from backend.static_store import forecast_store_from_env, store_from_env
 from backend.stats_service import query_forecast_all_models_payload, query_lead_winners_payload, query_stats_payload
 
 
 STATIC_SITE_ROOT = _project_root / "static_export"
 STATIC_ASSETS_ROOT = STATIC_SITE_ROOT / "static"
 STATIC_DATA_ROOT = STATIC_SITE_ROOT / "data"
-STATIC_STORE = store_from_env(default_local_root=STATIC_SITE_ROOT, default_mode="local")
+STATIC_STORE = store_from_env(default_local_root=STATIC_SITE_ROOT)
+_FORECAST_STORE_CACHED: dict[str, object] = {}
+
+def _get_forecast_store():
+    """Lazy lookup so the local ``static_export/forecast/`` directory can appear after startup."""
+    cached = _FORECAST_STORE_CACHED.get("v")
+    if cached is not None:
+        return cached
+    store = forecast_store_from_env(default_local_root=STATIC_SITE_ROOT / "forecast")
+    if store is not None:
+        _FORECAST_STORE_CACHED["v"] = store
+    return store
 
 
 @asynccontextmanager
@@ -52,6 +68,12 @@ app = FastAPI(title="Model Statistics Query API", lifespan=_lifespan)
 def health() -> dict[str, str]:
     """ALB / ECS health checks."""
     return {"status": "ok"}
+
+
+@app.get("/api/auth/config")
+def auth_config() -> dict:
+    """Cognito Hosted UI hints for the SPA (safe to expose; no secrets)."""
+    return public_auth_config()
 
 
 class LongCacheStaticMiddleware(BaseHTTPMiddleware):
@@ -119,4 +141,6 @@ def lead_winners(payload: LeadWinnersRequest):
 @app.post("/api/stats/forecast")
 def forecast_all_models(payload: ForecastAllModelsRequest):
     """Forecast values for all models across all leads for a region (load once, cache)."""
-    return query_forecast_all_models_payload(payload, store=STATIC_STORE)
+    return query_forecast_all_models_payload(
+        payload, store=STATIC_STORE, forecast_store=_get_forecast_store(),
+    )
