@@ -183,7 +183,14 @@ echo "==> verify static_export/data"
 verify_static_export
 
 echo "==> docker build --platform ${DOCKER_PLATFORM} -t ${LOCAL_IMAGE}"
-docker build --platform "$DOCKER_PLATFORM" -t "$LOCAL_IMAGE" .
+docker build --platform "$DOCKER_PLATFORM" -t "$LOCAL_IMAGE" \
+  --build-arg MODELACCURACY_DATA_S3_URI="${MODELACCURACY_DATA_S3_URI:-}" \
+  --build-arg COGNITO_USER_POOL_ID="${COGNITO_USER_POOL_ID:-}" \
+  --build-arg COGNITO_APP_CLIENT_ID="${COGNITO_APP_CLIENT_ID:-}" \
+  --build-arg COGNITO_REGION="${COGNITO_REGION:-}" \
+  --build-arg COGNITO_DOMAIN_PREFIX="${COGNITO_DOMAIN_PREFIX:-}" \
+  --build-arg DYNAMODB_USER_ITEMS_TABLE="${DYNAMODB_USER_ITEMS_TABLE:-}" \
+  .
 
 if [[ -n "${SKIP_PUSH:-}" ]]; then
   echo "==> SKIP_PUSH set — not pushing to ECR"
