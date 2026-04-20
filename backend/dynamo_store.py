@@ -2,15 +2,41 @@
 
 from __future__ import annotations
 
+import json
 import os
+from decimal import Decimal
 from typing import Any, Protocol
 
 try:
     import boto3
     from botocore.exceptions import ClientError
+    from backend.aws_session import resource as _aws_resource
 except ImportError:  # pragma: no cover - optional for local dev
     boto3 = None
     ClientError = Exception
+    _aws_resource = None  # type: ignore[assignment]
+
+
+def _floats_to_decimals(obj: Any) -> Any:
+    """Recursively convert floats to Decimals for DynamoDB compatibility."""
+    if isinstance(obj, float):
+        return Decimal(str(obj))
+    if isinstance(obj, dict):
+        return {k: _floats_to_decimals(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_floats_to_decimals(v) for v in obj]
+    return obj
+
+
+def _decimals_to_floats(obj: Any) -> Any:
+    """Recursively convert Decimals back to floats for JSON responses."""
+    if isinstance(obj, Decimal):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {k: _decimals_to_floats(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_decimals_to_floats(v) for v in obj]
+    return obj
 
 
 class UserItemStore(Protocol):
@@ -45,7 +71,7 @@ def _shape_from_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": sk.removeprefix("SHAPE#"),
         "name": item["name"],
-        "region": item["shape"],
+        "region": _decimals_to_floats(item["shape"]),
         "created_at": item["created_at"],
         "updated_at": item["updated_at"],
     }
@@ -56,9 +82,9 @@ class DynamoUserItemStore:
 
     def __init__(self, table_name: str, resource=None):
         if resource is None:
-            if boto3 is None:
+            if boto3 is None or _aws_resource is None:
                 raise RuntimeError("boto3 is required for DynamoUserItemStore")
-            resource = boto3.resource("dynamodb")
+            resource = _aws_resource("dynamodb")
         self._table = resource.Table(table_name)
 
     def put_shape(
@@ -69,7 +95,7 @@ class DynamoUserItemStore:
             "SK": _shape_sk(shape_id),
             "item_type": "shape",
             "name": name,
-            "shape": region,
+            "shape": _floats_to_decimals(region),
             "created_at": now,
             "updated_at": now,
         }
@@ -107,7 +133,7 @@ class DynamoUserItemStore:
         if "region" in updates:
             expr_parts.append("#shape = :shape")
             attr_names["#shape"] = "shape"
-            attr_values[":shape"] = updates["region"]
+            attr_values[":shape"] = _floats_to_decimals(updates["region"])
 
         try:
             resp = self._table.update_item(
