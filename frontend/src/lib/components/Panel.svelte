@@ -644,6 +644,7 @@
       bestModelColumnHeader: includeWinners
         ? `Best model (${statLabel(ui.statistic)})`
         : null,
+      forecastPayload,
     });
   }
 
