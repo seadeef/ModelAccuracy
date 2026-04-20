@@ -18,11 +18,16 @@
 #   ECS_SERVICE / ECS_SERVICE_ARN   only used with --force-redeploy; prompted before data export if unset
 #
 # ECS Task Definition environment variables (set in AWS, not this script):
+#   MODELACCURACY_DATA_S3_URI   s3://bucket[/prefix] for stats data. Forecasts are read
+#                               from the same bucket at a `forecast/` folder that is a
+#                               sibling of <prefix> (keys: forecast/{model}/lead_{n}.bin,
+#                               forecast/forecast_calendar.json).
 #   COGNITO_USER_POOL_ID        Cognito User Pool ID (required for auth)
 #   COGNITO_APP_CLIENT_ID       Cognito App Client ID (required for auth)
 #   COGNITO_REGION              Cognito region (defaults to AWS_REGION / us-west-1)
+#   COGNITO_DOMAIN_PREFIX       Hosted UI domain label (*.auth.<region>.amazoncognito.com)
+#   COGNITO_OAUTH_BASE_URL      Optional full https origin for Hosted UI (overrides prefix+region; useful for demos)
 #   DYNAMODB_USER_ITEMS_TABLE   DynamoDB table for saved shapes (default ModelAccuracy-UserItems)
-#   MODELACCURACY_DEV_AUTH      Set to 1 for dev-mode auth (X-Dev-User-Id header, no Cognito)
 #
 # Flags:
 #   --tag-latest       push IMAGE_TAG and also push the same image as :latest
@@ -46,7 +51,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+# Load .env (AWS_PROFILE, AWS_REGION, …) so `aws` CLI calls below pick up the
+# same credentials the Python code uses. Lines starting with `#` are skipped.
+if [[ -f "$ROOT/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/.env"
+  set +a
+fi
+
 AWS_REGION="${AWS_REGION:-us-west-1}"
+if [[ -n "${AWS_PROFILE:-}" ]]; then
+  export AWS_PROFILE
+  echo "==> Using AWS_PROFILE=${AWS_PROFILE}"
+fi
 # Unset ECR_REPOSITORY → prompt on TTY when pushing; otherwise default (never prompted before).
 if [[ -n "${ECR_REPOSITORY+x}" ]]; then
   :
