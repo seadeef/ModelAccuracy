@@ -1,7 +1,12 @@
+import { authHeaders } from './authSession.svelte.js';
 import { STATIC_BASE } from './constants.js';
 import { appConfig } from './state.svelte.js';
 
 const API_BASE = '';
+
+function headersWithAuth(base = {}) {
+  return { ...base, ...authHeaders() };
+}
 
 function verificationStatisticsOnly() {
   return appConfig.statistics.filter((s) => s.key !== 'forecast');
@@ -35,7 +40,7 @@ export async function fetchLeadWinnersForRegion({
   try {
     const resp = await fetch(`${API_BASE}/api/stats/lead-winners`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: headersWithAuth({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
         region,
         statistic,
@@ -133,7 +138,7 @@ export async function fetchStatsAllLeads({
   }
   const resp = await fetch(`${API_BASE}/api/stats/query`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: headersWithAuth({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       model,
       region,
@@ -150,5 +155,59 @@ export async function fetchStatsAllLeads({
   }
   const data = await resp.json();
   return data.results ?? [];
+}
+
+/**
+ * Region-mean forecast (precip) for every model × lead in one request.
+ * Response: `{ models, forecast_calendar }` where `forecast_calendar.per_model[modelKey]`
+ * has `initDate` (ISO `YYYY-MM-DD`), `leadDaysMin`, `leadDaysMax`.
+ * Valid date for integer lead L = `initDate` + L calendar days.
+ */
+export async function fetchForecastAllModels({ region }) {
+  try {
+    const resp = await fetch(`${API_BASE}/api/stats/forecast`, {
+      method: 'POST',
+      headers: headersWithAuth({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ region }),
+    });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Save the current region as a named shape (authenticated).
+ * Returns the created shape object or null on failure.
+ */
+export async function saveRegion(name, region) {
+  try {
+    const resp = await fetch(`${API_BASE}/api/shapes`, {
+      method: 'POST',
+      headers: headersWithAuth({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ name, region }),
+    });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * List all saved shapes for the authenticated user.
+ * Returns { shapes: [...] } or null on failure.
+ */
+export async function listSavedRegions() {
+  try {
+    const resp = await fetch(`${API_BASE}/api/shapes`, {
+      headers: headersWithAuth(),
+    });
+    if (!resp.ok) return null;
+    return await resp.json();
+  } catch {
+    return null;
+  }
 }
 

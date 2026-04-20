@@ -1,4 +1,6 @@
 <script>
+  import { onMount } from 'svelte';
+  import { initAuth } from './lib/authSession.svelte.js';
   import { ui, appConfig } from './lib/state.svelte.js';
   import { drawToolGlyph } from './lib/appIcons.js';
   import { fetchZip } from './lib/api.js';
@@ -85,6 +87,10 @@
   const showGuide = $derived(
     ui.activeTool === 'point' && !ui.hasUsedPinTool,
   );
+
+  onMount(() => {
+    void initAuth().catch((e) => console.error('[auth] initAuth failed', e));
+  });
 </script>
 
 <div class="app">
