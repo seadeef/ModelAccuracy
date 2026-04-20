@@ -98,7 +98,7 @@ export async function geocodeAddress(query) {
   });
   const resp = await fetch(
     `https://nominatim.openstreetmap.org/search?${params}`,
-    { headers: { 'User-Agent': 'ModelAccuracyApp/1.0' } },
+    { headers: { 'User-Agent': 'Raincheck/1.0' } },
   );
   if (!resp.ok) return { found: false, label: q };
   const results = await resp.json();
