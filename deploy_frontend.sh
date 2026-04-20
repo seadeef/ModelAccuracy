@@ -8,8 +8,8 @@
 # by Vite, so their URLs change on every build and don't need invalidation.
 #
 # Env (loaded from .env if present):
-#   FRONTEND_BUCKET              S3 bucket (default: raincheck-static)
-#   CLOUDFRONT_DISTRIBUTION_ID   CF distribution (default: E1QEB4BM43ELTB)
+#   MODELACCURACY_DATA_S3_URI    s3://bucket[/prefix] — bucket is extracted for upload target
+#   CLOUDFRONT_DISTRIBUTION_ID   CF distribution ID (required)
 #   AWS_REGION                   default us-west-1
 #   AWS_PROFILE                  optional
 #   SKIP_BUILD=1                 use existing static_export/ (skip `export_static.py --frontend`)
@@ -31,8 +31,18 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
-BUCKET="${FRONTEND_BUCKET:-raincheck-static}"
-DISTRIBUTION_ID="${CLOUDFRONT_DISTRIBUTION_ID:-E1QEB4BM43ELTB}"
+if [[ -z "${MODELACCURACY_DATA_S3_URI:-}" ]]; then
+  echo "ERROR: MODELACCURACY_DATA_S3_URI not set (expected s3://bucket[/prefix])." >&2
+  exit 1
+fi
+# Strip scheme and any path → bucket name.
+BUCKET="${MODELACCURACY_DATA_S3_URI#s3://}"
+BUCKET="${BUCKET%%/*}"
+if [[ -z "${CLOUDFRONT_DISTRIBUTION_ID:-}" ]]; then
+  echo "ERROR: CLOUDFRONT_DISTRIBUTION_ID not set." >&2
+  exit 1
+fi
+DISTRIBUTION_ID="$CLOUDFRONT_DISTRIBUTION_ID"
 AWS_REGION="${AWS_REGION:-us-west-1}"
 if [[ -n "${AWS_PROFILE:-}" ]]; then
   export AWS_PROFILE
