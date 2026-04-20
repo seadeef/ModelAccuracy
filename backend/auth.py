@@ -1,4 +1,4 @@
-"""Cognito JWT verification and dev-mode auth fallback."""
+"""Cognito JWT verification."""
 
 from __future__ import annotations
 
@@ -82,6 +82,7 @@ class CognitoJWTVerifier:
                 algorithms=["RS256"],
                 audience=self.client_id,
                 issuer=self.issuer,
+                options={"verify_at_hash": False},
             )
         except JWTError as exc:
             raise HTTPException(status_code=401, detail=f"Token verification failed: {exc}")
@@ -116,8 +117,40 @@ class CognitoJWTVerifier:
         return sub
 
 
-def _is_dev_auth_enabled() -> bool:
-    return os.getenv("MODELACCURACY_DEV_AUTH", "").strip().lower() in ("1", "true", "yes")
+def _cognito_oauth_base_url(region: str, domain_prefix: str) -> str | None:
+    """HTTPS origin for Hosted UI OAuth endpoints (no trailing slash)."""
+    p = domain_prefix.strip()
+    if not p:
+        return None
+    r = region.strip()
+    return f"https://{p}.auth.{r}.amazoncognito.com"
+
+
+def public_auth_config() -> dict[str, Any]:
+    """Public SPA settings for Cognito Hosted UI / OAuth (no secrets).
+
+    Hosted UI base URL is built from ``COGNITO_DOMAIN_PREFIX`` + region, or set
+    explicitly via ``COGNITO_OAUTH_BASE_URL`` (e.g.
+    ``https://your-domain-prefix.auth.us-west-1.amazoncognito.com``) for
+    localhost demos when you already have the full URL from the Cognito console.
+    """
+    pool_id = os.getenv("COGNITO_USER_POOL_ID", "").strip()
+    client_id = os.getenv("COGNITO_APP_CLIENT_ID", "").strip()
+    if not pool_id or not client_id:
+        return {"mode": "none"}
+    region = os.getenv(
+        "COGNITO_REGION", os.getenv("AWS_REGION", "us-west-1")
+    ).strip()
+    domain_prefix = os.getenv("COGNITO_DOMAIN_PREFIX", "").strip()
+    oauth_override = os.getenv("COGNITO_OAUTH_BASE_URL", "").strip().rstrip("/")
+    oauth_base = oauth_override or _cognito_oauth_base_url(region, domain_prefix)
+    return {
+        "mode": "cognito",
+        "region": region,
+        "clientId": client_id,
+        "domainPrefix": domain_prefix or None,
+        "oauthBase": oauth_base,
+    }
 
 
 def build_get_current_user(
@@ -125,39 +158,25 @@ def build_get_current_user(
 ):
     """Build a FastAPI dependency that returns the authenticated user ID.
 
-    When *verifier* is ``None`` and dev auth is enabled, the ``X-Dev-User-Id``
-    header is accepted instead of a real JWT.
+    When *verifier* is ``None`` (Cognito env vars missing), returns 503.
     """
 
     async def get_current_user(
         authorization: str | None = Header(None),
-        x_dev_user_id: str | None = Header(None, alias="X-Dev-User-Id"),
     ) -> str:
-        # Cognito path
-        if verifier is not None:
-            if not authorization:
-                raise HTTPException(status_code=401, detail="Missing Authorization header")
-            return verifier.get_user_id(authorization)
-
-        # Dev-mode path
-        if _is_dev_auth_enabled():
-            if x_dev_user_id:
-                return x_dev_user_id
-            if authorization:
-                # Allow Bearer tokens in dev mode too (pass-through, no verification)
-                if authorization.lower().startswith("bearer "):
-                    token = authorization[7:].strip()
-                    if token:
-                        return token
+        if verifier is None:
             raise HTTPException(
-                status_code=401,
-                detail="Dev auth: provide X-Dev-User-Id header",
+                status_code=503,
+                detail="Authentication is not configured on this server",
             )
-
-        # Auth not configured at all
-        raise HTTPException(
-            status_code=503,
-            detail="Authentication is not configured on this server",
-        )
+        if not authorization:
+            print(f"[AUTH DEBUG] No Authorization header received")
+            raise HTTPException(status_code=401, detail="Missing Authorization header")
+        print(f"[AUTH DEBUG] Authorization header present, length={len(authorization)}")
+        try:
+            return verifier.get_user_id(authorization)
+        except HTTPException as exc:
+            print(f"[AUTH DEBUG] Verification failed: {exc.detail}")
+            raise
 
     return get_current_user
