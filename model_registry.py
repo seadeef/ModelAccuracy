@@ -67,6 +67,38 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         cycle_hour=12,
         data_dir="model_data/nbm",
     ),
+    "graphcast": ModelConfig(
+        key="graphcast",
+        label="GraphCast",
+        downloader_class_path="downloaders.graphcast_downloader.GraphCastDownloaderParallel",
+        downloader_defaults={
+            "output_dir": "model_data/graphcast",
+            "max_workers": 8,
+            "max_retries": 3,
+            "timeout_seconds": 300,
+        },
+        lead_days_min=1,
+        lead_days_max=10,
+        lead_windows=((1, 7), (7, 10), (1, 10)),
+        cycle_hour=12,
+        data_dir="model_data/graphcast",
+    ),
+    "aifs": ModelConfig(
+        key="aifs",
+        label="AIFS",
+        downloader_class_path="downloaders.aifs_downloader.AIFSDownloaderParallel",
+        downloader_defaults={
+            "output_dir": "model_data/aifs",
+            "max_workers": 16,
+            "max_retries": 3,
+            "timeout_seconds": 120,
+        },
+        lead_days_min=1,
+        lead_days_max=14,
+        lead_windows=((1, 7), (7, 14), (1, 10)),
+        cycle_hour=12,
+        data_dir="model_data/aifs",
+    ),
 }
 
 DEFAULT_MODEL = next(

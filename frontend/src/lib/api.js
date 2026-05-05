@@ -58,6 +58,74 @@ export async function fetchLeadWinnersForRegion({
   }
 }
 
+/** Returns true when the input is exactly 5 digits (pure ZIP entry). */
+export function looksLikeZip(input) {
+  return /^\d{5}$/.test(String(input).trim());
+}
+
+const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN;
+const MAPBOX_SEARCHBOX = 'https://api.mapbox.com/search/searchbox/v1';
+
+/**
+ * Mapbox Search Box suggest — returns autocomplete candidates for a partial query.
+ * Caller passes a persistent sessionToken (UUID) to group suggest+retrieve into one
+ * billable session. Returns [] on any failure so the UI stays quiet.
+ */
+export async function suggestPlaces(query, sessionToken, { signal } = {}) {
+  const q = String(query).trim();
+  if (!q || !MAPBOX_TOKEN) return [];
+  const params = new URLSearchParams({
+    q,
+    access_token: MAPBOX_TOKEN,
+    session_token: sessionToken,
+    country: 'us',
+    language: 'en',
+    limit: '6',
+    types: 'address,street,postcode,place,locality,neighborhood,poi',
+  });
+  try {
+    const resp = await fetch(`${MAPBOX_SEARCHBOX}/suggest?${params}`, { signal });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return data.suggestions ?? [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Mapbox Search Box retrieve — resolves a suggestion's mapbox_id to coordinates and bbox.
+ * Returns { found, label, lat, lon, bounds? } matching fetchZip's shape.
+ */
+export async function retrievePlace(mapboxId, sessionToken) {
+  if (!mapboxId || !MAPBOX_TOKEN) return { found: false, label: '' };
+  const params = new URLSearchParams({
+    access_token: MAPBOX_TOKEN,
+    session_token: sessionToken,
+  });
+  const resp = await fetch(
+    `${MAPBOX_SEARCHBOX}/retrieve/${encodeURIComponent(mapboxId)}?${params}`,
+  );
+  if (!resp.ok) return { found: false, label: '' };
+  const data = await resp.json();
+  const feature = data.features?.[0];
+  if (!feature) return { found: false, label: '' };
+  const [lon, lat] = feature.geometry?.coordinates ?? [];
+  const result = {
+    found: true,
+    label: feature.properties?.full_address || feature.properties?.name || '',
+    lat,
+    lon,
+    feature_type: feature.properties?.feature_type || '',
+  };
+  const bbox = feature.properties?.bbox;
+  if (Array.isArray(bbox) && bbox.length === 4) {
+    // Mapbox returns [west, south, east, north] — same as our static zip bounds.
+    result.bounds = bbox;
+  }
+  return result;
+}
+
 /** Loads ``static_export/zip/{5-digit}.json``; response shape matches prior API usage. */
 export async function fetchZip(zip) {
   const code = normalizeZipCode(zip);
@@ -75,47 +143,8 @@ export async function fetchZip(zip) {
     lat: data.lat,
     lon: data.lon,
     bounds: data.bounds,
+    feature_type: 'postcode',
   };
-}
-
-/** Returns true when the input looks like a bare 5-digit US ZIP code. */
-export function looksLikeZip(input) {
-  return /^\d{5}$/.test(input.trim());
-}
-
-/**
- * Geocode a free-form US address via the Nominatim (OpenStreetMap) API.
- * Returns { found, label, lat, lon, bounds? } matching the fetchZip shape.
- */
-export async function geocodeAddress(query) {
-  const q = query.trim();
-  if (!q) return { found: false, label: '' };
-  const params = new URLSearchParams({
-    q,
-    format: 'jsonv2',
-    countrycodes: 'us',
-    limit: '1',
-  });
-  const resp = await fetch(
-    `https://nominatim.openstreetmap.org/search?${params}`,
-    { headers: { 'User-Agent': 'Raincheck/1.0' } },
-  );
-  if (!resp.ok) return { found: false, label: q };
-  const results = await resp.json();
-  if (!results.length) return { found: false, label: q };
-  const r = results[0];
-  const result = {
-    found: true,
-    label: r.display_name,
-    lat: Number(r.lat),
-    lon: Number(r.lon),
-  };
-  if (r.boundingbox) {
-    // Nominatim returns [south, north, west, east] as strings
-    const [south, north, west, east] = r.boundingbox.map(Number);
-    result.bounds = [west, south, east, north];
-  }
-  return result;
 }
 
 /**

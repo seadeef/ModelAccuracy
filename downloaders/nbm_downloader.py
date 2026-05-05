@@ -544,6 +544,8 @@ class NBMDownloaderParallel(BaseDownloader):
         # Build transform from the regular 1D grid coords.
         target_transform, _, _, _, _ = self._target_grid()
 
+        land_mask = self._build_land_mask(lats, lons, target_transform)
+
         lead_data: dict[int, np.ndarray] = {}
         for fhour in forecast_hours:
             lead_days = fhour // 24
@@ -551,7 +553,7 @@ class NBMDownloaderParallel(BaseDownloader):
             if not npy_path.exists():
                 print(f"  Skipping lead {lead_days} (missing {npy_path.name})")
                 continue
-            lead_data[lead_days] = np.load(npy_path)
+            lead_data[lead_days] = self._apply_land_mask(np.load(npy_path), land_mask)
             print(f"  Lead {lead_days}: {npy_path.name}")
 
         if not lead_data:

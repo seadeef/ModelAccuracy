@@ -218,15 +218,23 @@
     loadTilesetInterp(ui.statistic, frac);
   }
 
-  export function flyToZip(data) {
+  export function flyToLocation(data) {
     if (!map) return;
+    const type = data.feature_type || '';
+    // Addresses/streets/POIs: Mapbox's bbox is a near-zero point, so ignore it
+    // and force a tight zoom. Everything else: trust the returned bbox.
+    const isPinpoint = type === 'address' || type === 'street' || type === 'poi';
+    if (isPinpoint) {
+      map.flyTo({ center: [data.lon, data.lat], zoom: 15, duration: 700 });
+      return;
+    }
     if (Array.isArray(data.bounds) && data.bounds.length === 4) {
       map.fitBounds(
         [[data.bounds[0], data.bounds[1]], [data.bounds[2], data.bounds[3]]],
         { padding: 24, duration: 700 },
       );
     } else {
-      map.flyTo({ center: [data.lon, data.lat], zoom: 10, duration: 700 });
+      map.flyTo({ center: [data.lon, data.lat], zoom: 11, duration: 700 });
     }
   }
 

@@ -33,6 +33,9 @@ function faviconIcoFallback() {
 }
 
 export default defineConfig({
+  // Load env vars (including VITE_*) from the project-root .env, matching the
+  // rest of the stack (backend/api.py, deploy_frontend.sh) so there's one source of truth.
+  envDir: path.resolve(__dirname, '..'),
   plugins: [svelte(), faviconIcoFallback()],
   server: {
     proxy: {

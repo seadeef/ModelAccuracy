@@ -10,6 +10,7 @@ import numpy as np
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from statistics_plugins.registry import ENABLED_STATISTICS
 from stats_grid_metadata import load_model_metadata
+from downloaders.base import build_land_mask
 
 try:
     import rasterio
@@ -380,42 +381,6 @@ def _collect_tasks_for_period(
 OUTPUT_DIR = Path("tiles_output")
 
 
-PRISM_DIR = Path("prism_data")
-
-
-def _build_land_mask(meta: dict) -> np.ndarray | None:
-    """Build a land mask by reprojecting a single PRISM file onto the GFS grid."""
-    # Find any PRISM GeoTIFF.
-    prism_files = sorted(PRISM_DIR.glob("**/data.tif"))
-    if not prism_files:
-        print("Warning: no PRISM data found for land mask.")
-        return None
-
-    with rasterio.open(prism_files[0]) as src:
-        prism_data = src.read(1).astype(np.float32)
-        prism_transform = src.transform
-        prism_crs = str(src.crs)
-        if src.nodata is not None:
-            prism_data[prism_data == src.nodata] = np.nan
-
-    # Reproject PRISM onto the GFS grid — anywhere PRISM has data is land.
-    gfs_shape = (meta["lats"].size, meta["lons"].size)
-    dst = np.full(gfs_shape, np.nan, dtype=np.float32)
-    reproject(
-        source=prism_data,
-        destination=dst,
-        src_transform=prism_transform,
-        src_crs=prism_crs,
-        dst_transform=meta["transform"],
-        dst_crs="EPSG:4326",
-        resampling=Resampling.nearest,
-        dst_nodata=np.nan,
-    )
-    mask = np.isfinite(dst)
-    print(f"Land mask from {prism_files[0]} ({np.count_nonzero(mask)} land pixels)")
-    return mask
-
-
 def _run_for_model(model_key: str) -> None:
     stats_root = Path("stats_output") / model_key
     plugins = ENABLED_STATISTICS
@@ -425,7 +390,7 @@ def _run_for_model(model_key: str) -> None:
     meta = load_metadata(stats_root)
 
     # Build land mask from PRISM, reprojected onto the model grid.
-    land_mask = _build_land_mask(meta)
+    land_mask = build_land_mask(meta["lats"], meta["lons"], meta["transform"])
 
     # Collect tasks for all periods.
     tasks: list[dict] = []

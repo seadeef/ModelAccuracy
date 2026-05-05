@@ -8,14 +8,14 @@
   import {
     glyphDownloadMap,
     glyphOpacityMoon,
-    glyphZipChevron,
   } from '../appIcons.js';
+  import AddressSearch from './AddressSearch.svelte';
 
   let {
-    zipValue = $bindable(''),
     onOpacityInput,
     onExport,
-    goToZip,
+    onLocationSelect,
+    onSearchStatus,
   } = $props();
 </script>
 
@@ -45,21 +45,9 @@
 
   <div class="toolbar-sep" aria-hidden="true"></div>
 
-  <div class="zip-block">
-    <div class="zip-field">
-      <span class="ctrl-label">Fly to</span>
-      <input
-        type="text"
-        placeholder="ZIP"
-        size="5"
-        bind:value={zipValue}
-        onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); goToZip?.(); } }}
-        aria-label="ZIP code"
-      />
-    </div>
-    <button type="button" class="zip-go" onclick={() => goToZip?.()} aria-label="Go to ZIP">
-      <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphZipChevron}</svg>
-    </button>
+  <div class="search-block">
+    <span class="ctrl-label">Fly to</span>
+    <AddressSearch onSelect={onLocationSelect} onStatus={onSearchStatus} />
   </div>
 
   {#if authSession.ready && authSession.mode === 'cognito'}
@@ -199,12 +187,9 @@
       padding: 10px;
       justify-content: center;
     }
-    .zip-field input[type='text'] {
-      font-size: 16px; /* reduces iOS zoom-on-focus */
-    }
-    .zip-go {
-      width: 40px;
-      height: 40px;
+    .search-block {
+      flex: 1 1 200px;
+      min-width: 160px;
     }
   }
   .toolbar-sep {
@@ -218,18 +203,15 @@
     flex-direction: column;
     gap: 3px;
   }
-  .zip-block {
-    display: flex;
-    flex-direction: row;
-    align-items: flex-end;
-    gap: 3px;
-  }
-  .zip-field {
+  .search-block {
     display: flex;
     flex-direction: column;
     gap: 3px;
     align-items: stretch;
-    width: fit-content;
+    min-width: 240px;
+  }
+  .search-block .ctrl-label {
+    text-align: left;
   }
   .ctrl-label {
     font-size: 10px;
@@ -259,42 +241,5 @@
     width: 80px;
     height: 4px;
     accent-color: var(--accent);
-  }
-  .zip-field input[type="text"] {
-    box-sizing: border-box;
-    height: var(--toolbar-control-height);
-    background: var(--surface);
-    color: var(--text-primary);
-    border: 1px solid var(--panel-border);
-    border-radius: 9px;
-    padding: 0 9px;
-    font-size: 12px;
-    line-height: 1.25;
-    font-family: inherit;
-    width: 58px;
-    outline: none;
-  }
-  .zip-field input[type="text"]:focus {
-    border-color: var(--accent);
-  }
-  .zip-go {
-    box-sizing: border-box;
-    flex-shrink: 0;
-    height: var(--toolbar-control-height);
-    width: var(--toolbar-control-height);
-    background: transparent;
-    border: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    padding: 0;
-    border-radius: 7px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: color 0.15s, background 0.15s;
-  }
-  .zip-go:hover {
-    color: var(--accent);
-    background: var(--hover-bg);
   }
 </style>

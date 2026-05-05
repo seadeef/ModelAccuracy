@@ -146,6 +146,13 @@ def _running_on_aws_lambda() -> bool:
     return bool(os.getenv("AWS_LAMBDA_FUNCTION_NAME"))
 
 
+def _force_local_static() -> bool:
+    """Local-dev opt-out: read static/forecast data from the filesystem even when
+    ``MODELACCURACY_DATA_S3_URI`` is set (the URI must stay set for docker builds)."""
+    val = os.getenv("MODELACCURACY_USE_LOCAL_STATIC", "").strip().lower()
+    return val in ("1", "true", "yes", "on")
+
+
 def _stats_s3_bucket_and_prefix() -> tuple[str, str] | None:
     """Parse ``MODELACCURACY_DATA_S3_URI=s3://bucket[/prefix]`` — prefix is the stats root (``<model>/…``)."""
     uri = os.getenv("MODELACCURACY_DATA_S3_URI", "").strip()
@@ -186,9 +193,10 @@ def store_from_env(
     if _running_on_aws_lambda():
         return _lambda_s3_store_or_raise()
 
-    s3_from_uri = _s3_store_from_data_uri()
-    if s3_from_uri is not None:
-        return s3_from_uri
+    if not _force_local_static():
+        s3_from_uri = _s3_store_from_data_uri()
+        if s3_from_uri is not None:
+            return s3_from_uri
     root = default_local_root or default_static_site_root()
     return LocalStaticStore(root)
 
@@ -208,12 +216,13 @@ def forecast_store_from_env(
     Local dev falls back to *default_local_root* (typically
     ``static_export/forecast/``).
     """
-    stats_loc = _stats_s3_bucket_and_prefix()
-    if stats_loc is not None:
-        bucket, stats_prefix = stats_loc
-        parent = stats_prefix.rsplit("/", 1)[0] if "/" in stats_prefix else ""
-        forecast_prefix = f"{parent}/forecast" if parent else "forecast"
-        return S3StaticStore(bucket=bucket, prefix=forecast_prefix)
+    if not _force_local_static():
+        stats_loc = _stats_s3_bucket_and_prefix()
+        if stats_loc is not None:
+            bucket, stats_prefix = stats_loc
+            parent = stats_prefix.rsplit("/", 1)[0] if "/" in stats_prefix else ""
+            forecast_prefix = f"{parent}/forecast" if parent else "forecast"
+            return S3StaticStore(bucket=bucket, prefix=forecast_prefix)
 
     root = default_local_root or (default_static_site_root() / "forecast")
     if root.is_dir():

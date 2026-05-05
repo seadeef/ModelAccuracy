@@ -379,6 +379,8 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         south = float(lats.min()) - lat_res / 2.0
         transform = rasterio.transform.Affine(lon_res, 0, west, 0, lat_res, south)
 
+        land_mask = self._build_land_mask(lats, lons, transform)
+
         # Read all available lead days.
         lead_data: dict[int, np.ndarray] = {}
         for fhour in forecast_hours:
@@ -387,7 +389,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             if not npy_path.exists():
                 print(f"  Skipping lead {lead_days} (missing {npy_path.name})")
                 continue
-            lead_data[lead_days] = np.load(npy_path)
+            lead_data[lead_days] = self._apply_land_mask(np.load(npy_path), land_mask)
             print(f"  Lead {lead_days}: {npy_path.name}")
 
         if not lead_data:

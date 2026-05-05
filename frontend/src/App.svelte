@@ -3,7 +3,6 @@
   import { initAuth } from './lib/authSession.svelte.js';
   import { ui, appConfig } from './lib/state.svelte.js';
   import { drawToolGlyph } from './lib/appIcons.js';
-  import { fetchZip } from './lib/api.js';
   import { getModelLeadBounds, tileUrl } from './lib/tile.js';
   import { exportMapImage } from './lib/exportMapImage.js';
   import MapView from './lib/components/MapView.svelte';
@@ -11,8 +10,6 @@
   import Panel from './lib/components/Panel.svelte';
   import DrawTools from './lib/components/DrawTools.svelte';
   let mapView;
-
-  let zipValue = $state('');
 
   function handleModelChange(e) {
     ui.model = e.target.value;
@@ -71,16 +68,12 @@
     }
   }
 
-  async function goToZip() {
-    const raw = zipValue.trim();
-    if (!raw) return;
-    ui.statusMessage = `Looking up ${raw}...`;
-    try {
-      const data = await fetchZip(raw);
-      if (!data.found) { ui.statusMessage = `ZIP not found: ${raw}`; return; }
-      mapView?.flyToZip(data);
-      ui.statusMessage = `Centered on ${data.zip}`;
-    } catch { ui.statusMessage = 'ZIP lookup error'; }
+  function handleLocationSelect(data) {
+    mapView?.flyToLocation(data);
+  }
+
+  function handleSearchStatus(msg) {
+    ui.statusMessage = msg;
   }
 
   /** Show even when a region is selected so the panel can stay open underneath. */
@@ -97,7 +90,12 @@
   <div class="map-fill">
     <MapView bind:this={mapView} />
 
-    <MapToolbar bind:zipValue onOpacityInput={handleOpacityInput} onExport={handleExport} goToZip={goToZip} />
+    <MapToolbar
+      onOpacityInput={handleOpacityInput}
+      onExport={handleExport}
+      onLocationSelect={handleLocationSelect}
+      onSearchStatus={handleSearchStatus}
+    />
 
     {#if ui.statusMessage && ui.statusMessage !== 'Idle'}
       <div class="status-pill">{ui.statusMessage}</div>

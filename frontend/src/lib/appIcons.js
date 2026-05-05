@@ -20,9 +20,6 @@ export const glyphDownloadMap = '<path d="M2 10v3h12v-3"/><path d="M8 2v8M5 7l3 
 export const glyphOpacityMoon =
   '<circle cx="8" cy="8" r="6"/><path d="M8 2a6 6 0 0 1 0 12" fill="currentColor" opacity="0.4"/>';
 
-/** ZIP chevron; parent stroke-width="2" */
-export const glyphZipChevron = '<path d="M6 2l6 6-6 6"/>';
-
 /** Panel close; parent stroke-width="1.5" */
 export const glyphPanelClose = '<path d="M4 4l8 8M12 4l-8 8"/>';
 
