@@ -1,0 +1,36 @@
+# Virtual environment
+venv/
+.venv/
+.venv_bounds/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+lambda_package/
+function.zip
+archive/
+
+# Data and outputs (large or generated)
+model_data/
+prism_data/
+stats_output/
+tiles_output/
+static_export/
+
+# Secrets
+.env
+.maptiler_key
+
+# IDE / OS
+.idea/
+.DS_Store
+*.swp
+*.swo
+.claude
+.cursor
