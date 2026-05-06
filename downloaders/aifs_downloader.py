@@ -4,7 +4,9 @@
 Source: s3://ecmwf-forecasts/{YYYYMMDD}/{HH}z/aifs-single/0p25/oper/
         {YYYYMMDDHH0000}-{N}h-oper-fc.grib2  (every 6h, 0..360h)
 
-`tp` is total precipitation accumulated *from forecast start*, units of meters.
+`tp` is total precipitation accumulated *from forecast start*. The GRIB attr
+`GRIB_units` reports `kg m**-2` (≡ mm of water), so no scaling is applied —
+unlike the GraphCast pipeline whose source delivers meters.
 To get a daily total ending at lead day D we subtract:
     daily_total = tp(D*24) - tp((D-1)*24)
 

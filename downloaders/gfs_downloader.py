@@ -2,9 +2,19 @@
 """GFS downloader.
 
 Downloads APCP (precipitation) GRIB2 files from the NOAA GFS S3 bucket
-using byte-range requests via .idx index files.  After download, each
-GRIB2 is converted to a CONUS-cropped .npy array and the GRIB2 is deleted.
-This matches the NBM pipeline and keeps model_data/ free of GRIB2 files.
+using byte-range requests via .idx index files.
+
+GFS publishes APCP as a `0-N day acc fcst` cumulative bucket at every daily
+forecast hour (f024, f048, ..., f336). To get a daily total ending at lead
+day D we subtract:
+    daily_total = cumulative(D*24) - cumulative((D-1)*24)
+This mirrors the AIFS pipeline (`aifs_downloader.py`).
+
+Output:
+    model_data/gfs/{year}/{YYYYMMDD}_{HH}z/f024_surface.npy ... f336_surface.npy
+    model_data/gfs/{year}/{YYYYMMDD}_{HH}z/_apcp/f024.grib2 ...   (raw cumulative APCP)
+    model_data/gfs/grid_lats.npy
+    model_data/gfs/grid_lons.npy
 """
 
 from __future__ import annotations
@@ -29,64 +39,64 @@ GFS_VARIABLE = "APCP"
 US_CROP_BOUNDS = (-130.0, 20.0, -60.0, 55.0)
 
 
-def _grib2_to_npy(grib_path: Path, output_dir: Path) -> None:
-    """Convert a single GFS GRIB2 to a CONUS-cropped .npy and delete the GRIB2.
-
-    Also saves grid_lats.npy / grid_lons.npy on first call.
-    Must run in a single process (cfgrib is not thread-safe).
-    """
+def _convert_grib_to_npy(grib_path: Path, prev_grib_path: Path | None, npy_path: Path, output_dir: Path) -> None:
+    """Compute APCP(fh) - APCP(fh-24), crop to CONUS, save as .npy. cfgrib is not thread-safe."""
     import numpy as np
     import xarray as xr
 
-    npy_path = grib_path.with_suffix(".npy")
     if npy_path.exists():
-        grib_path.unlink(missing_ok=True)
         return
 
     ds = xr.open_dataset(grib_path, engine="cfgrib")
     if not ds.data_vars:
         ds.close()
-        grib_path.unlink(missing_ok=True)
         return
-    var_name = list(ds.data_vars)[0]
-    data = ds[var_name].values.astype(np.float32)
+    var = list(ds.data_vars)[0]
+    cur = ds[var].values.astype(np.float32)
     lats = ds["latitude"].values
     lons = ds["longitude"].values
     ds.close()
 
-    # Normalize grid: wrap longitudes, ensure south-to-north.
+    if prev_grib_path is not None and prev_grib_path.exists():
+        ds_prev = xr.open_dataset(prev_grib_path, engine="cfgrib")
+        var_p = list(ds_prev.data_vars)[0]
+        prev = ds_prev[var_p].values.astype(np.float32)
+        ds_prev.close()
+        diff = cur - prev
+    else:
+        # No predecessor (f024 has no f000 cumulative — model starts at 0).
+        diff = cur
+
+    # Normalize grid: -180..180 longitude, south-to-north latitude.
     if lons.max() > 180:
         lons = ((lons + 180) % 360) - 180
         sort_idx = np.argsort(lons)
         lons = lons[sort_idx]
-        data = data[:, sort_idx]
+        diff = diff[:, sort_idx]
     if lats[0] > lats[-1]:
         lats = lats[::-1]
-        data = data[::-1, :]
+        diff = diff[::-1, :]
 
-    # Crop to CONUS.
     west, south, east, north = US_CROP_BOUNDS
     lat_mask = (lats >= south) & (lats <= north)
     lon_mask = (lons >= west) & (lons <= east)
     lat_idx = np.where(lat_mask)[0]
     lon_idx = np.where(lon_mask)[0]
-    data = data[np.ix_(lat_idx, lon_idx)]
-    lats = lats[lat_idx]
-    lons = lons[lon_idx]
+    cropped = diff[np.ix_(lat_idx, lon_idx)]
+    kept_lats = lats[lat_idx]
+    kept_lons = lons[lon_idx]
 
-    np.save(npy_path, data)
+    # APCP is kg m^-2 == mm; clip tiny negative noise from subtraction.
+    np.clip(cropped, 0.0, None, out=cropped)
 
-    # Save grid coords once.
-    grid_lats = output_dir / "grid_lats.npy"
-    grid_lons = output_dir / "grid_lons.npy"
-    if not grid_lats.exists():
-        np.save(grid_lats, lats)
-        np.save(grid_lons, lons)
+    npy_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(npy_path, cropped)
 
-    grib_path.unlink(missing_ok=True)
-    # cfgrib may leave a .idx sidecar file.
-    for idx in grib_path.parent.glob(grib_path.name + ".*idx*"):
-        idx.unlink(missing_ok=True)
+    grid_lats_p = output_dir / "grid_lats.npy"
+    grid_lons_p = output_dir / "grid_lons.npy"
+    if not grid_lats_p.exists():
+        np.save(grid_lats_p, kept_lats)
+        np.save(grid_lons_p, kept_lons)
 
 
 @dataclass(frozen=True)
@@ -137,30 +147,45 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         idx_path = f"gfs.{date_str}/{cycle_str}/atmos/{idx_filename}"
         return grib_filename, grib_path, idx_path
 
-    def _output_npy(self, init_date: datetime, fhour: int, level: str) -> Path:
-        """Final .npy output path (what compute_stats reads)."""
+    def _init_dir(self, init_date: datetime) -> Path:
         date_str = init_date.strftime("%Y%m%d")
         cycle_str = f"{GFS_CYCLE:02d}"
+        out = self.output_dir / str(init_date.year) / f"{date_str}_{cycle_str}z"
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    def _output_npy(self, init_date: datetime, fhour: int, level: str) -> Path:
+        """Final daily-total .npy path (what compute_stats reads)."""
         safe_level = level.replace(" ", "_")
-        out_dir = self.output_dir / str(init_date.year) / f"{date_str}_{cycle_str}z"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        return out_dir / f"f{fhour:03d}_{safe_level}.npy"
+        return self._init_dir(init_date) / f"f{fhour:03d}_{safe_level}.npy"
 
-    def _output_grib(self, init_date: datetime, fhour: int, level: str) -> Path:
-        """Temporary GRIB2 path (deleted after conversion to .npy)."""
-        return self._output_npy(init_date, fhour, level).with_suffix(".grib2")
+    def _apcp_grib(self, init_date: datetime, fhour: int) -> Path:
+        """Cumulative APCP GRIB2 path (kept for re-assembly)."""
+        d = self._init_dir(init_date) / "_apcp"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"f{fhour:03d}.grib2"
 
-    def _find_byte_range(self, idx_text: str, level: str):
+    def _find_byte_range(self, idx_text: str, level: str, fhour: int):
+        """Locate cumulative APCP at the requested daily fhour in the .idx file.
+
+        GFS publishes APCP as `0-N day acc fcst` at f024…f336 (matched here).
+        Raises ValueError if a non-daily fhour is requested.
+        """
+        if fhour <= 0 or fhour % 24 != 0:
+            raise ValueError(f"GFS APCP requires a daily fhour (multiple of 24, ≥24); got fhour={fhour}")
+        expected_desc = f"0-{fhour // 24} day acc fcst"
+
         lines = idx_text.strip().split("\n")
         start_byte = None
         end_byte = None
         for i, line in enumerate(lines):
             parts = line.split(":")
-            if len(parts) < 5:
+            if len(parts) < 6:
                 continue
             var_code = parts[3].strip()
             lvl_desc = parts[4].strip()
-            if var_code == GFS_VARIABLE and lvl_desc == level:
+            time_desc = parts[5].strip()
+            if var_code == GFS_VARIABLE and lvl_desc == level and time_desc == expected_desc:
                 start_byte = int(parts[1])
                 if i + 1 < len(lines):
                     next_parts = lines[i + 1].split(":")
@@ -174,9 +199,8 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         if npy_file.exists():
             return task, "exists"
 
-        grib_file = self._output_grib(init_date, fhour, level)
+        grib_file = self._apcp_grib(init_date, fhour)
         if grib_file.exists():
-            # GRIB2 from a previous run that wasn't converted yet; skip download.
             return task, "exists"
 
         grib_filename, grib_path, idx_path = self._paths(init_date, fhour)
@@ -194,7 +218,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
                 if idx_resp.status_code == 404:
                     return task, "not_found_idx"
                 idx_resp.raise_for_status()
-                start_byte, end_byte = self._find_byte_range(idx_resp.text, level)
+                start_byte, end_byte = self._find_byte_range(idx_resp.text, level, fhour)
                 if start_byte is None:
                     return task, "not_found_var"
                 headers = {"Range": f"bytes={start_byte}-{end_byte}"} if end_byte is not None else {"Range": f"bytes={start_byte}-"}
@@ -265,25 +289,34 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
         if not init_dates:
             raise ValueError("No init dates selected. Check start/end dates.")
 
+        # Validate: GFS only registers daily fhours, and we need cumulative descs `0-N day acc fcst`.
+        daily_fhours = sorted({int(fh) for fh in forecast_hours})
+        for fh in daily_fhours:
+            if fh <= 0 or fh % 24 != 0:
+                raise ValueError(f"GFS forecast hours must be daily multiples of 24 (≥24); got {fh}")
+
         tasks: list[DownloadTask] = []
         skipped = 0
         for d in init_dates:
-            for fh in forecast_hours:
-                t = DownloadTask(d, int(fh), str(level))
-                if self._output_npy(t.init_date, t.fhour, t.level).exists():
-                    skipped += 1
-                else:
-                    tasks.append(t)
+            # If every daily total is already assembled for this init, skip the init entirely.
+            if all(self._output_npy(d, fh, level).exists() for fh in daily_fhours):
+                skipped += 1
+                continue
+            for fh in daily_fhours:
+                # Skip download if cumulative grib already on disk OR daily already assembled.
+                if self._apcp_grib(d, fh).exists() or self._output_npy(d, fh, level).exists():
+                    continue
+                tasks.append(DownloadTask(d, fh, str(level)))
 
         print("\n" + "=" * 70)
         print("Parallel GFS filtered download (idx + Range)")
         print(f"Period: {start.date()} to {end.date()} | Daily")
         print(f"Cycle: {GFS_CYCLE:02d}z")
-        print(f"Forecast hours: {forecast_hours}")
-        print(f"Variable: {GFS_VARIABLE} | Level: {level}")
+        print(f"Forecast hours: {daily_fhours}")
+        print(f"Variable: {GFS_VARIABLE} (cumulative 0-N day acc) | Level: {level}")
         print(f"Workers: {self.max_workers} | Retries: {self.max_retries}")
         print(f"Output: {self.output_dir.resolve()}")
-        print(f"Tasks: {len(tasks)} to download | {skipped} already exist")
+        print(f"Tasks: {len(tasks)} cumulative grib2 to download | {skipped} inits already complete")
         print("=" * 70)
 
         results = self._run_parallel(
@@ -298,7 +331,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             if status == "not_found_idx" and len(examples) < 5:
                 examples.append(f"Missing idx: {task.init_date:%Y-%m-%d} {GFS_CYCLE:02d}z f{task.fhour:03d}")
             elif status == "not_found_var" and len(examples) < 5:
-                examples.append(f"Var not found: {GFS_VARIABLE} @ {task.level} in {task.init_date:%Y-%m-%d} {GFS_CYCLE:02d}z f{task.fhour:03d}")
+                examples.append(f"Var not found: {GFS_VARIABLE} @ {task.level} 0-{task.fhour//24}d in {task.init_date:%Y-%m-%d} {GFS_CYCLE:02d}z f{task.fhour:03d}")
             elif status.startswith("failed") and len(examples) < 5:
                 examples.append(f"Failed: {task.init_date:%Y-%m-%d} {GFS_CYCLE:02d}z f{task.fhour:03d} ({GFS_VARIABLE}@{task.level}) -> {status}")
         if examples:
@@ -307,22 +340,65 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
                 print("  " + e)
         print("-" * 70)
 
-        # Convert GRIB2 → cropped .npy and delete GRIB2.
-        # cfgrib is not thread-safe, so this runs sequentially.
-        # Pick up both freshly downloaded and previously stranded .grib2 files.
-        grib_files = []
-        for task, status in results:
-            grib = self._output_grib(task.init_date, task.fhour, task.level)
-            npy = self._output_npy(task.init_date, task.fhour, task.level)
-            if grib.exists() and not npy.exists():
-                grib_files.append(grib)
-        if grib_files:
-            print(f"Converting {len(grib_files)} GRIB2 files to .npy...")
-            for i, grib in enumerate(grib_files, 1):
-                _grib2_to_npy(grib, self.output_dir)
-                if i % 25 == 0 or i == len(grib_files):
-                    print(f"  Converted {i}/{len(grib_files)}", flush=True)
-            print()
+        print("\nAssembling daily totals from cumulative APCP...")
+        self._assemble_daily(init_dates, daily_fhours, level)
+
+
+    def _assemble_daily(
+        self,
+        init_dates: list[datetime],
+        daily_fhours: list[int],
+        level: str,
+    ) -> None:
+        """Compute daily = cumulative(fh) - cumulative(fh-24); write .npy. cfgrib is not thread-safe."""
+        work: list[tuple[Path, Path | None, Path]] = []
+        skipped_existing = 0
+        skipped_missing = 0
+
+        for init_date in init_dates:
+            for daily_fh in daily_fhours:
+                npy_out = self._output_npy(init_date, daily_fh, level)
+                if npy_out.exists():
+                    skipped_existing += 1
+                    continue
+                cur_grib = self._apcp_grib(init_date, daily_fh)
+                prev_fh = daily_fh - 24
+                # GFS publishes no f000 cumulative; for daily_fh=24 there is no predecessor.
+                prev_grib = self._apcp_grib(init_date, prev_fh) if prev_fh >= 24 else None
+                if not cur_grib.exists():
+                    skipped_missing += 1
+                    continue
+                if prev_grib is not None and not prev_grib.exists():
+                    skipped_missing += 1
+                    continue
+                work.append((cur_grib, prev_grib, npy_out))
+
+        if not work:
+            print(f"\nAssembly: 0 created | {skipped_existing} existed | {skipped_missing} skipped (missing apcp)")
+            return
+
+        print(f"  {len(work)} daily files to assemble (sequential cfgrib)...")
+        done = 0
+        failed = 0
+        for cur, prev, npy_out in work:
+            try:
+                _convert_grib_to_npy(cur, prev, npy_out, self.output_dir)
+                done += 1
+            except Exception as e:
+                failed += 1
+                if failed <= 5:
+                    print(f"  WARNING: assembly failed for {npy_out}: {e}")
+            n = done + failed
+            if n % 100 == 0 or n == len(work):
+                print(f"  Assembly progress: {n}/{len(work)}", flush=True)
+        # Clean up cfgrib sidecar idx files.
+        for init_date in init_dates:
+            apcp_dir = self._init_dir(init_date) / "_apcp"
+            if apcp_dir.exists():
+                for sidecar in apcp_dir.glob("*.idx"):
+                    sidecar.unlink(missing_ok=True)
+        print(f"\nAssembly: {done} created | {skipped_existing} existed | {skipped_missing} skipped"
+              + (f" | {failed} failed" if failed else ""))
 
 
     def extract_forecast(
