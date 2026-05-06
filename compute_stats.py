@@ -17,6 +17,7 @@ import numpy as np
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL, window_to_key
 from statistics_plugins.registry import VERIFICATION_STATISTICS
 from stats_grid_metadata import load_model_metadata, save_model_metadata
+from stats_io import write_lead_windows
 
 try:
     import rasterio
@@ -788,6 +789,17 @@ def _sum_lead_accumulators(
     return combined
 
 
+def _sum_accumulator_dicts(
+    accs: list[Dict[str, np.ndarray]],
+) -> Dict[str, np.ndarray]:
+    """Sum a list of {key: array} accumulators. All inputs share the same keys/shapes."""
+    out = {k: np.zeros_like(v) for k, v in accs[0].items()}
+    for acc in accs:
+        for k, v in acc.items():
+            out[k] += v
+    return out
+
+
 def _write_lead_files(
     stat_dir: Path,
     plugin,
@@ -798,23 +810,16 @@ def _write_lead_files(
         outputs = plugin.finalize(lead_accs[lead])
         np.savez_compressed(stat_dir / f"lead_{lead}.npz", **outputs)
 
-    # Build combined lead windows.
-    for start, end in _active_lead_windows:
-        lead_ids = [lead for lead in sorted(lead_accs) if start <= lead <= end]
-        if len(lead_ids) != end - start + 1:
-            continue
-        window_acc: dict[str, np.ndarray] | None = None
-        for lead in lead_ids:
-            acc = lead_accs[lead]
-            if window_acc is None:
-                window_acc = {k: np.zeros_like(v) for k, v in acc.items()}
-            for k, v in acc.items():
-                window_acc[k] += v
-        if window_acc is None:
-            continue
-        outputs = plugin.finalize(window_acc)
-        window_key = window_to_key(start, end)
-        np.savez_compressed(stat_dir / f"lead_{window_key}.npz", **outputs)
+    def _write_window(start: int, end: int, acc: Dict[str, np.ndarray]) -> None:
+        outputs = plugin.finalize(acc)
+        np.savez_compressed(stat_dir / f"lead_{window_to_key(start, end)}.npz", **outputs)
+
+    write_lead_windows(
+        lead_accs,
+        _active_lead_windows,
+        write_fn=_write_window,
+        combine_fn=_sum_accumulator_dicts,
+    )
 
 
 def _write_stats(

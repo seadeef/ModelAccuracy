@@ -7,7 +7,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Callable, TYPE_CHECKING, TypeVar
 
 import numpy as np
 import rasterio
@@ -15,6 +15,9 @@ from rasterio.enums import Resampling
 from rasterio.warp import reproject
 import requests
 from requests.adapters import HTTPAdapter
+
+if TYPE_CHECKING:
+    from model_registry import ModelConfig
 
 T = TypeVar("T")
 
@@ -128,6 +131,107 @@ class BaseDownloader:
         start = datetime(int(start_year), 1, 1)
         end = datetime(int(end_year), 12, 31)
         return self._download(start, end, **kwargs)
+
+    def extract_forecast(
+        self,
+        model_config: "ModelConfig",
+        *,
+        init_date: datetime | None = None,
+        output_root: Path | None = None,
+    ) -> None:
+        """Extract per-lead forecast .npy files into stats_output/forecast/ format.
+
+        Discovers the latest init dir for ``model_config.cycle_hour``, loads
+        each daily-lead .npy, applies the CONUS land mask, writes per-lead
+        ``lead_{N}.npz`` files, and writes per-window averages for
+        ``model_config.lead_windows``.
+        """
+        import rasterio.transform
+        from model_registry import window_to_key
+        from stats_io import write_lead_windows
+
+        cycle = model_config.cycle_hour
+        forecast_hours = model_config.forecast_hours
+        lead_windows = list(model_config.lead_windows)
+
+        model_dir = self.output_dir
+        if output_root is None:
+            output_root = Path("stats_output")
+        forecast_dir = output_root / "forecast"
+        forecast_dir.mkdir(parents=True, exist_ok=True)
+
+        if init_date is None:
+            all_inits = sorted(model_dir.glob(f"*/*_{cycle:02d}z"), reverse=True)
+            for candidate in all_inits:
+                if any(candidate.glob("f*_*.npy")):
+                    init_date = datetime.strptime(candidate.name[:8], "%Y%m%d")
+                    break
+            if init_date is None:
+                raise SystemExit(f"No init directories with data found under {model_dir}.")
+            print(f"Using most recent init date: {init_date.date()}")
+
+        date_str = init_date.strftime("%Y%m%d")
+        init_dir = model_dir / str(init_date.year) / f"{date_str}_{cycle:02d}z"
+        if not init_dir.exists():
+            raise SystemExit(f"Init directory not found: {init_dir}")
+
+        grid_lats_path = model_dir / "grid_lats.npy"
+        grid_lons_path = model_dir / "grid_lons.npy"
+        if not grid_lats_path.exists() or not grid_lons_path.exists():
+            raise SystemExit(
+                f"Grid coordinate files not found under {model_dir}. Run download first."
+            )
+
+        lats = np.load(grid_lats_path)
+        lons = np.load(grid_lons_path)
+        lat_res = abs(float(lats[1] - lats[0]))
+        lon_res = abs(float(lons[1] - lons[0]))
+        west = float(lons.min()) - lon_res / 2.0
+        south = float(lats.min()) - lat_res / 2.0
+        transform = rasterio.transform.Affine(lon_res, 0, west, 0, lat_res, south)
+
+        land_mask = self._build_land_mask(lats, lons, transform)
+
+        lead_data: dict[int, np.ndarray] = {}
+        for fhour in forecast_hours:
+            lead_days = fhour // 24
+            npy_path = init_dir / f"f{fhour:03d}_surface.npy"
+            if not npy_path.exists():
+                print(f"  Skipping lead {lead_days} (missing {npy_path.name})")
+                continue
+            lead_data[lead_days] = self._apply_land_mask(np.load(npy_path), land_mask)
+            print(f"  Lead {lead_days}: {npy_path.name}")
+
+        if not lead_data:
+            raise SystemExit("No forecast data found.")
+
+        np.savez_compressed(
+            forecast_dir / "metadata.npz",
+            lats=lats,
+            lons=lons,
+            transform=np.array(transform),
+            crs="EPSG:4326",
+            init_date=init_date.strftime("%Y-%m-%d"),
+        )
+
+        for lead_days, data in sorted(lead_data.items()):
+            np.savez_compressed(forecast_dir / f"lead_{lead_days}.npz", precip=data)
+            print(f"  Wrote lead_{lead_days}.npz")
+
+        def _write_window(start: int, end: int, arr: np.ndarray) -> None:
+            wkey = window_to_key(start, end)
+            np.savez_compressed(forecast_dir / f"lead_{wkey}.npz", precip=arr)
+            print(f"  Wrote lead_{wkey}.npz (avg of leads {start}-{end})")
+
+        write_lead_windows(
+            lead_data,
+            lead_windows,
+            write_fn=_write_window,
+            combine_fn=lambda arrs: np.mean(arrs, axis=0),
+        )
+
+        print(f"\nWrote {len(lead_data)} lead files + windows to {forecast_dir}")
+        print(f"Init date: {init_date.date()} {cycle:02d}z")
 
     def _byte_range_fetch(
         self,

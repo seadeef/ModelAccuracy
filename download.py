@@ -193,9 +193,8 @@ def _run_forecast(config: ModelConfig) -> None:
     output_root = Path("stats_output") / config.key
     print(f"\n--- Extracting forecast for model '{config.key}' ---")
     downloader.extract_forecast(
+        config,
         init_date=resolved_date,
-        forecast_hours=forecast_hours,
-        lead_windows=list(config.lead_windows),
         output_root=output_root,
     )
 
