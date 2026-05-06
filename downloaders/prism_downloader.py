@@ -65,16 +65,22 @@ class PRISMDownloaderParallel(BaseDownloader):
         date_dir.mkdir(parents=True, exist_ok=True)
         return date_dir / "data.zip"
 
-    def _day_download_complete(self, date: datetime) -> bool:
-        """True if we already have this day on disk (zip and/or extracted grid).
+    def _day_download_complete(self, date: datetime, *, want_extract: bool) -> bool:
+        """True if we already have this day on disk in the form the caller wants.
 
         ``download.py`` uses ``remove_zip_after_extract=True``, so successful days
         often only have ``data.tif`` (or ``data.*``) with no ``data.zip``. Skipping
         only on ``data.zip`` caused full re-downloads of every day in the range.
+
+        When ``want_extract`` is True we require ``data.tif`` — a leftover
+        ``data.zip`` from a prior failed extraction does not count as complete
+        (``compute_stats`` would otherwise silently skip the date).
         """
         date_dir = self.output_dir / str(date.year) / f"{date:%Y%m%d}"
         if not date_dir.is_dir():
             return False
+        if want_extract:
+            return (date_dir / "data.tif").exists()
         if (date_dir / "data.zip").exists():
             return True
         for p in date_dir.iterdir():
@@ -101,8 +107,21 @@ class PRISMDownloaderParallel(BaseDownloader):
         url = self._daily_url(date)
         out = self._output_path(date)
 
-        if self._day_download_complete(date):
+        if self._day_download_complete(date, want_extract=extract):
             return task, "exists"
+
+        # Self-heal: a previous run downloaded the zip but failed to extract.
+        # If the zip is on disk and extraction is requested, extract it and skip
+        # the download.
+        if extract and out.exists() and not (out.parent / "data.tif").exists():
+            try:
+                self.extract_zip(out, date)
+                if self.remove_zip_after_extract and out.exists():
+                    out.unlink(missing_ok=True)
+                return task, "exists"
+            except Exception:
+                # Fall through to a fresh download attempt.
+                pass
 
         last_err = None
         for attempt in range(1, self.max_retries + 1):
@@ -181,7 +200,7 @@ class PRISMDownloaderParallel(BaseDownloader):
         tasks: list[PRISMTask] = []
         skipped = 0
         for d in dates:
-            if self._day_download_complete(d):
+            if self._day_download_complete(d, want_extract=extract):
                 skipped += 1
             else:
                 tasks.append(PRISMTask(date=d, extract=extract))

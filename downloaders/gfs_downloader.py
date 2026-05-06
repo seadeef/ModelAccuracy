@@ -426,7 +426,7 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
 
         # Find init directory.
         if init_date is None:
-            all_inits = sorted(gfs_dir.glob("*/*_12z"), reverse=True)
+            all_inits = sorted(gfs_dir.glob(f"*/*_{GFS_CYCLE:02d}z"), reverse=True)
             for candidate in all_inits:
                 if any(candidate.glob("f*_*.npy")):
                     init_date = datetime.strptime(candidate.name[:8], "%Y%m%d")

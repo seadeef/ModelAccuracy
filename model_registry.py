@@ -20,6 +20,9 @@ class ModelConfig:
     lead_windows: tuple[tuple[int, int], ...] = ((1, 7), (7, 14), (1, 10))
     cycle_hour: int = 12
     data_dir: str = "model_data/gfs"
+    # Hours after the cycle hour at which the full forecast is available to
+    # download. Used by --forecast mode to pick today vs. yesterday.
+    publish_delay_hours: int = 14
     default: bool = False
 
     @property
@@ -49,6 +52,7 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         lead_windows=((1, 7), (7, 14), (1, 10)),
         cycle_hour=12,
         data_dir="model_data/gfs",
+        publish_delay_hours=14,
         default=True,
     ),
     "nbm": ModelConfig(
@@ -66,6 +70,7 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         lead_windows=((1, 7), (7, 11), (1, 10)),
         cycle_hour=12,
         data_dir="model_data/nbm",
+        publish_delay_hours=5,
     ),
     "graphcast": ModelConfig(
         key="graphcast",
@@ -82,6 +87,7 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         lead_windows=((1, 7), (7, 10), (1, 10)),
         cycle_hour=12,
         data_dir="model_data/graphcast",
+        publish_delay_hours=16,
     ),
     "aifs": ModelConfig(
         key="aifs",
@@ -98,6 +104,7 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         lead_windows=((1, 7), (7, 14), (1, 10)),
         cycle_hour=12,
         data_dir="model_data/aifs",
+        publish_delay_hours=6,
     ),
 }
 

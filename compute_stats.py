@@ -40,12 +40,13 @@ PRISM_DIR = Path("prism_data")
 OUTPUT_ROOT: Path = Path("stats_output")
 LEAD_DAYS_MIN: int = 1
 LEAD_DAYS_MAX: int = 14
+CYCLE_HOUR: int = MODEL_REGISTRY[DEFAULT_MODEL].cycle_hour
 _active_lead_windows: list[tuple[int, int]] = list(MODEL_REGISTRY[DEFAULT_MODEL].lead_windows)
 
 
 def _configure_for_model(model_key: str) -> None:
     global GFS_DIR, GFS_GRID_LATS_PATH, GFS_GRID_LONS_PATH, OUTPUT_ROOT
-    global LEAD_DAYS_MIN, LEAD_DAYS_MAX, _active_lead_windows
+    global LEAD_DAYS_MIN, LEAD_DAYS_MAX, CYCLE_HOUR, _active_lead_windows
     config = MODEL_REGISTRY[model_key]
     GFS_DIR = Path(config.data_dir)
     GFS_GRID_LATS_PATH = GFS_DIR / "grid_lats.npy"
@@ -53,6 +54,7 @@ def _configure_for_model(model_key: str) -> None:
     OUTPUT_ROOT = Path("stats_output") / model_key
     LEAD_DAYS_MIN = config.lead_days_min
     LEAD_DAYS_MAX = config.lead_days_max
+    CYCLE_HOUR = config.cycle_hour
     _active_lead_windows = list(config.lead_windows)
 
 # Task discovery: downloaders produce .npy files (CONUS-cropped float32 arrays).
@@ -139,10 +141,11 @@ def _parse_init_date(dir_name: str) -> datetime:
 def _list_gfs_inits() -> list[Path]:
     if not GFS_DIR.exists():
         raise FileNotFoundError(f"Missing GFS directory: {GFS_DIR.resolve()}")
+    suffix = f"_{CYCLE_HOUR:02d}z"
     init_dirs: list[Path] = []
     for year_dir in sorted(p for p in GFS_DIR.iterdir() if p.is_dir()):
         for init_dir in sorted(year_dir.iterdir()):
-            if init_dir.is_dir() and init_dir.name.endswith("_12z"):
+            if init_dir.is_dir() and init_dir.name.endswith(suffix):
                 init_dirs.append(init_dir)
     return init_dirs
 

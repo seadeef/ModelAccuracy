@@ -149,7 +149,7 @@ def _forecast_dir_has_data(config: ModelConfig, date: datetime) -> bool:
 
 def _run_forecast(config: ModelConfig) -> None:
     forecast_hours = config.forecast_hours
-    today = datetime.now(timezone.utc) - timedelta(hours=14)  # GFS 12z needs ~14h to publish
+    today = datetime.now(timezone.utc) - timedelta(hours=config.publish_delay_hours)
     today = today.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday = today - timedelta(days=1)
 
@@ -181,6 +181,14 @@ def _run_forecast(config: ModelConfig) -> None:
             if empty_dir.exists() and not any(empty_dir.iterdir()):
                 empty_dir.rmdir()
             print(f"No forecast data available for {date_str}, trying previous day...")
+
+    if resolved_date is None:
+        print(
+            f"\nERROR: forecast download failed for model '{config.key}' on both "
+            f"{today.date()} and {yesterday.date()}. Skipping extraction so a stale "
+            f"forecast is not republished."
+        )
+        return
 
     output_root = Path("stats_output") / config.key
     print(f"\n--- Extracting forecast for model '{config.key}' ---")

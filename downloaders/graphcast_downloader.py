@@ -142,19 +142,13 @@ def _process_init_nc(args: tuple) -> tuple[str, int, int, str]:
                         return init_iso, cycle, 0, f"failed: no apcp ({list(ds.data_vars)})"
                     lats = ds["latitude"].values.astype(np.float32)
                     lons = ds["longitude"].values.astype(np.float32)
-                    lat_slc, lon_slc, kept_lats, kept_lons, lon_sort, flip_lat = _conus_index_slices(lats, lons)
+                    lat_slc, lon_slc, _, _, lon_sort, flip_lat = _conus_index_slices(lats, lons)
                     apcp = ds["apcp"].isel(latitude=lat_slc, longitude=lon_slc).values.astype(np.float32)
                     apcp = apcp[:, :, lon_sort]
                     if flip_lat:
                         apcp = apcp[:, ::-1, :]
                 finally:
                     ds.close()
-
-            grid_lats_p = output_dir / "grid_lats.npy"
-            grid_lons_p = output_dir / "grid_lons.npy"
-            if not grid_lats_p.exists():
-                np.save(grid_lats_p, kept_lats)
-                np.save(grid_lons_p, kept_lons)
 
             wrote = _write_dailies(apcp, init_dir, daily_fhours)
             return init_iso, cycle, wrote, "processed"
@@ -286,6 +280,11 @@ class GraphCastDownloaderParallel(BaseDownloader):
               f"{skipped} already complete")
         print("=" * 70)
 
+        # Pre-write grid_lats.npy / grid_lons.npy in the parent process so the
+        # multiprocess .nc workers don't race on the write.
+        sample_nc_init = nc_tasks[0] if nc_tasks else None
+        self._ensure_grid_files(zarr_ds, sample_nc_init, cycle)
+
         # ── Path 1: parquet-ref zarr via threads ──────────────────────
         if zarr_tasks and zarr_ds is not None:
             self._run_zarr_threads(zarr_ds, zarr_tasks, cycle, daily_fhours)
@@ -293,6 +292,58 @@ class GraphCastDownloaderParallel(BaseDownloader):
         # ── Path 2: direct .nc via processes ──────────────────────────
         if nc_tasks:
             self._run_nc_processes(nc_tasks, cycle, daily_fhours)
+
+    def _ensure_grid_files(self, zarr_ds, sample_nc_init: datetime | None, cycle: int) -> None:
+        """Write grid_lats.npy/grid_lons.npy if missing.
+
+        Runs once in the parent process. Prefers the parquet zarr if it opened;
+        otherwise opens one sample .nc to derive the grid. The .nc workers then
+        find the files already on disk and skip the (racy) write.
+        """
+        import numpy as np
+
+        grid_lats_p = self.output_dir / "grid_lats.npy"
+        grid_lons_p = self.output_dir / "grid_lons.npy"
+        if grid_lats_p.exists() and grid_lons_p.exists():
+            return
+
+        lats = lons = None
+        if zarr_ds is not None:
+            try:
+                lats = zarr_ds["latitude"].values.astype(np.float32)
+                lons = zarr_ds["longitude"].values.astype(np.float32)
+            except Exception as e:
+                print(f"  WARNING: could not derive grid from parquet zarr: {e}")
+
+        if (lats is None or lons is None) and sample_nc_init is not None:
+            try:
+                import s3fs
+                import xarray as xr
+                date_str = sample_nc_init.strftime("%Y%m%d")
+                cycle_str = f"{cycle:02d}"
+                mmdd = sample_nc_init.strftime("%m%d")
+                fname = f"GRAP_v100_GFS_{date_str}{cycle_str}_f000_f240_06.nc"
+                key = f"noaa-oar-mlwp-data/GRAP_v100_GFS/{sample_nc_init.year}/{mmdd}/{fname}"
+                fs = s3fs.S3FileSystem(anon=True)
+                with fs.open(key, "rb") as fh:
+                    ds = xr.open_dataset(fh, engine="h5netcdf")
+                    try:
+                        lats = ds["latitude"].values.astype(np.float32)
+                        lons = ds["longitude"].values.astype(np.float32)
+                    finally:
+                        ds.close()
+            except Exception as e:
+                print(f"  WARNING: could not pre-derive grid from sample .nc "
+                      f"({e}); workers may race on grid file write.")
+
+        if lats is None or lons is None:
+            return
+
+        _, _, kept_lats, kept_lons, _, _ = _conus_index_slices(lats, lons)
+        if not grid_lats_p.exists():
+            np.save(grid_lats_p, kept_lats)
+        if not grid_lons_p.exists():
+            np.save(grid_lons_p, kept_lons)
 
     def _run_zarr_threads(
         self,
@@ -304,15 +355,10 @@ class GraphCastDownloaderParallel(BaseDownloader):
         import numpy as np
 
         # Pre-compute CONUS slices from the dataset (they're constant across inits).
+        # Grid files are written in the parent process via _ensure_grid_files.
         lats = zarr_ds["latitude"].values.astype(np.float32)
         lons = zarr_ds["longitude"].values.astype(np.float32)
-        lat_slc, lon_slc, kept_lats, kept_lons, lon_sort, flip_lat = _conus_index_slices(lats, lons)
-
-        grid_lats_p = self.output_dir / "grid_lats.npy"
-        grid_lons_p = self.output_dir / "grid_lons.npy"
-        if not grid_lats_p.exists():
-            np.save(grid_lats_p, kept_lats)
-            np.save(grid_lons_p, kept_lons)
+        lat_slc, lon_slc, _, _, lon_sort, flip_lat = _conus_index_slices(lats, lons)
 
         apcp = zarr_ds["apcp"].isel(latitude=lat_slc, longitude=lon_slc)
 
