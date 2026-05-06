@@ -49,11 +49,6 @@ class PRISMDownloaderParallel(BaseDownloader):
         )
         self.remove_zip_after_extract = bool(remove_zip_after_extract)
 
-    def _status_key(self, status: str) -> str:
-        if status.startswith("failed"):
-            return "failed"
-        return status
-
     def _daily_filename(self, date: datetime) -> str:
         return f"prism_{PRISM_VARIABLE}_us_25m_{date:%Y%m%d}.zip"
 
@@ -163,38 +158,13 @@ class PRISMDownloaderParallel(BaseDownloader):
 
         return task, f"failed: {last_err}"
 
-    def _date_list(self, start_date: str | datetime, end_date: str | datetime) -> list[datetime]:
-        if isinstance(start_date, str):
-            start_date = datetime.strptime(start_date, "%Y-%m-%d")
-        if isinstance(end_date, str):
-            end_date = datetime.strptime(end_date, "%Y-%m-%d")
-        current = datetime(start_date.year, start_date.month, start_date.day)
-        end = datetime(end_date.year, end_date.month, end_date.day)
-        dates = []
-        while current <= end:
+    def _download(self, start: datetime, end: datetime, *, extract: bool = True) -> None:
+        current = datetime(start.year, start.month, start.day)
+        end0 = datetime(end.year, end.month, end.day)
+        dates: list[datetime] = []
+        while current <= end0:
             dates.append(current)
             current += timedelta(days=1)
-        return dates
-
-    def download_date_range(
-        self,
-        start_date: str | datetime,
-        end_date: str | datetime,
-        extract: bool = True,
-    ) -> None:
-        self._download(self._date_list(start_date, end_date), extract=extract)
-
-    def download_year_range(
-        self,
-        start_year: int,
-        end_year: int,
-        extract: bool = True,
-    ) -> None:
-        start_date = datetime(int(start_year), 1, 1)
-        end_date = datetime(int(end_year), 12, 31)
-        self._download(self._date_list(start_date, end_date), extract=extract)
-
-    def _download(self, dates: list[datetime], extract: bool = True) -> None:
         if not dates:
             raise ValueError("No dates selected.")
         tasks: list[PRISMTask] = []

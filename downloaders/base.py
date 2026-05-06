@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -97,9 +98,35 @@ class BaseDownloader:
     _build_land_mask = staticmethod(build_land_mask)
     _apply_land_mask = staticmethod(apply_land_mask)
 
+    @staticmethod
+    def _to_dt(d) -> datetime:
+        """Normalize 'YYYY-MM-DD' string or datetime to datetime."""
+        if isinstance(d, str):
+            return datetime.strptime(d, "%Y-%m-%d")
+        return d
+
     def _status_key(self, status: str) -> str:
-        """Map raw status string to a count key. Override in subclasses."""
+        """Map raw status string to a count key. Override in subclasses for custom mappings.
+
+        Default collapses 'downloaded ...' → 'downloaded' and 'failed: ...' → 'failed'.
+        """
+        if status.startswith("downloaded"):
+            return "downloaded"
+        if status.startswith("failed"):
+            return "failed"
         return status
+
+    def download_date_range(self, start_date, end_date, **kwargs):
+        """Download a date range. Subclasses define _download(start, end, **kw)."""
+        start = self._to_dt(start_date)
+        end = self._to_dt(end_date)
+        return self._download(start, end, **kwargs)
+
+    def download_year_range(self, start_year: int, end_year: int, **kwargs):
+        """Download every day in [start_year, end_year]. Subclasses define _download(...)."""
+        start = datetime(int(start_year), 1, 1)
+        end = datetime(int(end_year), 12, 31)
+        return self._download(start, end, **kwargs)
 
     def _run_parallel(
         self,

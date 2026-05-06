@@ -185,12 +185,6 @@ class GraphCastDownloaderParallel(BaseDownloader):
             user_agent="GraphCastDownloaderParallel/1.0",
         )
 
-    @staticmethod
-    def _to_dt(d) -> datetime:
-        if isinstance(d, str):
-            return datetime.strptime(d, "%Y-%m-%d")
-        return d
-
     def _init_dir(self, init_date: datetime, cycle: int) -> Path:
         date_str = init_date.strftime("%Y%m%d")
         out_dir = self.output_dir / str(init_date.year) / f"{date_str}_{cycle:02d}z"
@@ -205,17 +199,7 @@ class GraphCastDownloaderParallel(BaseDownloader):
 
     # ── Public download interface ───────────────────────────────────
 
-    def download_date_range(self, start_date, end_date, *, forecast_hours=None, level: str = "surface"):
-        start = self._to_dt(start_date)
-        end = self._to_dt(end_date)
-        return self._download(start, end)
-
-    def download_year_range(self, start_year: int, end_year: int, *, forecast_hours=None, level: str = "surface"):
-        start = datetime(int(start_year), 1, 1)
-        end = datetime(int(end_year), 12, 31)
-        return self._download(start, end)
-
-    def _download(self, start: datetime, end: datetime):
+    def _download(self, start: datetime, end: datetime, *, forecast_hours=None, level: str = "surface"):
         import fsspec
         import numpy as np
         import xarray as xr

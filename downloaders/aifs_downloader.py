@@ -129,19 +129,6 @@ class AIFSDownloaderParallel(BaseDownloader):
             user_agent="AIFSDownloaderParallel/1.0",
         )
 
-    def _status_key(self, status: str) -> str:
-        if status.startswith("downloaded"):
-            return "downloaded"
-        if status.startswith("failed"):
-            return "failed"
-        return status
-
-    @staticmethod
-    def _to_dt(d) -> datetime:
-        if isinstance(d, str):
-            return datetime.strptime(d, "%Y-%m-%d")
-        return d
-
     def _remote_paths(self, init_date: datetime, cycle: int, fhour: int) -> tuple[str, str]:
         date_str = init_date.strftime("%Y%m%d")
         cycle_str = f"{cycle:02d}"
@@ -291,17 +278,7 @@ class AIFSDownloaderParallel(BaseDownloader):
 
     # ── Public download interface ───────────────────────────────────
 
-    def download_date_range(self, start_date, end_date, *, forecast_hours=None, level: str = "surface"):
-        start = self._to_dt(start_date)
-        end = self._to_dt(end_date)
-        return self._download(start, end, level=level)
-
-    def download_year_range(self, start_year: int, end_year: int, *, forecast_hours=None, level: str = "surface"):
-        start = datetime(int(start_year), 1, 1)
-        end = datetime(int(end_year), 12, 31)
-        return self._download(start, end, level=level)
-
-    def _download(self, start: datetime, end: datetime, *, level: str = "surface"):
+    def _download(self, start: datetime, end: datetime, *, forecast_hours=None, level: str = "surface"):
         # Clip to AIFS archive availability.
         if start < AIFS_FIRST_DATE:
             print(f"AIFS archive starts {AIFS_FIRST_DATE.date()}; clipping start.")

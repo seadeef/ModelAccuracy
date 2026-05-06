@@ -123,19 +123,6 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
             user_agent="GFSFilteredDownloaderParallel/1.0",
         )
 
-    def _status_key(self, status: str) -> str:
-        if status.startswith("downloaded"):
-            return "downloaded"
-        if status.startswith("failed"):
-            return "failed"
-        return status
-
-    @staticmethod
-    def _to_dt(d) -> datetime:
-        if isinstance(d, str):
-            return datetime.strptime(d, "%Y-%m-%d")
-        return d
-
     def _paths(self, init_date: datetime, fhour: int) -> tuple[str, str, str]:
         date_str = init_date.strftime("%Y%m%d")
         cycle_str = f"{GFS_CYCLE:02d}"
@@ -245,30 +232,6 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
                     grib_file.unlink(missing_ok=True)
                 time.sleep(1.25 * attempt)
         return task, f"failed: {last_err}"
-
-    def download_date_range(
-        self,
-        start_date: str | datetime,
-        end_date: str | datetime,
-        *,
-        forecast_hours: list[int],
-        level: str = "surface",
-    ):
-        start = self._to_dt(start_date)
-        end = self._to_dt(end_date)
-        return self._download(start, end, forecast_hours=forecast_hours, level=level)
-
-    def download_year_range(
-        self,
-        start_year: int,
-        end_year: int,
-        *,
-        forecast_hours: list[int],
-        level: str = "surface",
-    ):
-        start = datetime(int(start_year), 1, 1)
-        end = datetime(int(end_year), 12, 31)
-        return self._download(start, end, forecast_hours=forecast_hours, level=level)
 
     def _download(
         self,
