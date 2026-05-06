@@ -30,13 +30,11 @@ sys.path.insert(0, str(_this_dir.parent))
 sys.path.insert(0, str(_this_dir))
 
 from base import BaseDownloader
+from model_registry import US_CROP_BOUNDS
 
 # Fixed 12z cycle for GFS; used in remote paths and local dir names.
 GFS_CYCLE = 12
 GFS_VARIABLE = "APCP"
-
-# CONUS crop bounds (must match compute_stats / NBM target grid).
-US_CROP_BOUNDS = (-130.0, 20.0, -60.0, 55.0)
 
 
 def _convert_grib_to_npy(grib_path: Path, prev_grib_path: Path | None, npy_path: Path, output_dir: Path) -> None:

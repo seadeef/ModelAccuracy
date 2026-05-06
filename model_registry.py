@@ -4,6 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+# Shared CONUS crop bounds (west, south, east, north).
+# Used by downloaders to crop model output to CONUS before saving .npy files.
+# compute_tiles uses a narrower US_BOUNDS for visible-CONUS rendering.
+US_CROP_BOUNDS = (-130.0, 20.0, -60.0, 55.0)
+
 
 def window_to_key(start: int, end: int) -> str:
     return f"{start}_{end}"

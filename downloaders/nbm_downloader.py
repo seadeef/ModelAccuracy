@@ -35,6 +35,7 @@ sys.path.insert(0, str(_this_dir.parent))
 sys.path.insert(0, str(_this_dir))
 
 from base import BaseDownloader
+from model_registry import US_CROP_BOUNDS
 
 NBM_CYCLE = 12
 NBM_VARIABLE = "APCP"
@@ -280,7 +281,6 @@ class NBMDownloaderParallel(BaseDownloader):
 
     # Target regular lat/lon grid matching GFS 0.25° resolution over CONUS.
     _TARGET_RES = 0.25
-    _TARGET_BOUNDS = (-130.0, 20.0, -60.0, 55.0)  # west, south, east, north
 
     def _target_grid(self):
         """Return (transform, width, height, lats_1d, lons_1d) for the regular target grid.
@@ -293,7 +293,7 @@ class NBMDownloaderParallel(BaseDownloader):
         import numpy as np
         import rasterio.transform
 
-        west, south, east, north = self._TARGET_BOUNDS
+        west, south, east, north = US_CROP_BOUNDS
         res = self._TARGET_RES
         lons_1d = np.arange(west + res / 2, east, res).astype(np.float32)
         lats_1d = np.arange(south + res / 2, north, res).astype(np.float32)

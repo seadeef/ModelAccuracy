@@ -60,8 +60,6 @@ def _configure_for_model(model_key: str) -> None:
 # Task discovery: downloaders produce .npy files (CONUS-cropped float32 arrays).
 LEAD_NPY_RE = re.compile(r"f(?P<fhour>\d{3})_(?P<level>[^.]+)\.npy$")
 
-US_CROP_BOUNDS = (-130.0, 20.0, -60.0, 55.0)  # (west, south, east, north)
-
 THREADS_PER_PROCESS = 4
 CACHE_MAX_ITEMS = 32
 

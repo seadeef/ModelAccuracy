@@ -36,10 +36,10 @@ sys.path.insert(0, str(_this_dir.parent))
 sys.path.insert(0, str(_this_dir))
 
 from base import BaseDownloader
+from model_registry import US_CROP_BOUNDS
 
 GRAPHCAST_CYCLE = 12
 GRAPHCAST_MAX_LEAD_H = 240  # 10 days
-US_CROP_BOUNDS = (-130.0, 20.0, -60.0, 55.0)
 PARQUET_REF_URL = "s3://noaa-oar-mlwp-data/parquet/GRAP_v100_GFS_combined_all.parq"
 
 

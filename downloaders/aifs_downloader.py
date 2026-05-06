@@ -35,12 +35,12 @@ sys.path.insert(0, str(_this_dir.parent))
 sys.path.insert(0, str(_this_dir))
 
 from base import BaseDownloader
+from model_registry import US_CROP_BOUNDS
 
 AIFS_CYCLE = 12
 AIFS_VARIABLE = "tp"
 AIFS_MAX_LEAD_H = 336  # 14 days, clipped from native 360h
 AIFS_FIRST_DATE = datetime(2025, 3, 1)  # earliest archived AIFS-single
-US_CROP_BOUNDS = (-130.0, 20.0, -60.0, 55.0)
 
 
 @dataclass(frozen=True)
