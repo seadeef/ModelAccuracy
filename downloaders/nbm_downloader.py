@@ -24,8 +24,6 @@ as ``fHHH_surface.npy`` (``compute_stats`` discovers ``.npy`` as well as GRIB).
 from __future__ import annotations
 
 import sys
-import tempfile
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -204,57 +202,14 @@ class NBMDownloaderParallel(BaseDownloader):
     def _download_task(self, task: DownloadTask) -> tuple[DownloadTask, str]:
         init_date, fhour, level = task.init_date, task.fhour, task.level
         out_file = self._sub_grib_file(init_date, fhour, level)
-        if out_file.exists():
-            return task, "exists"
-
         grib_url, idx_url = self._paths(init_date, fhour)
-        last_err = None
-
-        if self.polite_delay_seconds:
-            time.sleep(self.polite_delay_seconds)
-
-        for attempt in range(1, self.max_retries + 1):
-            part = out_file.with_suffix(out_file.suffix + ".part")
-            try:
-                idx_resp = self.session.get(idx_url, timeout=self.timeout_seconds)
-                if idx_resp.status_code == 404:
-                    return task, "not_found_idx"
-                idx_resp.raise_for_status()
-                start_byte, end_byte = self._find_byte_range(idx_resp.text, fhour)
-                if start_byte is None:
-                    return task, "not_found_var"
-                headers = (
-                    {"Range": f"bytes={start_byte}-{end_byte}"}
-                    if end_byte is not None
-                    else {"Range": f"bytes={start_byte}-"}
-                )
-                resp = self.session.get(
-                    grib_url, headers=headers, stream=True, timeout=self.timeout_seconds,
-                )
-                resp.raise_for_status()
-                with open(part, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=1024 * 256):
-                        if chunk:
-                            f.write(chunk)
-                # Validate GRIB2 magic bytes before accepting.
-                with open(part, "rb") as check:
-                    magic = check.read(4)
-                if magic != b"GRIB":
-                    part.unlink(missing_ok=True)
-                    last_err = ValueError(f"Invalid GRIB2 (magic={magic!r})")
-                    time.sleep(1.25 * attempt)
-                    continue
-                part.replace(out_file)
-                size_kb = out_file.stat().st_size / 1024
-                return task, f"downloaded ({size_kb:.1f} KB)"
-            except Exception as e:
-                last_err = e
-                if part.exists():
-                    part.unlink(missing_ok=True)
-                if out_file.exists():
-                    out_file.unlink(missing_ok=True)
-                time.sleep(1.25 * attempt)
-        return task, f"failed: {last_err}"
+        status = self._byte_range_fetch(
+            grib_url=grib_url,
+            idx_url=idx_url,
+            idx_parser=lambda txt: self._find_byte_range(txt, fhour),
+            out_path=out_file,
+        )
+        return task, status
 
     # ── Daily assembly ──────────────────────────────────────────────
 

@@ -20,7 +20,6 @@ Output:
 from __future__ import annotations
 
 import sys
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -180,58 +179,19 @@ class GFSFilteredDownloaderParallel(BaseDownloader):
 
     def _download_task(self, task: DownloadTask) -> tuple[DownloadTask, str]:
         init_date, fhour, level = task.init_date, task.fhour, task.level
-        npy_file = self._output_npy(init_date, fhour, level)
-        if npy_file.exists():
+        # Short-circuit: assembled daily total already on disk.
+        if self._output_npy(init_date, fhour, level).exists():
             return task, "exists"
 
         grib_file = self._apcp_grib(init_date, fhour)
-        if grib_file.exists():
-            return task, "exists"
-
-        grib_filename, grib_path, idx_path = self._paths(init_date, fhour)
-        idx_url = f"{self.base_url}/{idx_path}"
-        grib_url = f"{self.base_url}/{grib_path}"
-        last_err = None
-
-        if self.polite_delay_seconds:
-            time.sleep(self.polite_delay_seconds)
-
-        for attempt in range(1, self.max_retries + 1):
-            part = grib_file.with_suffix(grib_file.suffix + ".part")
-            try:
-                idx_resp = self.session.get(idx_url, timeout=self.timeout_seconds)
-                if idx_resp.status_code == 404:
-                    return task, "not_found_idx"
-                idx_resp.raise_for_status()
-                start_byte, end_byte = self._find_byte_range(idx_resp.text, level, fhour)
-                if start_byte is None:
-                    return task, "not_found_var"
-                headers = {"Range": f"bytes={start_byte}-{end_byte}"} if end_byte is not None else {"Range": f"bytes={start_byte}-"}
-                resp = self.session.get(grib_url, headers=headers, stream=True, timeout=self.timeout_seconds)
-                resp.raise_for_status()
-                with open(part, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=1024 * 256):
-                        if chunk:
-                            f.write(chunk)
-                # Validate GRIB2 magic bytes before accepting.
-                with open(part, "rb") as check:
-                    magic = check.read(4)
-                if magic != b"GRIB":
-                    part.unlink(missing_ok=True)
-                    last_err = ValueError(f"Invalid GRIB2 (magic={magic!r})")
-                    time.sleep(1.25 * attempt)
-                    continue
-                part.replace(grib_file)
-                size_kb = grib_file.stat().st_size / 1024
-                return task, f"downloaded ({size_kb:.1f} KB)"
-            except Exception as e:
-                last_err = e
-                if part.exists():
-                    part.unlink(missing_ok=True)
-                if grib_file.exists():
-                    grib_file.unlink(missing_ok=True)
-                time.sleep(1.25 * attempt)
-        return task, f"failed: {last_err}"
+        _, grib_path, idx_path = self._paths(init_date, fhour)
+        status = self._byte_range_fetch(
+            grib_url=f"{self.base_url}/{grib_path}",
+            idx_url=f"{self.base_url}/{idx_path}",
+            idx_parser=lambda txt: self._find_byte_range(txt, level, fhour),
+            out_path=grib_file,
+        )
+        return task, status
 
     def _download(
         self,

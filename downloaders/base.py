@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -127,6 +128,75 @@ class BaseDownloader:
         start = datetime(int(start_year), 1, 1)
         end = datetime(int(end_year), 12, 31)
         return self._download(start, end, **kwargs)
+
+    def _byte_range_fetch(
+        self,
+        *,
+        grib_url: str,
+        idx_url: str,
+        idx_parser: Callable[[str], tuple[int | None, int | None]],
+        out_path: Path,
+    ) -> str:
+        """Fetch one GRIB2 record via HTTP byte-range using a sidecar idx file.
+
+        Sequence per attempt: GET .idx → parse → Range-restricted GET .grib2 →
+        validate GRIB magic. Retries up to ``self.max_retries`` with linear backoff.
+
+        ``idx_parser(idx_text)`` returns ``(start_byte, end_byte_inclusive_or_None)``
+        — return ``(None, None)`` if the record is not present in the idx.
+
+        Returns a status string compatible with the default ``_status_key``:
+        ``"exists"``, ``"not_found_idx"``, ``"not_found_var"``,
+        ``"downloaded (... KB)"``, or ``"failed: ..."``.
+        """
+        if out_path.exists():
+            return "exists"
+
+        last_err = None
+        if self.polite_delay_seconds:
+            time.sleep(self.polite_delay_seconds)
+
+        for attempt in range(1, self.max_retries + 1):
+            part = out_path.with_suffix(out_path.suffix + ".part")
+            try:
+                idx_resp = self.session.get(idx_url, timeout=self.timeout_seconds)
+                if idx_resp.status_code == 404:
+                    return "not_found_idx"
+                idx_resp.raise_for_status()
+                start_byte, end_byte = idx_parser(idx_resp.text)
+                if start_byte is None:
+                    return "not_found_var"
+                headers = (
+                    {"Range": f"bytes={start_byte}-{end_byte}"}
+                    if end_byte is not None
+                    else {"Range": f"bytes={start_byte}-"}
+                )
+                resp = self.session.get(
+                    grib_url, headers=headers, stream=True, timeout=self.timeout_seconds,
+                )
+                resp.raise_for_status()
+                with open(part, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            f.write(chunk)
+                with open(part, "rb") as check:
+                    magic = check.read(4)
+                if magic != b"GRIB":
+                    part.unlink(missing_ok=True)
+                    last_err = ValueError(f"Invalid GRIB2 (magic={magic!r})")
+                    time.sleep(1.25 * attempt)
+                    continue
+                part.replace(out_path)
+                size_kb = out_path.stat().st_size / 1024
+                return f"downloaded ({size_kb:.1f} KB)"
+            except Exception as e:
+                last_err = e
+                if part.exists():
+                    part.unlink(missing_ok=True)
+                if out_path.exists():
+                    out_path.unlink(missing_ok=True)
+                time.sleep(1.25 * attempt)
+        return f"failed: {last_err}"
 
     def _run_parallel(
         self,

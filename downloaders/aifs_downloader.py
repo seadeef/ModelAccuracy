@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import sys
-import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -154,7 +153,7 @@ class AIFSDownloaderParallel(BaseDownloader):
         return self._init_dir(init_date, cycle) / f"f{daily_fhour:03d}_{level}.npy"
 
     def _find_byte_range(self, idx_text: str) -> tuple[int | None, int | None]:
-        """Parse JSONL .index file; return (offset, length) for tp."""
+        """Parse JSONL .index file; return (offset, end_byte_inclusive) for tp."""
         for line in idx_text.splitlines():
             line = line.strip()
             if not line:
@@ -168,57 +167,20 @@ class AIFSDownloaderParallel(BaseDownloader):
                 ln = d.get("_length")
                 if off is None or ln is None:
                     return None, None
-                return int(off), int(ln)
+                return int(off), int(off) + int(ln) - 1
         return None, None
 
     def _download_task(self, task: DownloadTask) -> tuple[DownloadTask, str]:
         init_date, cycle, fhour = task.init_date, task.cycle, task.fhour
         out_file = self._tp_grib(init_date, cycle, fhour)
-        if out_file.exists():
-            return task, "exists"
-
         grib_url, idx_url = self._remote_paths(init_date, cycle, fhour)
-        last_err = None
-
-        if self.polite_delay_seconds:
-            time.sleep(self.polite_delay_seconds)
-
-        for attempt in range(1, self.max_retries + 1):
-            part = out_file.with_suffix(out_file.suffix + ".part")
-            try:
-                idx_resp = self.session.get(idx_url, timeout=self.timeout_seconds)
-                if idx_resp.status_code == 404:
-                    return task, "not_found_idx"
-                idx_resp.raise_for_status()
-                offset, length = self._find_byte_range(idx_resp.text)
-                if offset is None:
-                    return task, "not_found_var"
-                end_byte = offset + length - 1
-                headers = {"Range": f"bytes={offset}-{end_byte}"}
-                resp = self.session.get(grib_url, headers=headers, stream=True, timeout=self.timeout_seconds)
-                resp.raise_for_status()
-                with open(part, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=1024 * 256):
-                        if chunk:
-                            f.write(chunk)
-                with open(part, "rb") as check:
-                    magic = check.read(4)
-                if magic != b"GRIB":
-                    part.unlink(missing_ok=True)
-                    last_err = ValueError(f"Invalid GRIB2 (magic={magic!r})")
-                    time.sleep(1.25 * attempt)
-                    continue
-                part.replace(out_file)
-                size_kb = out_file.stat().st_size / 1024
-                return task, f"downloaded ({size_kb:.1f} KB)"
-            except Exception as e:
-                last_err = e
-                if part.exists():
-                    part.unlink(missing_ok=True)
-                if out_file.exists():
-                    out_file.unlink(missing_ok=True)
-                time.sleep(1.25 * attempt)
-        return task, f"failed: {last_err}"
+        status = self._byte_range_fetch(
+            grib_url=grib_url,
+            idx_url=idx_url,
+            idx_parser=self._find_byte_range,
+            out_path=out_file,
+        )
+        return task, status
 
     def _assemble_daily(
         self,
