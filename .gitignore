@@ -25,7 +25,6 @@ static_export/
 
 # Secrets
 .env
-.maptiler_key
 
 # IDE / OS
 .idea/
