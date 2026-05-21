@@ -138,16 +138,65 @@ def _run_catchup(models: list[ModelConfig]) -> None:
             print(f"Model '{config.key}' is up to date (latest: {latest.date()})")
 
 
-def _forecast_dir_has_data(config: ModelConfig, date: datetime) -> bool:
+def _forecast_dir_has_data(config: ModelConfig, date: datetime, cycle: int | None = None) -> bool:
     """Check whether the init directory has converted .npy lead files ready for extraction."""
+    if cycle is None:
+        cycle = config.cycle_hour
     date_str = date.strftime("%Y%m%d")
-    init_dir = Path(config.data_dir) / str(date.year) / f"{date_str}_{config.cycle_hour:02d}z"
+    init_dir = Path(config.data_dir) / str(date.year) / f"{date_str}_{cycle:02d}z"
     if not init_dir.exists():
         return False
     return any(init_dir.glob("f*_*.npy"))
 
 
+def _run_graphcast_forecast(config: ModelConfig) -> None:
+    """Forecast download for GraphCast. NOAA AIWP publishes 00z and/or 12z inits
+    on different days, so probe S3 for whatever is available and pick the freshest
+    instead of hardcoding 12z.
+    """
+    cls = config.get_downloader_class()
+    defaults = dict(config.downloader_defaults)
+    downloader = cls(**defaults)
+
+    today = datetime.now(timezone.utc) - timedelta(hours=config.publish_delay_hours)
+    today = today.replace(hour=0, minute=0, second=0, microsecond=0)
+    candidates = [today, today - timedelta(days=1), today - timedelta(days=2)]
+
+    target = downloader.find_latest_forecast_init(candidates)
+    if target is None:
+        print(
+            f"\nERROR: no GraphCast init published in {candidates[-1].date()}..{candidates[0].date()}. "
+            f"Skipping extraction so a stale forecast is not republished."
+        )
+        return
+    init_date, cycle = target
+    print(f"\n--- GraphCast latest available init: {init_date.date()} {cycle:02d}z ---")
+
+    if _forecast_dir_has_data(config, init_date, cycle):
+        print(f"Already downloaded ({init_date.date()} {cycle:02d}z).")
+    else:
+        if not downloader.download_forecast_init(init_date, cycle):
+            print(
+                f"\nERROR: GraphCast forecast download failed for {init_date.date()} {cycle:02d}z. "
+                f"Skipping extraction so a stale forecast is not republished."
+            )
+            return
+
+    output_root = Path("stats_output") / config.key
+    print(f"\n--- Extracting forecast for model '{config.key}' ---")
+    downloader.extract_forecast(
+        config,
+        init_date=init_date,
+        cycle=cycle,
+        output_root=output_root,
+    )
+
+
 def _run_forecast(config: ModelConfig) -> None:
+    if config.key == "graphcast":
+        _run_graphcast_forecast(config)
+        return
+
     forecast_hours = config.forecast_hours
     today = datetime.now(timezone.utc) - timedelta(hours=config.publish_delay_hours)
     today = today.replace(hour=0, minute=0, second=0, microsecond=0)

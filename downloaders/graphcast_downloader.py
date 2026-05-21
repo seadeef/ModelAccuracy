@@ -7,11 +7,16 @@ Two data paths share the same downstream output:
    `s3://noaa-oar-mlwp-data/parquet/GRAP_v100_GFS_combined_all.parq` is a
    fsspec ReferenceFileSystem with chunk pointers into the original .nc
    files. Open once, share via threads (zarr is thread-safe). Per-init
-   read is ~12s (vs ~30s for direct .nc) and we avoid HDF5's GIL contention.
+   read is ~12s.
 
-2. **Direct .nc lazy reads** — covers anything past the parquet ref's last init.
-   Opens `s3://noaa-oar-mlwp-data/GRAP_v100_GFS/{YYYY}/{MMDD}/...nc` lazily
-   per init. HDF5 is not thread-safe, so this path uses ProcessPoolExecutor.
+2. **Direct .nc parallel chunk fetch** — covers anything past the parquet
+   ref's last init. Each `s3://noaa-oar-mlwp-data/GRAP_v100_GFS/...nc` is
+   5.77 GB but `apcp` is only ~170 MB across 41 HDF5 chunks (one global
+   timestep per chunk, shuffle+deflate filtered). We open the file once
+   via h5py to read chunk byte offsets (~1s metadata), then fan out
+   per-chunk byte-range S3 fetches via threads (~5-7s for the full cube).
+   Replaces the old xr.open_dataset+h5netcdf streaming path which took
+   ~30-60s per init due to many small range requests.
 
 Daily totals: sum four consecutive 6h apcp buckets, m → mm.
 
@@ -25,8 +30,9 @@ from __future__ import annotations
 
 import sys
 import time
+import zlib
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,6 +47,18 @@ from model_registry import US_CROP_BOUNDS
 GRAPHCAST_CYCLE = 12
 GRAPHCAST_MAX_LEAD_H = 240  # 10 days
 PARQUET_REF_URL = "s3://noaa-oar-mlwp-data/parquet/GRAP_v100_GFS_combined_all.parq"
+
+# NOAA AIWP publishes GraphCast inits at 00z and/or 12z, varying day-to-day.
+# Forecast mode probes both, preferring 12z (later init = fresher) within a date.
+GRAPHCAST_FORECAST_CYCLES: tuple[int, ...] = (12, 0)
+
+
+def _graphcast_nc_key(init_date: datetime, cycle: int) -> str:
+    date_str = init_date.strftime("%Y%m%d")
+    cycle_str = f"{cycle:02d}"
+    mmdd = init_date.strftime("%m%d")
+    fname = f"GRAP_v100_GFS_{date_str}{cycle_str}_f000_f240_06.nc"
+    return f"noaa-oar-mlwp-data/GRAP_v100_GFS/{init_date.year}/{mmdd}/{fname}"
 
 
 def _sub_fhours_for_daily(daily_fhour: int) -> list[int]:
@@ -102,62 +120,24 @@ def _write_dailies(apcp_cube, init_dir: Path, daily_fhours: list[int]) -> int:
     return wrote
 
 
-def _process_init_nc(args: tuple) -> tuple[str, int, int, str]:
-    """Worker for the direct .nc path (used past parquet-ref coverage).
+def _unshuffle(buf: bytes, typesize: int) -> bytes:
+    """Reverse the HDF5 shuffle filter (byte de-interleaving).
 
-    args: (init_iso, cycle, output_dir, daily_fhours, max_retries, polite_delay)
+    For typesize=4: shuffled layout is `[byte0_v0, byte0_v1, ..., byte0_vN,
+    byte1_v0, ..., byte3_vN]`. The inverse is a transpose of the (typesize, N)
+    view back to interleaved bytes.
     """
     import numpy as np
-    import s3fs
-    import xarray as xr
+    arr = np.frombuffer(buf, dtype=np.uint8).reshape(typesize, -1)
+    return arr.T.tobytes()
 
-    init_iso, cycle, output_dir_str, daily_fhours, max_retries, polite_delay = args
-    init_date = datetime.fromisoformat(init_iso)
-    output_dir = Path(output_dir_str)
 
-    date_str = init_date.strftime("%Y%m%d")
-    cycle_str = f"{cycle:02d}"
-    init_dir = output_dir / str(init_date.year) / f"{date_str}_{cycle_str}z"
-    init_dir.mkdir(parents=True, exist_ok=True)
-
-    if all((init_dir / f"f{fh:03d}_surface.npy").exists() for fh in daily_fhours):
-        return init_iso, cycle, 0, "exists"
-
-    if polite_delay:
-        time.sleep(polite_delay)
-
-    mmdd = init_date.strftime("%m%d")
-    fname = f"GRAP_v100_GFS_{date_str}{cycle_str}_f000_f240_06.nc"
-    key = f"noaa-oar-mlwp-data/GRAP_v100_GFS/{init_date.year}/{mmdd}/{fname}"
-
-    fs = s3fs.S3FileSystem(anon=True)
-    last_err = None
-
-    for attempt in range(1, max_retries + 1):
-        try:
-            with fs.open(key, "rb") as fh:
-                ds = xr.open_dataset(fh, engine="h5netcdf")
-                try:
-                    if "apcp" not in ds.data_vars:
-                        return init_iso, cycle, 0, f"failed: no apcp ({list(ds.data_vars)})"
-                    lats = ds["latitude"].values.astype(np.float32)
-                    lons = ds["longitude"].values.astype(np.float32)
-                    lat_slc, lon_slc, _, _, lon_sort, flip_lat = _conus_index_slices(lats, lons)
-                    apcp = ds["apcp"].isel(latitude=lat_slc, longitude=lon_slc).values.astype(np.float32)
-                    apcp = apcp[:, :, lon_sort]
-                    if flip_lat:
-                        apcp = apcp[:, ::-1, :]
-                finally:
-                    ds.close()
-
-            wrote = _write_dailies(apcp, init_dir, daily_fhours)
-            return init_iso, cycle, wrote, "processed"
-        except FileNotFoundError:
-            return init_iso, cycle, 0, "not_found"
-        except Exception as e:
-            last_err = e
-            time.sleep(1.5 * attempt)
-    return init_iso, cycle, 0, f"failed: {last_err}"
+def _decode_apcp_chunk(raw: bytes, dtype, chunk_shape):
+    """Decompress one HDF5 chunk encoded with shuffle+deflate."""
+    import numpy as np
+    deflated = zlib.decompress(raw)
+    deshuffled = _unshuffle(deflated, dtype.itemsize)
+    return np.frombuffer(deshuffled, dtype=dtype).reshape(chunk_shape)
 
 
 @dataclass(frozen=True)
@@ -196,6 +176,81 @@ class GraphCastDownloaderParallel(BaseDownloader):
 
     def _all_dailies_present(self, init_date: datetime, cycle: int, daily_fhours: list[int]) -> bool:
         return all(self._daily_npy(init_date, cycle, fh).exists() for fh in daily_fhours)
+
+    # ── Forecast-mode discovery (cycle-flexible) ────────────────────
+
+    def _list_remote_cycles_on_date(self, init_date: datetime) -> list[int]:
+        """Return sorted list of cycles (e.g. [0, 12]) published on a given date,
+        or [] if the date directory is missing or empty.
+        """
+        import s3fs
+        fs = s3fs.S3FileSystem(anon=True)
+        mmdd = init_date.strftime("%m%d")
+        prefix = f"noaa-oar-mlwp-data/GRAP_v100_GFS/{init_date.year}/{mmdd}/"
+        try:
+            keys = fs.ls(prefix)
+        except FileNotFoundError:
+            return []
+        except Exception:
+            return []
+        date_str = init_date.strftime("%Y%m%d")
+        expected_prefix = f"GRAP_v100_GFS_{date_str}"
+        cycles: set[int] = set()
+        for k in keys:
+            name = k.rsplit("/", 1)[-1]
+            if not name.startswith(expected_prefix) or not name.endswith("_f000_f240_06.nc"):
+                continue
+            cc_str = name[len(expected_prefix):len(expected_prefix) + 2]
+            try:
+                cycles.add(int(cc_str))
+            except ValueError:
+                continue
+        return sorted(cycles)
+
+    def find_latest_forecast_init(
+        self,
+        candidates: list[datetime],
+        prefer_cycles: tuple[int, ...] = GRAPHCAST_FORECAST_CYCLES,
+    ) -> tuple[datetime, int] | None:
+        """Find the freshest available remote init across ``candidates``.
+
+        ``candidates`` should be in newest-to-oldest order. For each date, picks
+        the latest available cycle in ``prefer_cycles`` order. Returns
+        ``(init_date, cycle)`` or ``None`` if no init is published in any of
+        the candidate dates.
+        """
+        for d in candidates:
+            available = self._list_remote_cycles_on_date(d)
+            if not available:
+                continue
+            for c in prefer_cycles:
+                if c in available:
+                    return d, c
+            # Fallback: take whatever is published if none of the preferred
+            # cycles are present.
+            return d, available[-1]
+        return None
+
+    def download_forecast_init(self, init_date: datetime, cycle: int) -> bool:
+        """Download a single GraphCast init at the specified cycle (00z or 12z).
+
+        Returns True iff every daily lead .npy exists on disk afterward.
+        """
+        daily_fhours = [d * 24 for d in range(1, GRAPHCAST_MAX_LEAD_H // 24 + 1)]
+        if self._all_dailies_present(init_date, cycle, daily_fhours):
+            return True
+
+        print("\n" + "=" * 70)
+        print("GraphCast (NOAA AIWP) forecast download")
+        print(f"Init: {init_date.date()} {cycle:02d}z | Lead 1-{GRAPHCAST_MAX_LEAD_H // 24}d")
+        print(f"Output: {self.output_dir.resolve()}")
+        print("=" * 70)
+
+        self._ensure_grid_files(None, init_date, cycle)
+        t0 = time.time()
+        _, status = self._process_init_chunk_parallel(init_date, cycle, daily_fhours)
+        print(f"[direct .nc] {init_date.date()} {cycle:02d}z -> {status} ({time.time()-t0:.1f}s)")
+        return self._all_dailies_present(init_date, cycle, daily_fhours)
 
     # ── Public download interface ───────────────────────────────────
 
@@ -264,8 +319,7 @@ class GraphCastDownloaderParallel(BaseDownloader):
               f"{skipped} already complete")
         print("=" * 70)
 
-        # Pre-write grid_lats.npy / grid_lons.npy in the parent process so the
-        # multiprocess .nc workers don't race on the write.
+        # Write grid_lats.npy / grid_lons.npy once before the per-init pipelines.
         sample_nc_init = nc_tasks[0] if nc_tasks else None
         self._ensure_grid_files(zarr_ds, sample_nc_init, cycle)
 
@@ -273,16 +327,17 @@ class GraphCastDownloaderParallel(BaseDownloader):
         if zarr_tasks and zarr_ds is not None:
             self._run_zarr_threads(zarr_ds, zarr_tasks, cycle, daily_fhours)
 
-        # ── Path 2: direct .nc via processes ──────────────────────────
+        # ── Path 2: direct .nc via parallel chunk fetch ──────────────
         if nc_tasks:
-            self._run_nc_processes(nc_tasks, cycle, daily_fhours)
+            self._run_nc_inits(nc_tasks, cycle, daily_fhours)
 
     def _ensure_grid_files(self, zarr_ds, sample_nc_init: datetime | None, cycle: int) -> None:
         """Write grid_lats.npy/grid_lons.npy if missing.
 
-        Runs once in the parent process. Prefers the parquet zarr if it opened;
-        otherwise opens one sample .nc to derive the grid. The .nc workers then
-        find the files already on disk and skip the (racy) write.
+        Prefers the parquet zarr if it opened; otherwise opens one sample .nc
+        to derive the grid. Called once before any per-init chunk fetches so
+        the worker doesn't have to derive lat/lon for the on-disk grid file
+        (it still reads them from each .nc for CONUS slicing).
         """
         import numpy as np
 
@@ -303,11 +358,7 @@ class GraphCastDownloaderParallel(BaseDownloader):
             try:
                 import s3fs
                 import xarray as xr
-                date_str = sample_nc_init.strftime("%Y%m%d")
-                cycle_str = f"{cycle:02d}"
-                mmdd = sample_nc_init.strftime("%m%d")
-                fname = f"GRAP_v100_GFS_{date_str}{cycle_str}_f000_f240_06.nc"
-                key = f"noaa-oar-mlwp-data/GRAP_v100_GFS/{sample_nc_init.year}/{mmdd}/{fname}"
+                key = _graphcast_nc_key(sample_nc_init, cycle)
                 fs = s3fs.S3FileSystem(anon=True)
                 with fs.open(key, "rb") as fh:
                     ds = xr.open_dataset(fh, engine="h5netcdf")
@@ -396,56 +447,127 @@ class GraphCastDownloaderParallel(BaseDownloader):
                 print("  " + e)
         print(f"[parquet-ref] done in {(time.time()-t0)/60:.1f} min")
 
-    def _run_nc_processes(self, tasks: list[datetime], cycle: int, daily_fhours: list[int]):
-        import multiprocessing as mp
-        ctx = mp.get_context("spawn")
+    def _process_init_chunk_parallel(
+        self,
+        init_date: datetime,
+        cycle: int,
+        daily_fhours: list[int],
+    ) -> tuple[tuple[datetime, int], str]:
+        """Fetch one init's apcp via parallel HDF5 chunk byte-range reads.
 
-        # 4 workers is enough — bandwidth limited; more workers don't help.
-        nc_workers = min(self.max_workers, 4)
-        print(f"\n[direct .nc] {len(tasks)} inits via {nc_workers} processes (HDF5 not thread-safe)")
+        Steps per init:
+          1. Open .nc once via h5py to extract chunk byte offsets and lat/lon
+             (~1s of small metadata reads; not parallelized).
+          2. Fan out 41 chunk fetches (one per timestep) via a ThreadPoolExecutor
+             of ``self.max_workers`` threads. Each chunk: byte-range fetch +
+             zlib decompress + reverse shuffle filter.
+          3. Slice CONUS, sort lon to -180..180, write per-fhour daily totals.
 
-        work = [
-            (
-                d.isoformat(),
-                cycle,
-                str(self.output_dir),
-                daily_fhours,
-                self.max_retries,
-                self.polite_delay_seconds,
-            )
-            for d in tasks
-        ]
+        Returns ``((init_date, cycle), status_string)``.
+        """
+        import h5py
+        import numpy as np
+        import s3fs
 
-        counts = defaultdict(int)
+        init_dir = self._init_dir(init_date, cycle)
+        if all((init_dir / f"f{fh:03d}_surface.npy").exists() for fh in daily_fhours):
+            return (init_date, cycle), "exists"
+
+        if self.polite_delay_seconds:
+            time.sleep(self.polite_delay_seconds)
+
+        key = _graphcast_nc_key(init_date, cycle)
+        fs = s3fs.S3FileSystem(anon=True)
+
+        # ── Phase 1: one-shot metadata read (chunk offsets + grid) ────
+        try:
+            with fs.open(key, "rb") as fh:
+                f = h5py.File(fh, "r")
+                try:
+                    if "apcp" not in f:
+                        return (init_date, cycle), f"failed: no apcp ({list(f.keys())})"
+                    ds_apcp = f["apcp"]
+                    n_chunks = ds_apcp.id.get_num_chunks()
+                    chunks_info = [ds_apcp.id.get_chunk_info(i) for i in range(n_chunks)]
+                    dtype = ds_apcp.dtype
+                    apcp_shape = ds_apcp.shape
+                    chunk_shape = ds_apcp.chunks
+                    lats = f["latitude"][:].astype(np.float32)
+                    lons = f["longitude"][:].astype(np.float32)
+                finally:
+                    f.close()
+        except FileNotFoundError:
+            return (init_date, cycle), "not_found"
+        except Exception as e:
+            return (init_date, cycle), f"failed: metadata {e}"
+
+        lat_slc, lon_slc, _, _, lon_sort, flip_lat = _conus_index_slices(lats, lons)
+
+        # ── Phase 2: parallel chunk fetch + decode ────────────────────
+        apcp_global = np.empty(apcp_shape, dtype=dtype)
+
+        def fetch_one(ci):
+            last_err = None
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    raw = fs.cat_file(
+                        key, start=ci.byte_offset, end=ci.byte_offset + ci.size,
+                    )
+                    arr = _decode_apcp_chunk(raw, dtype, chunk_shape)
+                    return ci.chunk_offset, arr
+                except Exception as e:
+                    last_err = e
+                    time.sleep(0.5 * attempt)
+            raise RuntimeError(f"chunk {ci.chunk_offset}: {last_err}")
+
+        try:
+            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
+                for chunk_offset, arr in pool.map(fetch_one, chunks_info):
+                    apcp_global[chunk_offset[0]] = arr[0]
+        except Exception as e:
+            return (init_date, cycle), f"failed: chunks {e}"
+
+        # ── Phase 3: CONUS slice + daily totals ───────────────────────
+        apcp = apcp_global[:, lat_slc, lon_slc].astype(np.float32, copy=False)
+        apcp = apcp[:, :, lon_sort]
+        if flip_lat:
+            apcp = apcp[:, ::-1, :]
+
+        _write_dailies(apcp, init_dir, daily_fhours)
+        return (init_date, cycle), "processed"
+
+    def _run_nc_inits(self, tasks: list[datetime], cycle: int, daily_fhours: list[int]):
+        """Drive ``_process_init_chunk_parallel`` over a list of inits.
+
+        Outer loop is sequential because the inner chunk pool already saturates
+        bandwidth (8-thread chunk fetch is ~7s/init flat from 4 to 32 threads
+        in benchmarks). Adding outer init-level parallelism stacks more
+        concurrent S3 connections without improving wall-clock.
+        """
+        if not tasks:
+            return
+
+        print(f"\n[direct .nc] {len(tasks)} inits via {self.max_workers}-thread chunk fetch (sequential outer)")
+        counts: dict[str, int] = defaultdict(int)
         examples: list[str] = []
-        total = len(work)
-        done = 0
+        total = len(tasks)
         t0 = time.time()
 
-        with ProcessPoolExecutor(max_workers=nc_workers, mp_context=ctx) as pool:
-            futures = {pool.submit(_process_init_nc, w): w for w in work}
-            for fut in as_completed(futures):
-                w = futures[fut]
-                try:
-                    init_iso, cyc, wrote, status = fut.result()
-                except Exception as e:
-                    init_iso = w[0]
-                    cyc = w[1]
-                    wrote = 0
-                    status = f"failed: pool {e}"
-                key = "processed" if status == "processed" else (status.split(":")[0] if status.startswith("failed") else status)
-                counts[key] += 1
-                if status.startswith("failed") and len(examples) < 5:
-                    examples.append(f"{init_iso[:10]} {cyc:02d}z -> {status[:120]}")
-                done += 1
-                if done % 5 == 0 or done == total:
-                    elapsed = time.time() - t0
-                    rate = done / elapsed if elapsed > 0 else 0
-                    eta_min = ((total - done) / rate / 60) if rate > 0 else 0
-                    parts = " | ".join(f"{k}={counts[k]}" for k in sorted(counts))
-                    print(f"\r[direct .nc] {done}/{total} | {parts} | "
-                          f"{rate*60:.1f} inits/min | ETA {eta_min:.1f} min",
-                          end="", flush=True)
+        for i, d in enumerate(tasks, start=1):
+            (init_d, cyc), status = self._process_init_chunk_parallel(d, cycle, daily_fhours)
+            key = self._status_key(status)
+            counts[key] += 1
+            if status.startswith("failed") and len(examples) < 5:
+                examples.append(f"{init_d:%Y-%m-%d} {cyc:02d}z -> {status[:120]}")
+            elapsed = time.time() - t0
+            rate = i / elapsed if elapsed > 0 else 0
+            eta_min = ((total - i) / rate / 60) if rate > 0 else 0
+            parts = " | ".join(f"{k}={counts[k]}" for k in sorted(counts))
+            print(
+                f"\r[direct .nc] {i}/{total} | {parts} | "
+                f"{rate*60:.1f} inits/min | ETA {eta_min:.1f} min",
+                end="", flush=True,
+            )
         print()
         if examples:
             print("Examples:")
