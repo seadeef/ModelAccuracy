@@ -36,7 +36,7 @@ Build modes (at most one; omit all for a full export):
   ``static_export/forecast/``.  Designed for the daily update workflow: run
   ``download.py --forecast``, then ``export_static.py --forecast``, then sync
   ``static_export/forecast/`` to the ``forecast/`` prefix of the stats S3 bucket
-  (same bucket as ``MODELACCURACY_DATA_S3_URI``).  The running container picks
+  (same bucket as ``DATA_S3_URI``).  The running container picks
   up new data within ~5 minutes.
 * ``--frontend`` — only site-root Vite output (``index.html``, ``assets/``); refreshes
   ``export_manifest.json``. Removes prior SPA artifacts first.
@@ -61,6 +61,7 @@ import subprocess
 from pathlib import Path
 
 import numpy as np
+from dotenv import load_dotenv
 
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from stats_grid_metadata import load_model_metadata
@@ -71,6 +72,7 @@ from statistics_plugins.registry import (
 )
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(_PROJECT_ROOT / ".env", override=True)
 STATS_ROOT = _PROJECT_ROOT / "stats_output"
 TILES_ROOT = _PROJECT_ROOT / "tiles_output"
 EXPORT_ROOT = _PROJECT_ROOT / "static_export"
@@ -79,6 +81,39 @@ FRONTEND_ROOT = _PROJECT_ROOT / "frontend"
 STATIC_ASSETS_DIR_NAME = "static"
 DATA_DIR_NAME = "data"
 FORECAST_DIR_NAME = "forecast"
+
+
+def _write_text_if_changed(path: Path, content: str) -> bool:
+    """Write *content* to *path* only if it differs from the existing file.
+
+    Preserves mtime when content is identical, so downstream ``aws s3 sync``
+    (which compares by mtime + size) doesn't re-upload unchanged files. The
+    100k ZIP JSONs are the motivating case — they're CSV-deterministic and
+    re-running the export rewrites them with new mtimes if we don't skip here.
+    Returns True if a write occurred.
+    """
+    try:
+        if path.read_text(encoding="utf-8") == content:
+            return False
+    except (FileNotFoundError, UnicodeDecodeError):
+        pass
+    path.write_text(content, encoding="utf-8")
+    return True
+
+
+def _write_bytes_if_changed(path: Path, content: bytes) -> bool:
+    """Binary counterpart to :func:`_write_text_if_changed`.
+
+    Note: float32 ``.bin`` files have fixed sizes (set by the model grid), so
+    size-only comparison wouldn't detect content changes — must read+compare.
+    """
+    try:
+        if path.read_bytes() == content:
+            return False
+    except FileNotFoundError:
+        pass
+    path.write_bytes(content)
+    return True
 
 
 def _get_forecast_init_date(model_key: str) -> str | None:
@@ -95,19 +130,16 @@ def _get_forecast_init_date(model_key: str) -> str | None:
 # ── config.json ─────────────────────────────────────────────────────
 
 def export_config(export_dir: Path, maptiler_key: str) -> None:
-    models = []
-    forecast_init_dates = {}
-    for key, config in sorted(MODEL_REGISTRY.items()):
-        models.append({
+    models = [
+        {
             "key": config.key,
             "label": config.label,
             "lead_days_min": config.lead_days_min,
             "lead_days_max": config.lead_days_max,
             "lead_windows": [list(w) for w in config.lead_windows],
-        })
-        init_date = _get_forecast_init_date(key)
-        if init_date is not None:
-            forecast_init_dates[key] = init_date
+        }
+        for _, config in sorted(MODEL_REGISTRY.items())
+    ]
 
     statistics = [
         {"key": p.spec.name, "label": p.spec.label, "units": p.spec.units}
@@ -120,12 +152,10 @@ def export_config(export_dir: Path, maptiler_key: str) -> None:
         "statistics": statistics,
         "default_statistic": DEFAULT_STATISTIC,
         "maptiler_api_key": maptiler_key,
-        "forecast_init_date": forecast_init_dates,
-        "forecastInitDate": forecast_init_dates,
     }
 
     out = export_dir / "config.json"
-    out.write_text(json.dumps(config_data, indent=2))
+    _write_text_if_changed(out, json.dumps(config_data, indent=2))
     print(f"  {out}")
 
 
@@ -157,7 +187,7 @@ def export_zip_directory(export_dir: Path, csv_path: Path) -> None:
                 ],
             }
             out_path = zip_dir / f"{code}.json"
-            out_path.write_text(json.dumps(payload))
+            _write_text_if_changed(out_path, json.dumps(payload))
             count += 1
 
     total_bytes = sum(p.stat().st_size for p in zip_dir.glob("*.json"))
@@ -233,7 +263,7 @@ def export_model_grids(data_root: Path) -> None:
         }
         out_path = data_root / model_key / "grid.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(payload))
+        _write_text_if_changed(out_path, json.dumps(payload))
         count += 1
     print(f"  {count} grid.json files under data/{{model}}/")
 
@@ -251,7 +281,7 @@ def _export_layer(npz_path: Path, field: str, out_dir: Path) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     bin_name = npz_path.stem + ".bin"  # e.g. lead_1.bin
     out_path = out_dir / bin_name
-    out_path.write_bytes(arr.tobytes())
+    _write_bytes_if_changed(out_path, arr.tobytes())
     return 1
 
 
@@ -287,7 +317,7 @@ def export_forecast_calendar(forecast_root: Path) -> None:
         }
 
     out = forecast_root / "forecast_calendar.json"
-    out.write_text(json.dumps({"per_model": per_model}, indent=2))
+    _write_text_if_changed(out, json.dumps({"per_model": per_model}, indent=2))
     print(f"  {out}")
 
 
@@ -356,9 +386,9 @@ def _compute_export_value_range(
 
 def _write_range_json(path: Path, vmin: float, vmax: float, colormap: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
+    _write_text_if_changed(
+        path,
         json.dumps({"vmin": vmin, "vmax": vmax, "colormap": colormap}, indent=2),
-        encoding="utf-8",
     )
 
 
@@ -460,16 +490,13 @@ def write_export_manifest(site_root: Path) -> None:
         "legend_ranges_dir": f"{STATIC_ASSETS_DIR_NAME}/ranges",
     }
     out = site_root / "export_manifest.json"
-    out.write_text(json.dumps(manifest, indent=2))
+    _write_text_if_changed(out, json.dumps(manifest, indent=2))
     print(f"  {out}")
 
 
 # ── main ────────────────────────────────────────────────────────────
 
 def _maptiler_key() -> str:
-    maptiler_key_file = Path(".maptiler_key")
-    if maptiler_key_file.is_file():
-        return maptiler_key_file.read_text().strip()
     return os.getenv("MAPTILER_API_KEY", "")
 
 
