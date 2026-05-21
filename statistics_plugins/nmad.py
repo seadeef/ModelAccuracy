@@ -8,13 +8,22 @@ EPSILON = 1e-10
 
 
 class NMADPlugin:
+    # Diverging colormap with a fixed 0–200 % range.  100% NMAD (error
+    # magnitude equals mean obs) lands at the white midpoint, which is a
+    # meaningful threshold; cells stay blue while error < mean and shift
+    # toward red as error grows past it.  The fixed range matters because
+    # localized arid pixels can produce 4000%+ NMAD (mean_obs ≈ 0); without
+    # the cap, percentile-driven vmin/vmax got pulled outward and the rest
+    # of the map collapsed to extremes.  Arid pixels still render — they
+    # just clamp to saturated red.
     spec = StatisticSpec(
         name="nmad",
         label="NMAD",
         units="%",
         render_field="value",
         colormap="diverging",
-        default=True
+        fixed_range=(0.0, 200.0),
+        default=True,
     )
 
     def init_accumulator(self, shape: tuple[int, int]) -> dict[str, np.ndarray]:

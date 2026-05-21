@@ -8,12 +8,33 @@ EPSILON = 1e-10
 
 
 class SACCPlugin:
+    """Per-pixel temporal Pearson correlation between model and obs time series.
+
+    Naming caveat: this is mathematically TCORR (temporal correlation), not a
+    strict SACC.  True SACC is a *spatial* correlation that produces one scalar
+    per forecast time, which can't be rendered as a per-pixel map; the metric
+    here is the closest per-pixel relative we can show.  Pearson correlation is
+    shift-invariant, so subtracting a per-pixel time-mean (a degenerate
+    "climatology") would give an identical answer — promoting this to true ACC
+    would require a *time-varying* climatology (e.g., per-pixel monthly mean
+    subtracted from each day's values), which is a bigger refactor.
+
+    Renders with ``diverging_reversed`` (red→white→blue) and a fixed 0–100 %
+    range so we share the colormap family with bias and so the convention
+    "blue = good skill" matches NMAD / NRMSE's "blue = low error".  A typical
+    CONUS day-1 cluster (SACC 60–90 %) lands in the upper blue half with
+    visible gradient; the white midpoint at 50 % is well below the cluster,
+    so the map doesn't wash out the way it did with percentile-driven
+    auto-ranging.
+    """
+
     spec = StatisticSpec(
         name="sacc",
         label="SACC",
         units="%",
         render_field="value",
         colormap="diverging_reversed",
+        fixed_range=(0.0, 100.0),
     )
 
     def init_accumulator(self, shape: tuple[int, int]) -> dict[str, np.ndarray]:

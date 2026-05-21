@@ -8,12 +8,21 @@ EPSILON = 1e-10
 
 
 class NRMSEPlugin:
+    # Diverging colormap with a fixed 0–800 % range.  NRMSE for daily precip
+    # is routinely 100–500 %  (RMSE > mean is the norm given the variance of
+    # rainfall), so the natural midpoint is well above 100 %; 400 % puts the
+    # white center near the cross-lead median and lets the gradient span the
+    # bulk of the data.  The fixed cap keeps localized arid-pixel outliers
+    # (mean_obs ≈ 0 → values in the thousands) from pulling the percentile
+    # range outward — they clamp to saturated red instead of poisoning the
+    # rest of the map.
     spec = StatisticSpec(
         name="nrmse",
         label="NRMSE",
         units="%",
         render_field="value",
         colormap="diverging",
+        fixed_range=(0.0, 800.0),
     )
 
     def init_accumulator(self, shape: tuple[int, int]) -> dict[str, np.ndarray]:
