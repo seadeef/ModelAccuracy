@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
+from backend import admin_boundaries
 from backend.static_store import LocalStaticStore, StaticStore, default_static_site_root
 from model_registry import MODEL_REGISTRY
 from statistics_plugins.registry import STATISTICS_BY_NAME
@@ -19,6 +20,10 @@ from statistics_plugins.registry import STATISTICS_BY_NAME
 # ---------------------------------------------------------------------------
 _grid_cache: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, int, int]] = {}
 _bin_cache: dict[tuple, np.ndarray] = {}
+# Keyed by (id(lats), id(lons), level, fips); the grid arrays are themselves
+# cached above, so their ``id()`` is stable for the life of the process and
+# different (store, model) pairs produce distinct arrays.
+_admin_mask_cache: dict[tuple[int, int, str, str], np.ndarray] = {}
 
 # Forecast data lives in a separate store (S3 prefix) updated daily without
 # redeploying the container.  TTL caches ensure new data is picked up.
@@ -317,6 +322,70 @@ def _mask_nearest_cell(
     return mask
 
 
+def _multi_polygon_mask(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    n_lat: int,
+    n_lon: int,
+    polygons: list,
+    *,
+    use_corners: bool,
+) -> np.ndarray:
+    """Union of (outer ∖ holes) across MultiPolygon parts.
+
+    Holes always use a strict centers-only test so cells that merely clip a
+    hole's edge aren't dropped.  ``use_corners`` controls only the outer test.
+    """
+    mask = np.zeros(n_lat * n_lon, dtype=bool)
+    outer_fn = _polygon_mask_centers_or_corners if use_corners else _polygon_mask_centers
+    for poly in polygons:
+        if not poly:
+            continue
+        outer = poly[0]
+        if len(outer) < 3:
+            continue
+        outer_mask = outer_fn(lats, lons, n_lat, n_lon, outer)
+        if len(poly) > 1:
+            hole_mask = np.zeros(n_lat * n_lon, dtype=bool)
+            for hole in poly[1:]:
+                if len(hole) >= 3:
+                    hole_mask |= _polygon_mask_centers(lats, lons, n_lat, n_lon, hole)
+            outer_mask &= ~hole_mask
+        mask |= outer_mask
+    return mask
+
+
+def _admin_region_mask(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    n_lat: int,
+    n_lon: int,
+    level: str,
+    fips: str,
+) -> np.ndarray:
+    cache_key = (id(lats), id(lons), level, fips)
+    cached = _admin_mask_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        entry = admin_boundaries.get_entry(level, fips)
+    except (KeyError, admin_boundaries.AdminBoundariesUnavailable):
+        empty = np.zeros(n_lat * n_lon, dtype=bool)
+        _admin_mask_cache[cache_key] = empty
+        return empty
+    polygons = entry.get("polygons") or []
+    mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
+    if not np.any(mask):
+        mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
+    if not np.any(mask):
+        west, south, east, north = entry["bbox"]
+        cx = (west + east) / 2
+        cy = (south + north) / 2
+        mask = _mask_nearest_cell(lats, lons, n_lat, n_lon, cx, cy)
+    _admin_mask_cache[cache_key] = mask
+    return mask
+
+
 def _build_region_mask(
     lats: np.ndarray,
     lons: np.ndarray,
@@ -348,6 +417,14 @@ def _build_region_mask(
             cy = sum(p[1] for p in ring) / len(ring)
             mask = _mask_nearest_cell(lats, lons, n_lat, n_lon, cx, cy)
         return mask
+
+    if region_type == "admin":
+        level = str(region.get("level") or "")
+        fips = str(region.get("fips") or "")
+        if not level or not fips:
+            return mask
+        return _admin_region_mask(lats, lons, n_lat, n_lon, level, fips)
+
     return mask
 
 

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, model_validator
 
-from backend.request_models import StatsRegion
+from backend.request_models import VALID_REGION_TYPES, StatsRegion
 
-_VALID_SHAPE_TYPES = {"point", "rectangle", "polygon"}
+_VALID_SHAPE_TYPES = VALID_REGION_TYPES
 
 
 def _validate_region(region: StatsRegion) -> StatsRegion:
+    # StatsRegion's own model_validator already enforces the type/level/fips invariants;
+    # this stays as a hook in case saved-shapes ever needs a stricter subset.
     if region.type not in _VALID_SHAPE_TYPES:
         raise ValueError(f"region.type must be one of {_VALID_SHAPE_TYPES}")
     return region
