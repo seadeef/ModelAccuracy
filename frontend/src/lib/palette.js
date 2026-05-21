@@ -30,18 +30,32 @@ export function statColor(key) {
 const MODEL_HUES = [210, 275, 185, 315, 240, 170, 295, 225];
 
 /**
- * Deterministic display colors keyed by model.  Each model receives
- * bg / fg / border variants for use in pills, chart lines, etc.
+ * Short uppercase identifier derived from a model's label — full label
+ * if it's already an acronym of ≤4 chars (e.g. "GFS", "AIFS"); otherwise
+ * the first 3 alphanumeric chars (e.g. "GraphCast" → "GRA").
+ */
+export function modelIdent(label) {
+  const cleaned = String(label || '').replace(/[^A-Za-z0-9]/g, '');
+  return (cleaned.length <= 4 ? cleaned : cleaned.slice(0, 3)).toUpperCase();
+}
+
+/**
+ * Deterministic display colors keyed by model.  Each entry has bg / fg /
+ * border variants for use in pills, chart lines, etc., plus a short
+ * uppercase `ident` — the canonical short identifier shown in chart
+ * labels and the winners table.
  */
 export function modelPalette(models) {
   const arr = Array.isArray(models) ? models : [];
   const out = {};
   for (let i = 0; i < arr.length; i++) {
     const hue = MODEL_HUES[i % MODEL_HUES.length];
-    out[arr[i].key] = {
+    const m = arr[i];
+    out[m.key] = {
       bg:     `hsl(${hue} 52% 32%)`,
       fg:     `hsl(${hue} 30% 96%)`,
       border: `hsl(${hue} 45% 48%)`,
+      ident:  modelIdent(m.label || m.key),
     };
   }
   return out;

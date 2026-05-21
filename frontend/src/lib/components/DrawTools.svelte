@@ -12,16 +12,24 @@
     }
   }
 
-  const tools = [
+  const drawTools = [
     { id: 'point', label: 'Click point', icon: drawToolGlyph.point },
     { id: 'rectangle', label: 'Draw rectangle', icon: drawToolGlyph.rectangle },
     { id: 'polygon', label: 'Draw polygon', icon: drawToolGlyph.polygon },
+  ];
+
+  const adminTools = [
+    { id: 'state', label: 'Pick a state', icon: drawToolGlyph.state },
+    { id: 'county', label: 'Pick a county', icon: drawToolGlyph.county },
   ];
 
   function toolTitle(tool) {
     if (ui.selectedRegion) return tool.label;
     if (tool.id === 'polygon') {
       return `${tool.label} — Click map to add corners, then press Enter to finish (at least 3). Double-click also finishes.`;
+    }
+    if (tool.id === 'state' || tool.id === 'county') {
+      return `${tool.label} — Click a ${tool.id} on the map to select it`;
     }
     return `${tool.label} — Draw to get started`;
   }
@@ -85,7 +93,9 @@
 
   function loadShape(shape) {
     ui.selectedRegion = shape.region;
-    if (shape.region?.type) {
+    if (shape.region?.type === 'admin') {
+      ui.activeTool = shape.region.level || 'state';
+    } else if (shape.region?.type) {
       ui.activeTool = shape.region.type;
     }
     showLoadPopover = false;
@@ -101,9 +111,11 @@
     }
   }
 
-  function shapeTypeIcon(type) {
-    if (type === 'rectangle') return '▭';
-    if (type === 'polygon') return '⬠';
+  function shapeTypeIcon(region) {
+    const t = region?.type;
+    if (t === 'rectangle') return '▭';
+    if (t === 'polygon') return '⬠';
+    if (t === 'admin') return region.level === 'county' ? '▦' : '◫';
     return '📍';
   }
 </script>
@@ -111,7 +123,22 @@
 <svelte:window onclick={handleClickOutside} />
 
 <div class="toolbar">
-  {#each tools as tool}
+  {#each drawTools as tool}
+    <button
+      class="tool-btn"
+      class:active={ui.activeTool === tool.id}
+      title={toolTitle(tool)}
+      onclick={() => selectTool(tool.id)}
+    >
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
+        {@html tool.icon}
+      </svg>
+    </button>
+  {/each}
+
+  <div class="toolbar-sep" aria-hidden="true"></div>
+
+  {#each adminTools as tool}
     <button
       class="tool-btn"
       class:active={ui.activeTool === tool.id}
@@ -187,7 +214,7 @@
               {#each savedShapes as shape}
                 <li>
                   <button class="shape-item" onclick={() => loadShape(shape)}>
-                    <span class="shape-icon">{shapeTypeIcon(shape.region?.type)}</span>
+                    <span class="shape-icon">{shapeTypeIcon(shape.region)}</span>
                     <span class="shape-name">{shape.name}</span>
                   </button>
                 </li>

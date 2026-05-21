@@ -9,7 +9,8 @@
     tileUrl, preloadLeads, clearLeadImages, getLeadImage,
     compositeToDataUrlCached, getModelLeadBounds,
   } from '../tile.js';
-  import { drawToolGlyph } from '../appIcons.js';
+  import CenterGuide from './CenterGuide.svelte';
+  import { feature as topojsonFeature } from 'topojson-client';
 
   const [oW, oS, oE, oN] = TILE_IMAGE_BOUNDS_WGS84;
   const overlayCoords = [[oW, oN], [oE, oN], [oE, oS], [oW, oS]];
@@ -37,7 +38,8 @@
 
   function addRasterLayer() {
     // Insert below the dim mask so the cutout overlay can dim the raster.
-    // Stack (bottom→top): basemap → raster → dim-mask → draw-fill → draw-line → draw-point
+    // Stack (bottom→top):
+    //   basemap → raster → admin-fill → dim-mask → admin-outline → draw-fill → draw-line → draw-point
     const beforeLayer = map.getLayer(dimLayerId) ? dimLayerId
                       : map.getLayer(drawFillLayerId) ? drawFillLayerId
                       : undefined;
@@ -154,7 +156,6 @@
         showOnMap(tileUrl(ui.model, statistic, hi, ui.period, ui.month, ui.season));
       }
     }
-    if (gen === loadTilesetGen) ui.statusMessage = 'Idle';
   }
 
   function applyLayerState() {
@@ -247,6 +248,194 @@
   /** Dark mask with a hole over the selection (below draw layers, above basemap + raster). */
   const dimSourceId = 'selection-dim-source';
   const dimLayerId = 'selection-dim-fill';
+
+  // ── Admin (state / county) selection layer ──────────────────────────
+  const adminSourceId = 'admin-source';
+  const adminFillLayerId = 'admin-fill';
+  const adminOutlineLayerId = 'admin-outline';
+  /** Cache GeoJSON per level so toggling tools doesn't re-fetch. */
+  const adminGeoCache = new Map(); // level → FeatureCollection
+  let adminLevelLoaded = null;     // 'state' | 'county' | null
+  let adminHoveredId = null;
+  let adminLoadAbort = null;
+
+  function adminTopoUrl(level) {
+    return `/static/admin/${level === 'county' ? 'counties' : 'states'}.topojson`;
+  }
+
+  /**
+   * Fetch the TopoJSON for a level and decode to GeoJSON.  TopoJSON is ~4–6×
+   * smaller gzipped than the equivalent GeoJSON because shared borders are
+   * stored once.
+   *
+   * us-atlas stores geometry ids as **numbers** (e.g. California is `6`, not
+   * `"06"`), so we zero-pad here to the canonical FIPS width — 2 for states,
+   * 5 for counties.  Without this, states 01–09 (and every county inside
+   * them, ~1300 of them) would fail backend FIPS validation.
+   */
+  async function loadAdminGeo(level) {
+    const cached = adminGeoCache.get(level);
+    if (cached) return cached;
+    if (adminLoadAbort) adminLoadAbort.abort();
+    adminLoadAbort = new AbortController();
+    try {
+      const resp = await fetch(adminTopoUrl(level), { signal: adminLoadAbort.signal });
+      if (!resp.ok) throw new Error(`admin geo ${level} fetch failed (${resp.status})`);
+      const topology = await resp.json();
+      const objectName = level === 'county' ? 'counties' : 'states';
+      const fc = topojsonFeature(topology, topology.objects[objectName]);
+      const padTo = level === 'county' ? 5 : 2;
+      for (const feat of fc.features) {
+        const fips = String(feat.id ?? '').padStart(padTo, '0');
+        feat.id = fips;
+        feat.properties = { ...(feat.properties || {}), fips, level };
+      }
+      adminGeoCache.set(level, fc);
+      return fc;
+    } finally {
+      adminLoadAbort = null;
+    }
+  }
+
+  function geomBbox(geom) {
+    let w = Infinity, e = -Infinity, s = Infinity, n = -Infinity;
+    const visit = (ring) => {
+      for (const [x, y] of ring) {
+        if (x < w) w = x;
+        if (x > e) e = x;
+        if (y < s) s = y;
+        if (y > n) n = y;
+      }
+    };
+    if (geom?.type === 'Polygon') {
+      for (const ring of geom.coordinates) visit(ring);
+    } else if (geom?.type === 'MultiPolygon') {
+      for (const poly of geom.coordinates) for (const ring of poly) visit(ring);
+    }
+    return [w, s, e, n];
+  }
+
+  async function setupAdminLayer(level) {
+    if (!map) return;
+    let fc;
+    try {
+      fc = await loadAdminGeo(level);
+    } catch (err) {
+      if (err?.name !== 'AbortError') {
+        console.warn(`[status] Failed to load ${level} boundaries`, err);
+      }
+      return;
+    }
+    if (!map) return;
+    if (ui.activeTool !== level) return; // tool switched while loading
+
+    if (map.getSource(adminSourceId)) {
+      map.getSource(adminSourceId).setData(fc);
+    } else {
+      // Fill goes BELOW the dim mask so its hover tint dims outside the selection.
+      // Outline goes ABOVE the dim mask so borders stay crisp everywhere — otherwise
+      // the dim overlay washes out lines outside the cutout, which makes it hard to
+      // see what's clickable when zoomed in near a selection edge.
+      const fillBefore = map.getLayer(dimLayerId) ? dimLayerId
+                       : map.getLayer(drawFillLayerId) ? drawFillLayerId
+                       : undefined;
+      const outlineBefore = map.getLayer(drawFillLayerId) ? drawFillLayerId : undefined;
+      // No promoteId: each feature's top-level `id` is set to the padded FIPS
+      // string in loadAdminGeo, which MapLibre uses as the source feature id.
+      map.addSource(adminSourceId, { type: 'geojson', data: fc });
+      map.addLayer({
+        id: adminFillLayerId, type: 'fill', source: adminSourceId,
+        paint: {
+          'fill-color': '#26d9e8',
+          'fill-opacity': [
+            'case',
+            ['boolean', ['feature-state', 'hover'], false], 0.32,
+            0.08,
+          ],
+        },
+      }, fillBefore);
+      map.addLayer({
+        id: adminOutlineLayerId, type: 'line', source: adminSourceId,
+        paint: {
+          'line-color': '#26d9e8',
+          'line-width': [
+            'case',
+            ['boolean', ['feature-state', 'hover'], false], 2.4,
+            1.2,
+          ],
+          'line-opacity': 0.9,
+        },
+      }, outlineBefore);
+      map.on('mousemove', adminFillLayerId, handleAdminMouseMove);
+      map.on('mouseleave', adminFillLayerId, handleAdminMouseLeave);
+      map.on('click', adminFillLayerId, handleAdminClick);
+    }
+    adminLevelLoaded = level;
+  }
+
+  function teardownAdminLayer() {
+    if (!map) return;
+    if (adminHoveredId != null && map.getSource(adminSourceId)) {
+      map.setFeatureState({ source: adminSourceId, id: adminHoveredId }, { hover: false });
+      adminHoveredId = null;
+    }
+    if (map.getLayer(adminFillLayerId)) {
+      map.off('mousemove', adminFillLayerId, handleAdminMouseMove);
+      map.off('mouseleave', adminFillLayerId, handleAdminMouseLeave);
+      map.off('click', adminFillLayerId, handleAdminClick);
+      map.removeLayer(adminFillLayerId);
+    }
+    if (map.getLayer(adminOutlineLayerId)) map.removeLayer(adminOutlineLayerId);
+    if (map.getSource(adminSourceId)) map.removeSource(adminSourceId);
+    adminLevelLoaded = null;
+  }
+
+  function handleAdminMouseMove(e) {
+    if (!map) return;
+    map.getCanvas().style.cursor = 'pointer';
+    const f = e.features?.[0];
+    if (!f) return;
+    if (adminHoveredId != null && adminHoveredId !== f.id) {
+      map.setFeatureState({ source: adminSourceId, id: adminHoveredId }, { hover: false });
+    }
+    adminHoveredId = f.id;
+    map.setFeatureState({ source: adminSourceId, id: adminHoveredId }, { hover: true });
+  }
+
+  function handleAdminMouseLeave() {
+    if (!map) return;
+    map.getCanvas().style.cursor = 'crosshair';
+    if (adminHoveredId != null) {
+      map.setFeatureState({ source: adminSourceId, id: adminHoveredId }, { hover: false });
+      adminHoveredId = null;
+    }
+  }
+
+  function handleAdminClick(e) {
+    const f = e.features?.[0];
+    if (!f) return;
+    const props = f.properties || {};
+    const level = props.level || ui.activeTool;
+    const fips = String(props.fips ?? f.id ?? '');
+    if (!fips) return;
+    // MapLibre splits polygons across tile boundaries, so e.features[0].geometry
+    // is the tile-clipped fragment under the cursor — bbox/cutout would only match
+    // that fragment when zoomed in. Look up the full feature from the cache instead.
+    const fc = adminGeoCache.get(level);
+    const fullFeature = fc?.features?.find((feat) => feat.id === fips);
+    const geometry = fullFeature?.geometry || f.geometry;
+    const bounds = geomBbox(geometry);
+    ui.selectedRegion = {
+      type: 'admin',
+      level,
+      fips,
+      name: props.name || '',
+      bounds,
+      geometry,
+    };
+    ui.activeTool = level;
+    ui.hasUsedAreaDrawTool = true;
+  }
 
   let rectStart = null;       // {lng, lat} for rectangle drag start
   /** `$state` so the Enter-to-finish hint can react while drawing. */
@@ -347,6 +536,10 @@
       for (const [lng, lat] of region.coordinates) {
         growToInclude(lng, lat);
       }
+    } else if (region.type === 'admin' && Array.isArray(region.bounds)) {
+      const [bw, bs, be, bn] = region.bounds;
+      growToInclude(bw, bs);
+      growToInclude(be, bn);
     }
 
     w = Math.max(-180, w);
@@ -380,14 +573,26 @@
 
     const outer = viewportDimOuterRing(region);
 
-    let hole;
+    let holes;
     if (region.type === 'rectangle') {
       const [sw, ne] = region.coordinates;
-      hole = asClockwiseHoleRing(boundsHoleRing(sw, ne));
+      holes = [asClockwiseHoleRing(boundsHoleRing(sw, ne))];
     } else if (region.type === 'polygon') {
       const pts = region.coordinates;
       if (pts.length < 3) return emptyFeatureCollection();
-      hole = asClockwiseHoleRing([...pts, pts[0]]);
+      holes = [asClockwiseHoleRing([...pts, pts[0]])];
+    } else if (region.type === 'admin') {
+      // Use the outer ring of every MultiPolygon part as a separate hole.
+      const geom = region.geometry;
+      if (!geom) return emptyFeatureCollection();
+      const parts = geom.type === 'MultiPolygon' ? geom.coordinates
+                  : geom.type === 'Polygon' ? [geom.coordinates]
+                  : [];
+      holes = parts
+        .map((part) => part?.[0])
+        .filter((ring) => Array.isArray(ring) && ring.length >= 4)
+        .map((ring) => asClockwiseHoleRing([...ring]));
+      if (!holes.length) return emptyFeatureCollection();
     } else {
       return emptyFeatureCollection();
     }
@@ -400,7 +605,7 @@
           properties: {},
           geometry: {
             type: 'Polygon',
-            coordinates: [outer, hole],
+            coordinates: [outer, ...holes],
           },
         },
       ],
@@ -724,17 +929,28 @@
     }
   }
 
-  // Update cursor and clear draw state when tool changes
+  // Update cursor and clear draw state when tool changes.
+  // Read `ui.activeTool` BEFORE the `!map` bail-out so Svelte registers it as a
+  // tracked dep on the very first run (when onMount hasn't yet created the map).
+  // If we read it after the early return, the first effect call doesn't see it,
+  // no dep is tracked, and later button clicks never re-run this effect.
   $effect(() => {
-    if (!map) return;
     const tool = ui.activeTool;
+    if (!map) return;
     const canvas = map.getCanvas();
     if (tool) {
       canvas.style.cursor = 'crosshair';
-      // Clear previous draw state when switching tools
       clearDrawState();
     } else {
       canvas.style.cursor = '';
+    }
+    if (tool === 'state' || tool === 'county') {
+      if (adminLevelLoaded !== tool) {
+        teardownAdminLayer();
+        setupAdminLayer(tool);
+      }
+    } else if (adminLevelLoaded != null) {
+      teardownAdminLayer();
     }
   });
 
@@ -795,7 +1011,7 @@
       const { min } = getModelLeadBounds(appConfig.models, ui.model);
       ui.leadFractional = min;
     } catch (err) {
-      ui.statusMessage = 'Failed to load config';
+      console.warn('[status] Failed to load config', err);
     }
 
     // NOW create the map — config is loaded, style URL will be correct
@@ -814,7 +1030,7 @@
     });
     map.on('load', () => {
       if (!appConfig.maptilerApiKey) {
-        ui.statusMessage = 'Using fallback basemap; set MAPTILER_API_KEY for MapTiler.';
+        console.log('[status] Using fallback basemap; set MAPTILER_API_KEY for MapTiler.');
       }
       doPreloadLeads();
       // Draw + dim layers must exist before handleChange → showOnMap → addRasterLayer,
@@ -845,14 +1061,19 @@
       if (ui.activeTool) handleDrawClick(event);
     });
 
-    /** Dim outer ring follows the viewport; refresh when the view changes (not a full-world polygon). */
+    /**
+     * Dim outer ring follows the viewport; refresh continuously during pan/zoom so newly
+     * revealed areas dim immediately (otherwise the mask appears to "chunk" — only filling
+     * the new viewport when the gesture ends). The dim polygon is tiny (one outer ring +
+     * ≤ a few holes), so per-frame re-tiling via setData is cheap.
+     */
     function refreshDimOnViewChange() {
       const r = ui.selectedRegion;
-      if (r && (r.type === 'rectangle' || r.type === 'polygon')) {
+      if (r && (r.type === 'rectangle' || r.type === 'polygon' || r.type === 'admin')) {
         updateDimMask();
       }
     }
-    map.on('moveend', refreshDimOnViewChange);
+    map.on('move', refreshDimOnViewChange);
     map.on('resize', refreshDimOnViewChange);
   });
 
@@ -878,62 +1099,34 @@
     </div>
   {/if}
   {#if ui.activeTool === 'polygon' && !hasDrawnPolygon}
-    <div
-      class="draw-hint"
-      class:draw-hint--with-panel={!!ui.selectedRegion}
-      role="status"
-      aria-live="polite"
-    >
-      {#if !ui.selectedRegion}
-        <div class="draw-hint-icon">
-          <svg width="28" height="28" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
-            {@html drawToolGlyph.polygon}
-          </svg>
-        </div>
-      {/if}
-      <div class="draw-hint-text">
-        {#if polyPoints.length === 0}
-          Tap the map to add polygon corners
+    <CenterGuide>
+      {#if polyPoints.length === 0}
+        Tap the map to add polygon corners
+      {:else}
+        {#if coarsePointer}
+          Tap <strong>Done</strong> below when you have at least 3 points
         {:else}
-          {#if coarsePointer}
-            Tap <strong>Done</strong> below when you have at least 3 points
-          {:else}
-            Press <kbd>Enter</kbd> to finish
-          {/if}
-          <span class="hint-detail">
-            {#if polyPoints.length < 3}
-              ({3 - polyPoints.length} more point{3 - polyPoints.length === 1 ? '' : 's'} needed)
-              <span class="hint-detail-sep">·</span>
-            {/if}
-            Press <kbd>Esc</kbd> to stop drawing
-          </span>
+          Press <kbd class="guide-kbd">Enter</kbd> to finish
         {/if}
-      </div>
-    </div>
+        <span class="guide-detail">
+          {#if polyPoints.length < 3}
+            ({3 - polyPoints.length} more point{3 - polyPoints.length === 1 ? '' : 's'} needed)
+            <span class="guide-detail-sep">·</span>
+          {/if}
+          Press <kbd class="guide-kbd">Esc</kbd> to stop drawing
+        </span>
+      {/if}
+    </CenterGuide>
   {/if}
   {#if ui.activeTool === 'rectangle' && !hasDrawnRectangle}
-    <div
-      class="draw-hint"
-      class:draw-hint--with-panel={!!ui.selectedRegion}
-      role="status"
-      aria-live="polite"
-    >
-      {#if !ui.selectedRegion}
-        <div class="draw-hint-icon">
-          <svg width="28" height="28" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
-            {@html drawToolGlyph.rectangle}
-          </svg>
-        </div>
+    <CenterGuide>
+      {#if !isDrawing}
+        {coarsePointer ? 'Touch and drag to draw a rectangle' : 'Click & drag to draw a rectangle'}
+      {:else}
+        {coarsePointer ? 'Lift finger to finish' : 'Release to finish'}
+        <span class="guide-detail">Press <kbd class="guide-kbd">Esc</kbd> to stop drawing</span>
       {/if}
-      <div class="draw-hint-text">
-        {#if !isDrawing}
-          {coarsePointer ? 'Touch and drag to draw a rectangle' : 'Click & drag to draw a rectangle'}
-        {:else}
-          {coarsePointer ? 'Lift finger to finish' : 'Release to finish'}
-          <span class="hint-detail">Press <kbd>Esc</kbd> to stop drawing</span>
-        {/if}
-      </div>
-    </div>
+    </CenterGuide>
   {/if}
 </div>
 
@@ -947,42 +1140,10 @@
     width: 100%;
     height: 100%;
   }
-  .draw-hint {
-    position: fixed;
-    left: 50%;
-    top: 50%;
-    transform: translate(-50%, -50%);
-    z-index: 9;
-    pointer-events: none;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 12px;
-    padding: 24px 32px;
-    text-align: center;
-    background: rgba(10, 12, 18, 0.82);
-    backdrop-filter: blur(16px) saturate(1.2);
-    -webkit-backdrop-filter: blur(16px) saturate(1.2);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 16px;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
-    max-width: min(340px, calc(100vw - 40px));
-  }
   @media (max-width: 640px) {
-    .draw-hint {
-      max-width: calc(100vw - 20px);
-      padding: 18px 20px;
-    }
-    .draw-hint--with-panel {
-      top: min(32vh, calc(100dvh - 58vh - 40px));
-    }
     .poly-done-wrap {
       bottom: max(100px, calc(env(safe-area-inset-bottom, 0px) + 88px));
     }
-  }
-  .draw-hint--with-panel {
-    top: min(40vh, calc(100dvh - 52vh - 56px));
-    gap: 0;
   }
   .poly-done-wrap {
     position: fixed;
@@ -1009,44 +1170,27 @@
   .poly-done-btn:active {
     transform: scale(0.98);
   }
-  .draw-hint-icon {
-    width: 56px;
-    height: 56px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    border: 2px dashed rgba(255, 255, 255, 0.25);
-    border-radius: 14px;
-    color: var(--accent, #6eb5ff);
-  }
-  .draw-hint-text {
-    font-size: 16px;
-    font-weight: 600;
-    line-height: 1.35;
-    color: #fff;
-  }
-  .draw-hint kbd {
+  .guide-kbd {
     display: inline-block;
     padding: 2px 6px;
     margin: 0 2px;
     font-size: 11px;
     font-family: inherit;
     font-weight: 600;
-    background: var(--surface, rgba(255, 255, 255, 0.08));
-    border: 1px solid var(--panel-border, rgba(255, 255, 255, 0.12));
+    background: rgba(255, 255, 255, 0.10);
+    border: 1px solid rgba(255, 255, 255, 0.18);
     border-radius: 4px;
-    color: var(--accent, #6eb5ff);
+    color: #e8f3ff;
   }
-  .hint-detail {
+  .guide-detail {
     display: block;
     margin-top: 6px;
     font-size: 11px;
     font-weight: 400;
     line-height: 1.4;
-    color: var(--text-secondary, #7a818c);
+    color: rgba(255, 255, 255, 0.7);
   }
-  .hint-detail-sep {
+  .guide-detail-sep {
     margin: 0 0.35em;
     opacity: 0.65;
   }

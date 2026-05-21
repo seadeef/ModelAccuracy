@@ -16,13 +16,14 @@ export const ui = $state({
   season: 'djf',
   weatherOpacity: 0.85,
   leadFractional: 1.0,
-  statusMessage: 'Idle',
   activeWindow: null,
 
-  // Draw tools: 'point' | 'rectangle' | 'polygon' | null
+  // Draw tools: 'point' | 'rectangle' | 'polygon' | 'state' | 'county' | null
   activeTool: 'point',
 
-  // Selected region: null or { type, coordinates, bounds }
+  // Selected region: null or
+  //   { type: 'point'|'rectangle'|'polygon', coordinates, bounds? }
+  //   { type: 'admin', level: 'state'|'county', fips, name, bounds, geometry }
   selectedRegion: null,
 
   /** Default pin guide stays until the user places a point selection at least once. */

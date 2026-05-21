@@ -1,10 +1,33 @@
-import { STATIC_BASE, MONTH_NAMES, SEASON_NAMES } from './constants.js';
+import { STATIC_BASE, MONTH_NAMES, SEASON_NAMES, TILE_IMAGE_BOUNDS_WGS84 } from './constants.js';
 
 function rangeJsonUrl(model, statistic, period, month, season) {
   const b = `${STATIC_BASE}/ranges/${model}/${statistic}`;
   if (period === 'monthly') return `${b}/monthly/${month}.json`;
   if (period === 'seasonal') return `${b}/seasonal/${season}.json`;
   return `${b}/yearly.json`;
+}
+
+/** Source tile PNGs are EPSG:3857. Lat must use the Mercator y mapping;
+ *  lng is linear. Returns [0,1] fraction along the source bounds. */
+function mercY(latDeg) {
+  return Math.log(Math.tan(Math.PI / 4 + (latDeg * Math.PI) / 360));
+}
+
+function geometryParts(geometry) {
+  if (!geometry) return [];
+  if (geometry.type === 'MultiPolygon') return geometry.coordinates;
+  if (geometry.type === 'Polygon') return [geometry.coordinates];
+  return [];
+}
+
+function buildAdminTitleSuffix(region) {
+  if (!region || region.type !== 'admin' || !region.name) return '';
+  return `  —  ${region.name}`;
+}
+
+function adminFilenameTag(region) {
+  if (!region || region.type !== 'admin' || !region.fips) return '';
+  return `_${region.level}${region.fips}`;
 }
 
 function loadImage(src) {
@@ -60,6 +83,7 @@ export async function exportMapImage({
   season,
   models,
   statisticsMeta,
+  region,
 }) {
   const src = overlayUrl || fallbackTileUrl;
   if (!src) throw new Error('No tile URL for export');
@@ -100,21 +124,61 @@ export async function exportMapImage({
     periodLabel = SEASON_NAMES[season] ? `${SEASON_NAMES[season]} (${season.toUpperCase()})` : season.toUpperCase();
   }
 
-  const title = `${modelLabel} ${statLabel} (${units})  \u2014  ${leadLabel}  \u2014  ${periodLabel}`;
+  const title = `${modelLabel} ${statLabel} (${units})  \u2014  ${leadLabel}  \u2014  ${periodLabel}${buildAdminTitleSuffix(region)}`;
 
-  const MIN_WIDTH = 800;
+  const MIN_IMG_WIDTH = 800;
   const TITLE_H = 48;
   const LEGEND_H = 70;
   const PADDING = 16;
+  const MAP_AREA_WIDTH = 900;
+  const MAP_AREA_HEIGHT = 600;
 
   const tileW = tileImg.naturalWidth;
   const tileH = tileImg.naturalHeight;
-  const scale = Math.max(1, MIN_WIDTH / (tileW + 2 * PADDING));
-  const scaledW = Math.round(tileW * scale);
-  const scaledH = Math.round(tileH * scale);
 
-  const imgW = scaledW + 2 * PADDING;
-  const imgH = TITLE_H + scaledH + LEGEND_H;
+  const [oW, oS, oE, oN] = TILE_IMAGE_BOUNDS_WGS84;
+  const oMercN = mercY(oN);
+  const oMercS = mercY(oS);
+
+  // Map a WGS84 point to source-pixel coords in the (Mercator) tile PNG.
+  const lngToSrcX = (lng) => ((lng - oW) / (oE - oW)) * tileW;
+  const latToSrcY = (lat) => ((oMercN - mercY(lat)) / (oMercN - oMercS)) * tileH;
+
+  // Crop the source tile to an admin region's bbox when one is selected.
+  const adminGeometry = region?.type === 'admin' ? region.geometry : null;
+  const adminBounds = region?.type === 'admin' && Array.isArray(region.bounds) ? region.bounds : null;
+
+  let srcX = 0, srcY = 0, srcW = tileW, srcH = tileH;
+  if (adminGeometry && adminBounds && adminBounds.length === 4) {
+    const [bw, bs, be, bn] = adminBounds;
+    const xL = lngToSrcX(bw);
+    const xR = lngToSrcX(be);
+    const yT = latToSrcY(bn);
+    const yB = latToSrcY(bs);
+    // Snap each edge outward so the cropped source pixels fully contain the bbox.
+    // ceil(xR)-floor(xL) is correct; ceil(xR-xL) under-sizes when the bbox crosses a pixel boundary.
+    srcX = Math.max(0, Math.floor(xL));
+    srcY = Math.max(0, Math.floor(yT));
+    const srcXEnd = Math.min(tileW, Math.ceil(xR));
+    const srcYEnd = Math.min(tileH, Math.ceil(yB));
+    srcW = Math.max(1, srcXEnd - srcX);
+    srcH = Math.max(1, srcYEnd - srcY);
+  }
+
+  // Fit the source crop into a fixed map-area box, preserving aspect ratio.
+  // Tiny crops (single states, counties) get scaled up; CONUS-wide crops fit within MAP_AREA_WIDTH.
+  const scale = Math.min(MAP_AREA_WIDTH / srcW, MAP_AREA_HEIGHT / srcH);
+  const scaledW = Math.round(srcW * scale);
+  const scaledH = Math.round(srcH * scale);
+
+  // Image always has at least MIN_IMG_WIDTH so title and legend have room.
+  const imgW = Math.max(MIN_IMG_WIDTH, scaledW + 2 * PADDING);
+  const imgH = TITLE_H + MAP_AREA_HEIGHT + LEGEND_H;
+
+  // Center the scaled map both horizontally and vertically inside the map area.
+  const mapOffsetX = Math.round((imgW - scaledW) / 2);
+  const mapOffsetY = TITLE_H + Math.round((MAP_AREA_HEIGHT - scaledH) / 2);
+  const mapAreaBottom = TITLE_H + MAP_AREA_HEIGHT;
 
   const canvas = document.createElement('canvas');
   canvas.width = imgW;
@@ -131,15 +195,69 @@ export async function exportMapImage({
   ctx.lineTo(imgW, TITLE_H - 0.5);
   ctx.stroke();
 
+  // Convert a (lng, lat) WGS84 vertex to canvas pixels inside the cropped/scaled tile area.
+  const lngLatToCanvas = (lng, lat) => {
+    const sx = lngToSrcX(lng);
+    const sy = latToSrcY(lat);
+    return [
+      mapOffsetX + (sx - srcX) * scale,
+      mapOffsetY + (sy - srcY) * scale,
+    ];
+  };
+
   ctx.fillStyle = 'rgb(240,240,240)';
-  ctx.fillRect(PADDING, TITLE_H, scaledW, scaledH);
+  ctx.fillRect(mapOffsetX, mapOffsetY, scaledW, scaledH);
   ctx.imageSmoothingEnabled = scale > 1;
   ctx.imageSmoothingQuality = 'high';
-  ctx.drawImage(tileImg, PADDING, TITLE_H, scaledW, scaledH);
+
+  if (adminGeometry) {
+    ctx.save();
+    // Build a clip path from the admin polygon(s); even-odd handles holes.
+    ctx.beginPath();
+    for (const poly of geometryParts(adminGeometry)) {
+      for (const ring of poly) {
+        if (!Array.isArray(ring) || ring.length < 3) continue;
+        for (let i = 0; i < ring.length; i++) {
+          const [lng, lat] = ring[i];
+          const [px, py] = lngLatToCanvas(lng, lat);
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+      }
+    }
+    ctx.clip('evenodd');
+    ctx.drawImage(tileImg, srcX, srcY, srcW, srcH, mapOffsetX, mapOffsetY, scaledW, scaledH);
+    ctx.restore();
+
+    // Outline the admin shape so the boundary is legible against the white background.
+    ctx.save();
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = 'rgba(40,40,40,0.85)';
+    ctx.lineWidth = 1.4;
+    for (const poly of geometryParts(adminGeometry)) {
+      for (const ring of poly) {
+        if (!Array.isArray(ring) || ring.length < 3) continue;
+        ctx.beginPath();
+        for (let i = 0; i < ring.length; i++) {
+          const [lng, lat] = ring[i];
+          const [px, py] = lngLatToCanvas(lng, lat);
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  } else {
+    ctx.drawImage(tileImg, srcX, srcY, srcW, srcH, mapOffsetX, mapOffsetY, scaledW, scaledH);
+  }
 
   ctx.beginPath();
-  ctx.moveTo(0, TITLE_H + scaledH + 0.5);
-  ctx.lineTo(imgW, TITLE_H + scaledH + 0.5);
+  ctx.moveTo(0, mapAreaBottom + 0.5);
+  ctx.lineTo(imgW, mapAreaBottom + 0.5);
   ctx.stroke();
 
   let titleFontPx = 20;
@@ -156,7 +274,7 @@ export async function exportMapImage({
   const barW = Math.min(Math.floor(imgW * 0.5), 400);
   const barH = 16;
   const barX = (imgW - barW) >> 1;
-  const barY = TITLE_H + scaledH + 12;
+  const barY = mapAreaBottom + 12;
 
   drawColorBar(ctx, barX, barY, barW, barH, colormap);
 
@@ -189,7 +307,7 @@ export async function exportMapImage({
       : period === 'seasonal' && season
         ? season
         : 'yearly';
-  const filename = `${model}_${statistic}_lead${leadTag}_${periodTag}.png`;
+  const filename = `${model}_${statistic}_lead${leadTag}_${periodTag}${adminFilenameTag(region)}.png`;
 
   await new Promise((resolve, reject) => {
     canvas.toBlob(

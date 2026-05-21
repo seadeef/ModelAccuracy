@@ -8,6 +8,15 @@ function headersWithAuth(base = {}) {
   return { ...base, ...authHeaders() };
 }
 
+/** Drop the (potentially large) ``geometry`` field from admin regions before sending.
+ *  The backend resolves polygons from FIPS via ``backend/admin_boundaries.py``; the
+ *  frontend only carries ``geometry`` for local rendering (dim mask). */
+function regionPayload(region) {
+  if (!region || region.type !== 'admin' || !region.geometry) return region;
+  const { geometry: _g, ...rest } = region;
+  return rest;
+}
+
 function verificationStatisticsOnly() {
   return appConfig.statistics.filter((s) => s.key !== 'forecast');
 }
@@ -42,7 +51,7 @@ export async function fetchLeadWinnersForRegion({
       method: 'POST',
       headers: headersWithAuth({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({
-        region,
+        region: regionPayload(region),
         statistic,
         period,
         month,
@@ -170,7 +179,7 @@ export async function fetchStatsAllLeads({
     headers: headersWithAuth({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       model,
-      region,
+      region: regionPayload(region),
       period,
       month,
       season,
@@ -197,7 +206,7 @@ export async function fetchForecastAllModels({ region }) {
     const resp = await fetch(`${API_BASE}/api/stats/forecast`, {
       method: 'POST',
       headers: headersWithAuth({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ region }),
+      body: JSON.stringify({ region: regionPayload(region) }),
     });
     if (!resp.ok) return null;
     return await resp.json();
@@ -215,7 +224,7 @@ export async function saveRegion(name, region) {
     const resp = await fetch(`${API_BASE}/api/shapes`, {
       method: 'POST',
       headers: headersWithAuth({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ name, region }),
+      body: JSON.stringify({ name, region: regionPayload(region) }),
     });
     if (!resp.ok) return null;
     return await resp.json();

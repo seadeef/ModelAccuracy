@@ -60,6 +60,10 @@
       const lons = r.coordinates.map(c => c[0]);
       return { lat: lats.reduce((a, b) => a + b, 0) / lats.length, lon: lons.reduce((a, b) => a + b, 0) / lons.length };
     }
+    if (r.type === 'admin' && Array.isArray(r.bounds) && r.bounds.length === 4) {
+      const [w, s, e, n] = r.bounds;
+      return { lat: (s + n) / 2, lon: (w + e) / 2 };
+    }
     return null;
   }
 
@@ -70,6 +74,7 @@
     const coord = `${c.lat.toFixed(2)}\u00b0N, ${Math.abs(c.lon).toFixed(2)}\u00b0W`;
     if (r.type === 'polygon') return `Polygon centered at: ${coord}`;
     if (r.type === 'rectangle') return `Rectangle centered at: ${coord}`;
+    if (r.type === 'admin') return r.name ? `${r.name} \u2014 ${coord}` : coord;
     return coord;
   }
 
@@ -682,6 +687,9 @@
     if (r.type === 'polygon') {
       return `g:${r.coordinates.map(([lng, lat]) => `${lng.toFixed(5)},${lat.toFixed(5)}`).join(';')}`;
     }
+    if (r.type === 'admin' && r.level && r.fips) {
+      return `a:${r.level}:${r.fips}`;
+    }
     return '';
   }
 
@@ -946,7 +954,7 @@
       ctx.globalAlpha = 1.0;
 
       const lastPt = points[points.length - 1];
-      const shortLabel = m.label.length > 6 ? m.label.slice(0, 5) + '\u2026' : m.label;
+      const shortLabel = palette[m.key]?.ident ?? m.label;
       termLabels.push({ y: lastPt.y, label: shortLabel, color, active });
     }
 
@@ -1090,7 +1098,7 @@
               role="presentation"
             >
               <div class="chart-section">
-                <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Ensemble Forecast</div>
+                <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Ensemble Forecast — <span style:color={palette[ui.model]?.border || '#6eb5ff'}>{palette[ui.model]?.ident ?? ''}</span></div>
                 <div class="lead-chart">
                   <canvas bind:this={ensembleForecastCanvasEl}></canvas>
                 </div>
@@ -1137,6 +1145,7 @@
                   <tr>
                     {#each winnerTableRows as row}
                       {@const pc = row.winner ? palette[row.winner] : null}
+                      {@const id = pc?.ident ?? ''}
                       <td class:winners-col-current={row.day === winnerLeadKey}>
                         {#if row.winner}
                           {#if pc}
@@ -1145,9 +1154,10 @@
                               style:background={pc.bg}
                               style:color={pc.fg}
                               style:border-color={pc.border}
-                            >{modelLabel(row.winner)}</span>
+                              title={modelLabel(row.winner)}
+                            ><span class="winner-ident">{id}</span></span>
                           {:else}
-                            <span class="winner-pill winner-pill-compact winner-pill-fallback">{modelLabel(row.winner)}</span>
+                            <span class="winner-pill winner-pill-compact winner-pill-fallback" title={modelLabel(row.winner)}><span class="winner-ident">{id}</span></span>
                           {/if}
                         {:else}
                           <span class="compare-nodata">&mdash;</span>
@@ -1590,9 +1600,21 @@
     text-overflow: ellipsis;
   }
   .winner-pill-compact {
-    padding: 2px 6px;
+    padding: 2px 4px;
     font-size: 11px;
     border-radius: 4px;
+    width: 3.5rem;
+    box-sizing: border-box;
+    text-align: center;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .winner-ident {
+    display: inline-block;
+    transform-origin: center center;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
   }
   .winner-pill-fallback {
     background: var(--surface);

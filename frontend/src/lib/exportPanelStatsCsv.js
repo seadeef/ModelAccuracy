@@ -32,6 +32,9 @@ function regionToken(region) {
   if (region.type === 'polygon') {
     return `poly-${region.coordinates?.length || 0}`;
   }
+  if (region.type === 'admin' && region.level && region.fips) {
+    return `${region.level}-${region.fips}`;
+  }
   return region.type || 'region';
 }
 

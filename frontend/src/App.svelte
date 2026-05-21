@@ -1,14 +1,14 @@
 <script>
   import { onMount } from 'svelte';
-  import { initAuth } from './lib/authSession.svelte.js';
+  import { initAuth, authSession, beginCognitoSignIn } from './lib/authSession.svelte.js';
   import { ui, appConfig } from './lib/state.svelte.js';
-  import { drawToolGlyph } from './lib/appIcons.js';
   import { getModelLeadBounds, tileUrl } from './lib/tile.js';
   import { exportMapImage } from './lib/exportMapImage.js';
   import MapView from './lib/components/MapView.svelte';
   import MapToolbar from './lib/components/MapToolbar.svelte';
   import Panel from './lib/components/Panel.svelte';
   import DrawTools from './lib/components/DrawTools.svelte';
+  import CenterGuide from './lib/components/CenterGuide.svelte';
   let mapView;
 
   function handleModelChange(e) {
@@ -48,7 +48,7 @@
       ui.month,
       ui.season,
     );
-    ui.statusMessage = 'Preparing download…';
+    console.log('[status] Preparing download…');
     try {
       await exportMapImage({
         overlayUrl,
@@ -61,10 +61,10 @@
         season: ui.season,
         models: appConfig.models,
         statisticsMeta: appConfig.statistics,
+        region: ui.selectedRegion,
       });
-      ui.statusMessage = 'Idle';
     } catch {
-      ui.statusMessage = 'Map download failed';
+      console.warn('[status] Map download failed');
     }
   }
 
@@ -73,13 +73,33 @@
   }
 
   function handleSearchStatus(msg) {
-    ui.statusMessage = msg;
+    if (msg) console.log('[status]', msg);
   }
 
   /** Show even when a region is selected so the panel can stay open underneath. */
-  const showGuide = $derived(
+  const showPointGuide = $derived(
     ui.activeTool === 'point' && !ui.hasUsedPinTool,
   );
+  const showAdminGuide = $derived(
+    (ui.activeTool === 'state' || ui.activeTool === 'county') && !ui.hasUsedAreaDrawTool,
+  );
+  const adminGuideText = $derived(
+    ui.activeTool === 'county' ? 'Click a county to analyze' : 'Click a state to analyze',
+  );
+
+  /**
+   * Session-scoped latch: the point guide pulses on its very first display
+   * this session and never again — switching away from the pin tool or
+   * actually clicking the map both permanently disable subsequent pulsing.
+   */
+  let pinGuidePulseAllowed = $state(
+    ui.activeTool === 'point' && !ui.hasUsedPinTool,
+  );
+  $effect(() => {
+    if (ui.hasUsedPinTool || ui.activeTool !== 'point') {
+      pinGuidePulseAllowed = false;
+    }
+  });
 
   onMount(() => {
     void initAuth().catch((e) => console.error('[auth] initAuth failed', e));
@@ -97,26 +117,21 @@
       onSearchStatus={handleSearchStatus}
     />
 
-    {#if ui.statusMessage && ui.statusMessage !== 'Idle'}
-      <div class="status-pill">{ui.statusMessage}</div>
-    {/if}
-
     <DrawTools />
 
-    {#if showGuide}
-      <div class="draw-guide" class:draw-guide--with-panel={!!ui.selectedRegion}>
-        {#if !ui.selectedRegion}
-          <div class="guide-icon">
-            <svg width="28" height="28" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
-              {@html drawToolGlyph.point}
-            </svg>
-          </div>
-        {/if}
-        <div class="guide-text">Click anywhere to analyze</div>
-        {#if !ui.hasUsedAreaDrawTool}
-          <div class="guide-hint">Or draw an area with the tools on the left</div>
-        {/if}
-      </div>
+    {#if showPointGuide}
+      <CenterGuide
+        pulse={pinGuidePulseAllowed}
+        hint={!ui.hasUsedAreaDrawTool ? 'Or analyze an area with the tools on the left' : null}
+      >
+        Click anywhere to compare model accuracy
+      </CenterGuide>
+    {/if}
+
+    {#if showAdminGuide}
+      <CenterGuide>
+        {adminGuideText}
+      </CenterGuide>
     {/if}
 
     <Panel
@@ -125,6 +140,18 @@
       onperiodchange={handlePeriodChange}
       onmodelchange={handleModelChange}
     />
+
+    {#if authSession.ready && authSession.mode === 'cognito'}
+      {#if authSession.hasSession}
+        <div class="auth-floating auth-floating--email" title={authSession.userLabel ?? 'Signed in'}>
+          {authSession.userLabel ?? 'Signed in'}
+        </div>
+      {:else}
+        <button type="button" class="auth-floating auth-floating--cta" onclick={() => beginCognitoSignIn()}>
+          Sign in
+        </button>
+      {/if}
+    {/if}
 
     <footer class="app-credit">Kevin Toren 2026</footer>
   </div>
@@ -180,103 +207,64 @@
 
   .app-credit {
     position: absolute;
+    bottom: max(14px, env(safe-area-inset-bottom, 0px));
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 11;
+    margin: 0;
+    padding: 6px 14px;
+    font-size: 12px;
+    font-weight: 400;
+    letter-spacing: 0.02em;
+    color: rgba(255, 255, 255, 0.7);
+    background: rgba(18, 22, 30, 0.62);
+    backdrop-filter: blur(14px) saturate(1.2);
+    -webkit-backdrop-filter: blur(14px) saturate(1.2);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 999px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+    pointer-events: none;
+  }
+
+  .auth-floating {
+    position: absolute;
     top: max(14px, env(safe-area-inset-top, 0px));
     right: max(14px, env(safe-area-inset-right, 0px));
     z-index: 11;
     margin: 0;
-    padding: 8px 14px;
+    display: inline-flex;
+    align-items: center;
+    padding: 10px 18px;
+    font-family: inherit;
     font-size: 13px;
     font-weight: 600;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.02em;
     color: var(--text-primary);
     background: var(--panel-bg);
-    backdrop-filter: blur(16px) saturate(1.2);
-    -webkit-backdrop-filter: blur(16px) saturate(1.2);
+    backdrop-filter: blur(20px) saturate(1.4);
+    -webkit-backdrop-filter: blur(20px) saturate(1.4);
     border: 1px solid var(--panel-border);
-    border-radius: 12px;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
-    pointer-events: none;
-  }
-
-  .status-pill {
-    position: absolute;
-    bottom: max(20px, env(safe-area-inset-bottom, 0px));
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 8;
-    padding: 6px 14px;
-    font-size: 12px;
-    color: var(--text-secondary);
-    background: var(--panel-bg);
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
-    border: 1px solid var(--panel-border);
-    border-radius: 20px;
-    white-space: nowrap;
-    pointer-events: none;
-    animation: fadeIn 0.3s;
-  }
-  @keyframes fadeIn {
-    from { opacity: 0; transform: translateX(-50%) translateY(4px); }
-    to { opacity: 1; transform: translateX(-50%) translateY(0); }
-  }
-
-  .draw-guide {
-    /* Match MapView .draw-hint; centered in viewport */
-    position: fixed;
-    left: 50%;
-    top: 50%;
-    transform: translate(-50%, -50%);
-    z-index: 25;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 8px;
-    pointer-events: none;
-    padding: 24px 32px;
-    text-align: center;
-    max-width: min(340px, calc(100vw - 40px));
-    background: rgba(10, 12, 18, 0.82);
-    backdrop-filter: blur(16px) saturate(1.2);
-    -webkit-backdrop-filter: blur(16px) saturate(1.2);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    border-radius: 16px;
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
-    animation: draw-tooltip-pulse 4s ease-in-out infinite;
-  }
-  /* Panel open: no icon, sit above bottom sheet */
-  .draw-guide--with-panel {
-    top: min(40vh, calc(100vh - 52vh - 56px));
-    gap: 8px;
-  }
-  .guide-icon {
-    width: 56px;
-    height: 56px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    border: 2px dashed rgba(255, 255, 255, 0.25);
     border-radius: 14px;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+    max-width: min(260px, 40vw);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .auth-floating--email {
+    pointer-events: none;
+  }
+  .auth-floating--cta {
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+  }
+  .auth-floating--cta:hover {
+    background: rgba(28, 34, 46, 0.92);
+    border-color: rgba(255, 255, 255, 0.18);
     color: var(--accent);
   }
-  @keyframes draw-tooltip-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.8; }
-  }
-  .guide-text {
-    font-size: 16px;
-    font-weight: 600;
-    line-height: 1.35;
-    color: #fff;
-  }
-  .guide-hint {
-    display: block;
-    margin-top: 4px;
-    font-size: 11px;
-    font-weight: 400;
-    line-height: 1.35;
-    color: var(--text-secondary);
+  .auth-floating--cta:active {
+    background: rgba(20, 24, 32, 0.95);
   }
 
   @media (max-width: 640px) {
@@ -284,27 +272,17 @@
       font-size: 14px;
     }
     .app-credit {
-      top: auto;
       bottom: max(10px, env(safe-area-inset-bottom, 0px));
-      right: max(10px, env(safe-area-inset-right, 0px));
       font-size: 11px;
-      padding: 6px 10px;
+      padding: 5px 12px;
+      gap: 6px;
     }
-    .status-pill {
-      bottom: max(88px, calc(env(safe-area-inset-bottom, 0px) + 72px));
-      max-width: calc(100vw - 24px);
-      white-space: normal;
-      text-align: center;
-    }
-    .draw-guide {
-      max-width: calc(100vw - 20px);
-      padding: 18px 20px;
-    }
-    .draw-guide--with-panel {
-      top: min(28vh, calc(100dvh - 58vh - 48px));
-    }
-    .guide-text {
-      font-size: 15px;
+    .auth-floating {
+      top: max(10px, env(safe-area-inset-top, 0px));
+      right: max(10px, env(safe-area-inset-right, 0px));
+      font-size: 12px;
+      padding: 7px 12px;
+      max-width: min(180px, 50vw);
     }
   }
 </style>
