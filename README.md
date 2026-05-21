@@ -152,7 +152,7 @@ Common flags:
 
 | Variable | Description |
 |----------|-------------|
-| `MODELACCURACY_WARM_CACHE` | `1` / `true` / `yes` — preload all models' `grid.json` at startup |
+| `WARM_CACHE` | `1` / `true` / `yes` — preload all models' `grid.json` at startup |
 | `PORT` | Listen port (default **8080**) |
 
 ### Run the container locally

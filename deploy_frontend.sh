@@ -2,13 +2,17 @@
 # Rebuild the Svelte SPA and upload its artifacts to S3, then invalidate CloudFront.
 #
 # Scope: only the Vite output (index.html, assets/, favicon.svg|ico, export_manifest.json).
-# Does NOT touch data/, forecast/, or static/ — those have their own upload flows.
+# Does NOT touch static_export/{static,data,forecast}/:
+#   * static/ (config, tiles, ranges, zip, admin)   — ./deploy_static.sh --static
+#   * forecast/ (forecast .bin + calendar)          — ./deploy_static.sh --forecast
+#   * data/ (verification .bin + grid.json)         — baked into the API image;
+#                                                     rebuild via ./deploy_fargate.sh
 #
 # Invalidation is scoped to non-hashed files. Files under /assets/ are content-hashed
 # by Vite, so their URLs change on every build and don't need invalidation.
 #
 # Env (loaded from .env if present):
-#   MODELACCURACY_DATA_S3_URI    s3://bucket[/prefix] — bucket is extracted for upload target
+#   DATA_S3_URI                  s3://bucket[/prefix] — bucket is extracted for upload target
 #   CLOUDFRONT_DISTRIBUTION_ID   CF distribution ID (required)
 #   AWS_REGION                   default us-west-1
 #   AWS_PROFILE                  optional
@@ -31,12 +35,12 @@ if [[ -f "$ROOT/.env" ]]; then
   set +a
 fi
 
-if [[ -z "${MODELACCURACY_DATA_S3_URI:-}" ]]; then
-  echo "ERROR: MODELACCURACY_DATA_S3_URI not set (expected s3://bucket[/prefix])." >&2
+if [[ -z "${DATA_S3_URI:-}" ]]; then
+  echo "ERROR: DATA_S3_URI not set (expected s3://bucket[/prefix])." >&2
   exit 1
 fi
 # Strip scheme and any path → bucket name.
-BUCKET="${MODELACCURACY_DATA_S3_URI#s3://}"
+BUCKET="${DATA_S3_URI#s3://}"
 BUCKET="${BUCKET%%/*}"
 if [[ -z "${CLOUDFRONT_DISTRIBUTION_ID:-}" ]]; then
   echo "ERROR: CLOUDFRONT_DISTRIBUTION_ID not set." >&2

@@ -18,6 +18,7 @@ load_dotenv(_project_root / ".env", override=True)
 from fastapi import FastAPI, Header
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 
 from model_registry import MODEL_REGISTRY
@@ -47,7 +48,7 @@ def _get_forecast_store():
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    if os.getenv("MODELACCURACY_WARM_CACHE", "").strip().lower() in ("1", "true", "yes"):
+    if os.getenv("WARM_CACHE", "").strip().lower() in ("1", "true", "yes"):
         from backend.stats_query import _get_grid
 
         for mk in MODEL_REGISTRY:
@@ -55,7 +56,7 @@ async def _lifespan(app: FastAPI):
                 _get_grid(STATIC_STORE, mk)
             except Exception as e:
                 print(
-                    f"WARNING: MODELACCURACY_WARM_CACHE: failed to load grid for model {mk}: {e}",
+                    f"WARNING: WARM_CACHE: failed to load grid for model {mk}: {e}",
                     file=sys.stderr,
                 )
     yield
@@ -77,17 +78,52 @@ def auth_config() -> dict:
 
 
 class LongCacheStaticMiddleware(BaseHTTPMiddleware):
-    """Set long-lived Cache-Control for versioned static assets (image tag = new deploy)."""
+    """Set Cache-Control on static assets, with two regimes:
+
+    * Rebuild outputs (tiles, ranges, data binaries, config) get a short cache
+      with ``must-revalidate`` so they actually refresh after a re-run of the
+      compute pipeline.  These URLs are stable (``lead_9.png`` stays
+      ``lead_9.png``), so ``immutable`` would be a lie that locks browsers onto
+      the first bytes they ever see.
+    * Vendor / external shapes (ZIP polygons, admin boundaries) get a long
+      cache with ``immutable`` since they change yearly at most.
+
+    In dev (``DEV=1``), skip caching headers entirely.  StaticFiles
+    will still emit ETag/Last-Modified, so browsers do conditional GETs and
+    edits on disk show up on reload without fighting the cache.
+    """
+
+    _DEV = os.getenv("DEV", "").strip().lower() in ("1", "true", "yes")
+
+    _MUTABLE_PREFIXES = (
+        "/static/tiles/",
+        "/static/ranges/",
+        "/static/config.json",
+        "/data/",
+    )
+    _IMMUTABLE_PREFIXES = (
+        "/static/zip/",
+        "/static/admin/",
+    )
 
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
+        if self._DEV:
+            return response
         path = request.url.path
-        if path.startswith("/static/") or path.startswith("/data/"):
+        if path.startswith(self._MUTABLE_PREFIXES):
+            response.headers["Cache-Control"] = "public, max-age=300, must-revalidate"
+        elif path.startswith(self._IMMUTABLE_PREFIXES):
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif path.startswith("/static/"):
+            response.headers["Cache-Control"] = "public, max-age=300, must-revalidate"
         return response
 
 
 app.add_middleware(LongCacheStaticMiddleware)
+# Production CDN gzips for us; this matters in dev (uvicorn behind Vite proxy) where
+# large JSON like /static/admin/*.topojson would otherwise ship raw.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # static_export/static: config, zip, tiles → /static/…
 # static_export/data: .bin, grid.json → /data/…

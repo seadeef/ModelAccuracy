@@ -165,5 +165,7 @@ class DynamoUserItemStore:
 
 def user_item_store_from_env(resource=None) -> UserItemStore:
     """Build a :class:`DynamoUserItemStore` from environment variables."""
-    table_name = os.getenv("DYNAMODB_USER_ITEMS_TABLE", "ModelAccuracy-UserItems").strip()
+    table_name = os.getenv("DYNAMODB_USER_ITEMS_TABLE", "").strip()
+    if not table_name:
+        raise RuntimeError("DYNAMODB_USER_ITEMS_TABLE is required (no default)")
     return DynamoUserItemStore(table_name=table_name, resource=resource)

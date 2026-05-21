@@ -148,20 +148,24 @@ def _running_on_aws_lambda() -> bool:
 
 def _force_local_static() -> bool:
     """Local-dev opt-out: read static/forecast data from the filesystem even when
-    ``MODELACCURACY_DATA_S3_URI`` is set (the URI must stay set for docker builds)."""
-    val = os.getenv("MODELACCURACY_USE_LOCAL_STATIC", "").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    ``DATA_S3_URI`` is set (the URI must stay set for docker builds).
+
+    ``DEV=1`` implies this — local dev should never reach for S3 by default."""
+    truthy = ("1", "true", "yes", "on")
+    if os.getenv("USE_LOCAL_STATIC", "").strip().lower() in truthy:
+        return True
+    return os.getenv("DEV", "").strip().lower() in truthy
 
 
 def _stats_s3_bucket_and_prefix() -> tuple[str, str] | None:
-    """Parse ``MODELACCURACY_DATA_S3_URI=s3://bucket[/prefix]`` — prefix is the stats root (``<model>/…``)."""
-    uri = os.getenv("MODELACCURACY_DATA_S3_URI", "").strip()
+    """Parse ``DATA_S3_URI=s3://bucket[/prefix]`` — prefix is the stats root (``<model>/…``)."""
+    uri = os.getenv("DATA_S3_URI", "").strip()
     if not uri:
         return None
     parsed = urlparse(uri)
     if parsed.scheme != "s3" or not parsed.netloc:
         raise ValueError(
-            "MODELACCURACY_DATA_S3_URI must look like s3://bucket or s3://bucket/optional/prefix"
+            "DATA_S3_URI must look like s3://bucket or s3://bucket/optional/prefix"
         )
     return parsed.netloc, (parsed.path or "").strip("/")
 
@@ -180,7 +184,7 @@ def _lambda_s3_store_or_raise() -> StaticStore:
     if store is not None:
         return store
     raise RuntimeError(
-        "Lambda is configured to read stats only from S3. Set MODELACCURACY_DATA_S3_URI to "
+        "Lambda is configured to read stats only from S3. Set DATA_S3_URI to "
         "s3://bucket/prefix where that prefix holds the exported stats tree (same layout as "
         "static_export/data/: <model>/grid.json and .bin paths)."
     )
@@ -192,11 +196,11 @@ def store_from_env(
 ) -> StaticStore:
     if _running_on_aws_lambda():
         return _lambda_s3_store_or_raise()
-
-    if not _force_local_static():
-        s3_from_uri = _s3_store_from_data_uri()
-        if s3_from_uri is not None:
-            return s3_from_uri
+    # Fargate (and dev) read stats from the local filesystem — verification .bin
+    # and grid.json are baked into the image (Dockerfile: COPY static_export …).
+    # Only forecast data lives in S3 (refreshed daily without a redeploy); see
+    # forecast_store_from_env. S3 stats reads remain only for Lambda, whose
+    # deployment package can't carry the data.
     root = default_local_root or default_static_site_root()
     return LocalStaticStore(root)
 
@@ -209,7 +213,7 @@ def forecast_store_from_env(
 
     Forecasts live in the same S3 bucket as the stats tree, in a ``forecast/``
     folder that is a **sibling** of the stats prefix (not nested inside it).
-    For ``MODELACCURACY_DATA_S3_URI=s3://bucket/static`` the forecast objects
+    For ``DATA_S3_URI=s3://bucket/static`` the forecast objects
     are at ``s3://bucket/forecast/{model}/lead_*.bin``; for ``s3://bucket``
     they are at ``s3://bucket/forecast/…``.
 

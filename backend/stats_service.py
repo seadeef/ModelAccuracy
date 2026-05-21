@@ -38,7 +38,7 @@ def _stats_data_missing_message(store: StaticStore) -> str:
     if store.cache_key.startswith("s3://"):
         return (
             f"No stats data found under {store.cache_key}. "
-            "MODELACCURACY_DATA_S3_URI must point at the stats root in S3 (same layout as static_export/data/: "
+            "DATA_S3_URI must point at the stats root in S3 (same layout as static_export/data/: "
             "<model>/grid.json, no data/ segment in keys). Check the URI, object keys, and Lambda IAM "
             "(s3:GetObject, s3:ListBucket)."
         )
@@ -208,7 +208,7 @@ def query_forecast_all_models_payload(
             {
                 "error": "Forecast data is not configured. Run export_static.py --forecast "
                 "(local dev) or ensure the stats S3 bucket has a forecast/ prefix populated "
-                "(production; derived from MODELACCURACY_DATA_S3_URI)."
+                "(production; derived from DATA_S3_URI)."
             },
             status_code=500,
         )

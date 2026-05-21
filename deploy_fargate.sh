@@ -18,7 +18,7 @@
 #   ECS_SERVICE / ECS_SERVICE_ARN   only used with --force-redeploy; prompted before data export if unset
 #
 # ECS Task Definition environment variables (set in AWS, not this script):
-#   MODELACCURACY_DATA_S3_URI   s3://bucket[/prefix] for stats data. Forecasts are read
+#   DATA_S3_URI                 s3://bucket[/prefix] for stats data. Forecasts are read
 #                               from the same bucket at a `forecast/` folder that is a
 #                               sibling of <prefix> (keys: forecast/{model}/lead_{n}.bin,
 #                               forecast/forecast_calendar.json).
@@ -27,7 +27,7 @@
 #   COGNITO_REGION              Cognito region (defaults to AWS_REGION / us-west-1)
 #   COGNITO_DOMAIN_PREFIX       Hosted UI domain label (*.auth.<region>.amazoncognito.com)
 #   COGNITO_OAUTH_BASE_URL      Optional full https origin for Hosted UI (overrides prefix+region; useful for demos)
-#   DYNAMODB_USER_ITEMS_TABLE   DynamoDB table for saved shapes (default ModelAccuracy-UserItems)
+#   DYNAMODB_USER_ITEMS_TABLE   DynamoDB table for saved shapes (required, no default)
 #
 # Flags:
 #   --tag-latest       push IMAGE_TAG and also push the same image as :latest
@@ -61,6 +61,7 @@ if [[ -f "$ROOT/.env" ]]; then
 fi
 
 AWS_REGION="${AWS_REGION:-us-west-1}"
+COGNITO_REGION="${COGNITO_REGION:-$AWS_REGION}"
 if [[ -n "${AWS_PROFILE:-}" ]]; then
   export AWS_PROFILE
   echo "==> Using AWS_PROFILE=${AWS_PROFILE}"
@@ -138,7 +139,12 @@ verify_static_export() {
     echo "ERROR: no */grid.json under $DATA (need at least one model export)." >&2
     exit 1
   fi
-  echo "OK: static_export/data contains grid.json"
+  local BOUNDARIES="$ROOT/static_export/static/admin/boundaries.json"
+  if [[ ! -f "$BOUNDARIES" ]]; then
+    echo "ERROR: $BOUNDARIES missing — run scripts/fetch_admin_boundaries.py." >&2
+    exit 1
+  fi
+  echo "OK: static_export/data contains grid.json; admin/boundaries.json present"
 }
 
 collect_ecs_targets_for_redeploy() {
@@ -184,11 +190,12 @@ verify_static_export
 
 echo "==> docker build --platform ${DOCKER_PLATFORM} -t ${LOCAL_IMAGE}"
 docker build --platform "$DOCKER_PLATFORM" -t "$LOCAL_IMAGE" \
-  --build-arg MODELACCURACY_DATA_S3_URI="${MODELACCURACY_DATA_S3_URI:-}" \
+  --build-arg DATA_S3_URI="${DATA_S3_URI:-}" \
   --build-arg COGNITO_USER_POOL_ID="${COGNITO_USER_POOL_ID:-}" \
   --build-arg COGNITO_APP_CLIENT_ID="${COGNITO_APP_CLIENT_ID:-}" \
   --build-arg COGNITO_REGION="${COGNITO_REGION:-}" \
   --build-arg COGNITO_DOMAIN_PREFIX="${COGNITO_DOMAIN_PREFIX:-}" \
+  --build-arg COGNITO_OAUTH_BASE_URL="${COGNITO_OAUTH_BASE_URL:-}" \
   --build-arg DYNAMODB_USER_ITEMS_TABLE="${DYNAMODB_USER_ITEMS_TABLE:-}" \
   .
 
