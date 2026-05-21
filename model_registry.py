@@ -100,7 +100,9 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         downloader_class_path="downloaders.aifs_downloader.AIFSDownloaderParallel",
         downloader_defaults={
             "output_dir": "model_data/aifs",
-            "max_workers": 16,
+            # ECMWF's public S3 bucket throttles aggressively (503 "Slow Down");
+            # keep concurrency modest. Base downloader handles 429/5xx backoff.
+            "max_workers": 8,
             "max_retries": 3,
             "timeout_seconds": 120,
         },

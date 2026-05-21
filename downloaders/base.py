@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +16,9 @@ from rasterio.enums import Resampling
 from rasterio.warp import reproject
 import requests
 from requests.adapters import HTTPAdapter
+
+# HTTP statuses worth retrying with backoff (rate limit + transient 5xx).
+_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
 if TYPE_CHECKING:
     from model_registry import ModelConfig
@@ -137,20 +141,22 @@ class BaseDownloader:
         model_config: "ModelConfig",
         *,
         init_date: datetime | None = None,
+        cycle: int | None = None,
         output_root: Path | None = None,
     ) -> None:
         """Extract per-lead forecast .npy files into stats_output/forecast/ format.
 
-        Discovers the latest init dir for ``model_config.cycle_hour``, loads
-        each daily-lead .npy, applies the CONUS land mask, writes per-lead
-        ``lead_{N}.npz`` files, and writes per-window averages for
-        ``model_config.lead_windows``.
+        Discovers the latest init dir for ``cycle`` (defaulting to
+        ``model_config.cycle_hour``), loads each daily-lead .npy, applies the
+        CONUS land mask, writes per-lead ``lead_{N}.npz`` files, and writes
+        per-window averages for ``model_config.lead_windows``.
         """
         import rasterio.transform
         from model_registry import window_to_key
         from stats_io import write_lead_windows
 
-        cycle = model_config.cycle_hour
+        if cycle is None:
+            cycle = model_config.cycle_hour
         forecast_hours = model_config.forecast_hours
         lead_windows = list(model_config.lead_windows)
 
@@ -233,6 +239,30 @@ class BaseDownloader:
         print(f"\nWrote {len(lead_data)} lead files + windows to {forecast_dir}")
         print(f"Init date: {init_date.date()} {cycle:02d}z")
 
+    @staticmethod
+    def _backoff_sleep(attempt: int, response: requests.Response | None = None) -> None:
+        """Sleep with exponential backoff + jitter, honoring Retry-After if present.
+
+        Workers retrying in lockstep is the actual failure mode behind S3 503
+        "Slow Down" bursts — jitter spreads the next-attempt wave so the bucket
+        gets a chance to recover.
+        """
+        retry_after_s: float | None = None
+        if response is not None:
+            ra = response.headers.get("Retry-After")
+            if ra:
+                try:
+                    retry_after_s = float(ra)
+                except ValueError:
+                    retry_after_s = None
+        if retry_after_s is not None:
+            delay = min(retry_after_s, 30.0) + random.uniform(0.0, 1.5)
+        else:
+            # 2, 4, 8, 16, 32 ... capped at 30s, scaled by 0.5–1.5x for jitter.
+            base = min(2.0 ** attempt, 30.0)
+            delay = base * (0.5 + random.random())
+        time.sleep(delay)
+
     def _byte_range_fetch(
         self,
         *,
@@ -244,7 +274,8 @@ class BaseDownloader:
         """Fetch one GRIB2 record via HTTP byte-range using a sidecar idx file.
 
         Sequence per attempt: GET .idx → parse → Range-restricted GET .grib2 →
-        validate GRIB magic. Retries up to ``self.max_retries`` with linear backoff.
+        validate GRIB magic. Retries with exponential backoff + jitter; rate-limit
+        responses (429/503/etc.) get extra attempts since they're transient.
 
         ``idx_parser(idx_text)`` returns ``(start_byte, end_byte_inclusive_or_None)``
         — return ``(None, None)`` if the record is not present in the idx.
@@ -257,15 +288,33 @@ class BaseDownloader:
             return "exists"
 
         last_err = None
+        # Polite delay + small startup jitter so 16 workers don't all GET in the same ms.
         if self.polite_delay_seconds:
             time.sleep(self.polite_delay_seconds)
+        time.sleep(random.uniform(0.0, 0.5))
 
-        for attempt in range(1, self.max_retries + 1):
+        attempt = 0
+        rate_limit_extra = 0
+        max_rate_limit_extra = 4  # up to 4 extra retries dedicated to 429/503 bursts
+        while True:
+            attempt += 1
+            if attempt > self.max_retries + rate_limit_extra:
+                break
             part = out_path.with_suffix(out_path.suffix + ".part")
+            retry_response: requests.Response | None = None
             try:
                 idx_resp = self.session.get(idx_url, timeout=self.timeout_seconds)
                 if idx_resp.status_code == 404:
                     return "not_found_idx"
+                if idx_resp.status_code in _RETRYABLE_STATUS:
+                    retry_response = idx_resp
+                    last_err = requests.HTTPError(
+                        f"{idx_resp.status_code} {idx_resp.reason} for url: {idx_url}"
+                    )
+                    if rate_limit_extra < max_rate_limit_extra:
+                        rate_limit_extra += 1
+                    self._backoff_sleep(attempt, retry_response)
+                    continue
                 idx_resp.raise_for_status()
                 start_byte, end_byte = idx_parser(idx_resp.text)
                 if start_byte is None:
@@ -278,6 +327,15 @@ class BaseDownloader:
                 resp = self.session.get(
                     grib_url, headers=headers, stream=True, timeout=self.timeout_seconds,
                 )
+                if resp.status_code in _RETRYABLE_STATUS:
+                    retry_response = resp
+                    last_err = requests.HTTPError(
+                        f"{resp.status_code} {resp.reason} for url: {grib_url}"
+                    )
+                    if rate_limit_extra < max_rate_limit_extra:
+                        rate_limit_extra += 1
+                    self._backoff_sleep(attempt, retry_response)
+                    continue
                 resp.raise_for_status()
                 with open(part, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=1024 * 256):
@@ -288,7 +346,7 @@ class BaseDownloader:
                 if magic != b"GRIB":
                     part.unlink(missing_ok=True)
                     last_err = ValueError(f"Invalid GRIB2 (magic={magic!r})")
-                    time.sleep(1.25 * attempt)
+                    self._backoff_sleep(attempt)
                     continue
                 part.replace(out_path)
                 size_kb = out_path.stat().st_size / 1024
@@ -299,7 +357,13 @@ class BaseDownloader:
                     part.unlink(missing_ok=True)
                 if out_path.exists():
                     out_path.unlink(missing_ok=True)
-                time.sleep(1.25 * attempt)
+                # If exception carried an HTTP response, use its Retry-After.
+                resp_attr = getattr(e, "response", None)
+                if isinstance(resp_attr, requests.Response):
+                    retry_response = resp_attr
+                    if resp_attr.status_code in _RETRYABLE_STATUS and rate_limit_extra < max_rate_limit_extra:
+                        rate_limit_extra += 1
+                self._backoff_sleep(attempt, retry_response)
         return f"failed: {last_err}"
 
     def _run_parallel(
