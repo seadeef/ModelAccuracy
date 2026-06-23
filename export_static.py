@@ -130,16 +130,18 @@ def _get_forecast_init_date(model_key: str) -> str | None:
 # ── config.json ─────────────────────────────────────────────────────
 
 def export_config(export_dir: Path, maptiler_key: str) -> None:
-    models = [
-        {
+    models = []
+    for _, config in sorted(MODEL_REGISTRY.items()):
+        entry = {
             "key": config.key,
             "label": config.label,
             "lead_days_min": config.lead_days_min,
             "lead_days_max": config.lead_days_max,
             "lead_windows": [list(w) for w in config.lead_windows],
         }
-        for _, config in sorted(MODEL_REGISTRY.items())
-    ]
+        if config.ident:
+            entry["ident"] = config.ident
+        models.append(entry)
 
     statistics = [
         {"key": p.spec.name, "label": p.spec.label, "units": p.spec.units}

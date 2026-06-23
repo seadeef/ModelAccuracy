@@ -19,10 +19,14 @@ class ModelConfig:
     key: str
     label: str
     downloader_class_path: str  # e.g. "downloaders.gfs_downloader.GFSFilteredDownloaderParallel"
+    ident: str = ""  # optional 4-char UI identifier; empty → derived from label in frontend
     downloader_defaults: dict = field(default_factory=dict)
     lead_days_min: int = 1
     lead_days_max: int = 14
     lead_windows: tuple[tuple[int, int], ...] = ((1, 7), (7, 14), (1, 10))
+    # Forecast variables this model exposes (keys into FORECAST_VARIABLES).
+    # The base resolves these in extract_forecast to emit forecast/{key}/ folders.
+    variables: tuple[str, ...] = ("precip",)
     cycle_hour: int = 12
     data_dir: str = "model_data/gfs"
     # Hours after the cycle hour at which the full forecast is available to
@@ -55,6 +59,7 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         lead_days_min=1,
         lead_days_max=14,
         lead_windows=((1, 7), (7, 14), (1, 10)),
+        variables=("precip", "temp", "wind", "humidity"),
         cycle_hour=12,
         data_dir="model_data/gfs",
         publish_delay_hours=14,
@@ -73,16 +78,18 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         lead_days_min=1,
         lead_days_max=11,
         lead_windows=((1, 7), (7, 11), (1, 10)),
+        variables=("precip", "temp", "wind", "humidity"),
         cycle_hour=12,
         data_dir="model_data/nbm",
         publish_delay_hours=5,
     ),
-    "graphcast": ModelConfig(
-        key="graphcast",
-        label="GraphCast",
-        downloader_class_path="downloaders.graphcast_downloader.GraphCastDownloaderParallel",
+    "weathernext2": ModelConfig(
+        key="weathernext2",
+        label="WeatherNext 2",
+        ident="WNXT",
+        downloader_class_path="downloaders.weathernext2_downloader.WeatherNext2DownloaderParallel",
         downloader_defaults={
-            "output_dir": "model_data/graphcast",
+            "output_dir": "model_data/weathernext2",
             "max_workers": 8,
             "max_retries": 3,
             "timeout_seconds": 300,
@@ -90,8 +97,9 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         lead_days_min=1,
         lead_days_max=10,
         lead_windows=((1, 7), (7, 10), (1, 10)),
+        variables=("precip", "temp", "wind", "humidity"),
         cycle_hour=12,
-        data_dir="model_data/graphcast",
+        data_dir="model_data/weathernext2",
         publish_delay_hours=16,
     ),
     "aifs": ModelConfig(
@@ -109,6 +117,7 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         lead_days_min=1,
         lead_days_max=14,
         lead_windows=((1, 7), (7, 14), (1, 10)),
+        variables=("precip", "temp", "wind", "humidity"),
         cycle_hour=12,
         data_dir="model_data/aifs",
         publish_delay_hours=6,

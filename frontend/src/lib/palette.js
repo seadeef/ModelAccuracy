@@ -32,7 +32,7 @@ const MODEL_HUES = [210, 275, 185, 315, 240, 170, 295, 225];
 /**
  * Short uppercase identifier derived from a model's label — full label
  * if it's already an acronym of ≤4 chars (e.g. "GFS", "AIFS"); otherwise
- * the first 3 alphanumeric chars (e.g. "GraphCast" → "GRA").
+ * the first 3 alphanumeric chars (e.g. "WeatherNext 2" → "WEA").
  */
 export function modelIdent(label) {
   const cleaned = String(label || '').replace(/[^A-Za-z0-9]/g, '');
@@ -55,7 +55,7 @@ export function modelPalette(models) {
       bg:     `hsl(${hue} 52% 32%)`,
       fg:     `hsl(${hue} 30% 96%)`,
       border: `hsl(${hue} 45% 48%)`,
-      ident:  modelIdent(m.label || m.key),
+      ident:  m.ident || modelIdent(m.label || m.key),
     };
   }
   return out;

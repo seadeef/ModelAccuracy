@@ -149,9 +149,9 @@ def _forecast_dir_has_data(config: ModelConfig, date: datetime, cycle: int | Non
     return any(init_dir.glob("f*_*.npy"))
 
 
-def _run_graphcast_forecast(config: ModelConfig) -> None:
-    """Forecast download for GraphCast. NOAA AIWP publishes 00z and/or 12z inits
-    on different days, so probe S3 for whatever is available and pick the freshest
+def _run_weathernext2_forecast(config: ModelConfig) -> None:
+    """Forecast download for WeatherNext 2. Google publishes 00/06/12/18z inits
+    on GCS; probe for whatever is available and pick the freshest complete cycle
     instead of hardcoding 12z.
     """
     cls = config.get_downloader_class()
@@ -165,19 +165,19 @@ def _run_graphcast_forecast(config: ModelConfig) -> None:
     target = downloader.find_latest_forecast_init(candidates)
     if target is None:
         print(
-            f"\nERROR: no GraphCast init published in {candidates[-1].date()}..{candidates[0].date()}. "
+            f"\nERROR: no WeatherNext 2 init published in {candidates[-1].date()}..{candidates[0].date()}. "
             f"Skipping extraction so a stale forecast is not republished."
         )
         return
     init_date, cycle = target
-    print(f"\n--- GraphCast latest available init: {init_date.date()} {cycle:02d}z ---")
+    print(f"\n--- WeatherNext 2 latest available init: {init_date.date()} {cycle:02d}z ---")
 
     if _forecast_dir_has_data(config, init_date, cycle):
         print(f"Already downloaded ({init_date.date()} {cycle:02d}z).")
     else:
         if not downloader.download_forecast_init(init_date, cycle):
             print(
-                f"\nERROR: GraphCast forecast download failed for {init_date.date()} {cycle:02d}z. "
+                f"\nERROR: WeatherNext 2 forecast download failed for {init_date.date()} {cycle:02d}z. "
                 f"Skipping extraction so a stale forecast is not republished."
             )
             return
@@ -193,8 +193,8 @@ def _run_graphcast_forecast(config: ModelConfig) -> None:
 
 
 def _run_forecast(config: ModelConfig) -> None:
-    if config.key == "graphcast":
-        _run_graphcast_forecast(config)
+    if config.key == "weathernext2":
+        _run_weathernext2_forecast(config)
         return
 
     forecast_hours = config.forecast_hours

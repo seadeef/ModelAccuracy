@@ -6,7 +6,7 @@ Source: s3://ecmwf-forecasts/{YYYYMMDD}/{HH}z/aifs-single/0p25/oper/
 
 `tp` is total precipitation accumulated *from forecast start*. The GRIB attr
 `GRIB_units` reports `kg m**-2` (≡ mm of water), so no scaling is applied —
-unlike the GraphCast pipeline whose source delivers meters.
+unlike the WeatherNext 2 pipeline whose source delivers meters.
 To get a daily total ending at lead day D we subtract:
     daily_total = tp(D*24) - tp((D-1)*24)
 
@@ -14,9 +14,18 @@ We download tp at f0, f24, f48, ..., f336 per init via byte-range using the
 sidecar .index (JSONL with _offset/_length), then assemble per-day .npy files
 on a regular 0.25° lat/lon CONUS grid.
 
+Besides precip, AIFS exposes instantaneous 2 m / 10 m fields as snapshots at
+each daily fhour (single record, no diff):
+    2t        -> temp     (K -> degC)
+    10u/10v   -> wind     (hypot, m/s)
+    2t + 2d   -> humidity (RH derived from dewpoint via Magnus)
+(AIFS has no surface RH field; humidity is derived from 2 m temp + dewpoint.)
+
 Output (matches gfs_downloader layout):
-    model_data/aifs/{year}/{YYYYMMDD}_{HH}z/f024_surface.npy ... f336_surface.npy
-    model_data/aifs/{year}/{YYYYMMDD}_{HH}z/_tp/f000.grib2 ...   (raw cumulative tp)
+    model_data/aifs/{year}/{YYYYMMDD}_{HH}z/f024_surface.npy ...   (precip mm)
+    model_data/aifs/{year}/{YYYYMMDD}_{HH}z/f024_temp.npy / _wind.npy / _humidity.npy
+    model_data/aifs/{year}/{YYYYMMDD}_{HH}z/_tp/f000.grib2 ...     (raw cumulative tp)
+    model_data/aifs/{year}/{YYYYMMDD}_{HH}z/_inst/f024_2t.grib2 ... (raw instant records)
     model_data/aifs/grid_lats.npy
     model_data/aifs/grid_lons.npy
 """
@@ -33,13 +42,92 @@ _this_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_this_dir.parent))
 sys.path.insert(0, str(_this_dir))
 
-from base import BaseDownloader
-from model_registry import US_CROP_BOUNDS
+from base import BaseDownloader, grib_first_field, normalize_and_crop
+from forecast_variables import kelvin_to_celsius, rh_from_dewpoint, wind_speed
 
 AIFS_CYCLE = 12
 AIFS_VARIABLE = "tp"
 AIFS_MAX_LEAD_H = 336  # 14 days, clipped from native 360h
 AIFS_FIRST_DATE = datetime(2025, 3, 1)  # earliest archived AIFS-single
+
+# Instantaneous records (ECMWF .index ``param`` names) snapshotted at each daily
+# fhour. humidity is derived from 2t + 2d, so both must be fetched.
+AIFS_INSTANT_PARAMS: tuple[str, ...] = ("2t", "2d", "10u", "10v")
+
+
+def _save_grid(output_dir: Path, kept_lats, kept_lons) -> None:
+    """Write grid_lats.npy/grid_lons.npy once. All variables share one grid."""
+    import numpy as np
+
+    glat = output_dir / "grid_lats.npy"
+    glon = output_dir / "grid_lons.npy"
+    if not glat.exists():
+        np.save(glat, kept_lats)
+        np.save(glon, kept_lons)
+
+
+def _convert_grib_to_npy(grib_path: Path, prev_grib_path: Path | None, npy_path: Path, output_dir: Path) -> None:
+    """Compute tp(fh) - tp(fh-24), crop to CONUS, save as .npy. cfgrib is not thread-safe."""
+    import numpy as np
+
+    if npy_path.exists():
+        return
+
+    cur, lats, lons = grib_first_field(grib_path)
+    if prev_grib_path is not None and prev_grib_path.exists():
+        prev, _, _ = grib_first_field(prev_grib_path)
+        diff = cur - prev
+    else:
+        # No predecessor (e.g. f24 with no f0) — treat tp as a 24h delta from 0.
+        diff = cur
+
+    cropped, kept_lats, kept_lons = normalize_and_crop(diff, lats, lons)
+    # AIFS tp units are kg m^-2 == mm; just clip tiny negative noise.
+    np.clip(cropped, 0.0, None, out=cropped)
+
+    npy_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(npy_path, cropped)
+    _save_grid(output_dir, kept_lats, kept_lons)
+
+
+def _convert_temp_to_npy(t_grib: Path, npy_path: Path, output_dir: Path) -> None:
+    """2 m temperature snapshot: K -> degC, crop to CONUS, save as .npy."""
+    import numpy as np
+
+    if npy_path.exists():
+        return
+    vals, lats, lons = grib_first_field(t_grib)
+    cropped, kept_lats, kept_lons = normalize_and_crop(vals, lats, lons)
+    np.save(npy_path, kelvin_to_celsius(cropped))
+    _save_grid(output_dir, kept_lats, kept_lons)
+
+
+def _convert_wind_to_npy(u_grib: Path, v_grib: Path, npy_path: Path, output_dir: Path) -> None:
+    """10 m wind speed from u/v snapshots (hypot), crop to CONUS, save as .npy."""
+    import numpy as np
+
+    if npy_path.exists():
+        return
+    u, ulats, ulons = grib_first_field(u_grib)
+    v, _, _ = grib_first_field(v_grib)
+    uc, kept_lats, kept_lons = normalize_and_crop(u, ulats, ulons)
+    vc, _, _ = normalize_and_crop(v, ulats, ulons)
+    np.save(npy_path, wind_speed(uc, vc))
+    _save_grid(output_dir, kept_lats, kept_lons)
+
+
+def _convert_humidity_to_npy(t_grib: Path, td_grib: Path, npy_path: Path, output_dir: Path) -> None:
+    """RH (%) from 2 m temp + dewpoint (Magnus), crop to CONUS, save as .npy."""
+    import numpy as np
+
+    if npy_path.exists():
+        return
+    t, tlats, tlons = grib_first_field(t_grib)
+    td, _, _ = grib_first_field(td_grib)
+    tc, kept_lats, kept_lons = normalize_and_crop(t, tlats, tlons)
+    tdc, _, _ = normalize_and_crop(td, tlats, tlons)
+    np.save(npy_path, rh_from_dewpoint(tc, tdc))
+    _save_grid(output_dir, kept_lats, kept_lons)
 
 
 @dataclass(frozen=True)
@@ -47,66 +135,7 @@ class DownloadTask:
     init_date: datetime
     cycle: int
     fhour: int  # raw lead hour in source (0, 24, 48, ..., 336)
-
-
-def _convert_grib_to_npy(grib_path: Path, prev_grib_path: Path | None, npy_path: Path, output_dir: Path) -> None:
-    """Compute tp(fh) - tp(fh-24), crop to CONUS, save as .npy. cfgrib is not thread-safe."""
-    import numpy as np
-    import xarray as xr
-
-    if npy_path.exists():
-        return
-
-    ds = xr.open_dataset(grib_path, engine="cfgrib")
-    if not ds.data_vars:
-        ds.close()
-        return
-    var = list(ds.data_vars)[0]
-    cur = ds[var].values.astype(np.float32)
-    lats = ds["latitude"].values
-    lons = ds["longitude"].values
-    ds.close()
-
-    if prev_grib_path is not None and prev_grib_path.exists():
-        ds_prev = xr.open_dataset(prev_grib_path, engine="cfgrib")
-        var_p = list(ds_prev.data_vars)[0]
-        prev = ds_prev[var_p].values.astype(np.float32)
-        ds_prev.close()
-        diff = cur - prev
-    else:
-        # No predecessor (e.g. f24 with no f0) — treat tp as already a 24h delta starting from 0.
-        diff = cur
-
-    # Normalize grid: -180..180 longitude, south-to-north latitude.
-    if lons.max() > 180:
-        lons = ((lons + 180) % 360) - 180
-        sort_idx = np.argsort(lons)
-        lons = lons[sort_idx]
-        diff = diff[:, sort_idx]
-    if lats[0] > lats[-1]:
-        lats = lats[::-1]
-        diff = diff[::-1, :]
-
-    west, south, east, north = US_CROP_BOUNDS
-    lat_mask = (lats >= south) & (lats <= north)
-    lon_mask = (lons >= west) & (lons <= east)
-    lat_idx = np.where(lat_mask)[0]
-    lon_idx = np.where(lon_mask)[0]
-    cropped = diff[np.ix_(lat_idx, lon_idx)]
-    kept_lats = lats[lat_idx]
-    kept_lons = lons[lon_idx]
-
-    # AIFS tp units are kg m^-2 == mm; just clip tiny negative noise.
-    np.clip(cropped, 0.0, None, out=cropped)
-
-    npy_path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(npy_path, cropped)
-
-    grid_lats_p = output_dir / "grid_lats.npy"
-    grid_lons_p = output_dir / "grid_lons.npy"
-    if not grid_lats_p.exists():
-        np.save(grid_lats_p, kept_lats)
-        np.save(grid_lons_p, kept_lons)
+    param: str = "tp"  # "tp" | "2t" | "2d" | "10u" | "10v"
 
 
 class AIFSDownloaderParallel(BaseDownloader):
@@ -149,11 +178,32 @@ class AIFSDownloaderParallel(BaseDownloader):
         d.mkdir(parents=True, exist_ok=True)
         return d / f"f{fhour:03d}.grib2"
 
+    def _record_grib(self, init_date: datetime, cycle: int, fhour: int, param: str) -> Path:
+        """Raw GRIB2 path for a record: tp in _tp/, instant params in _inst/."""
+        if param == "tp":
+            return self._tp_grib(init_date, cycle, fhour)
+        d = self._init_dir(init_date, cycle) / "_inst"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"f{fhour:03d}_{param}.grib2"
+
     def _daily_npy(self, init_date: datetime, cycle: int, daily_fhour: int, level: str) -> Path:
         return self._init_dir(init_date, cycle) / f"f{daily_fhour:03d}_{level}.npy"
 
-    def _find_byte_range(self, idx_text: str) -> tuple[int | None, int | None]:
-        """Parse JSONL .index file; return (offset, end_byte_inclusive) for tp."""
+    def _var_npy(self, init_date: datetime, cycle: int, daily_fhour: int, var_suffix: str) -> Path:
+        """Assembled per-variable daily .npy path (suffix: surface/temp/wind/humidity)."""
+        return self._init_dir(init_date, cycle) / f"f{daily_fhour:03d}_{var_suffix}.npy"
+
+    def _init_complete(self, init_date: datetime, cycle: int, daily_fhours: list[int], level: str) -> bool:
+        """True iff precip + temp + wind + humidity .npy exist for every daily fhour."""
+        suffixes = (level, "temp", "wind", "humidity")
+        return all(
+            self._var_npy(init_date, cycle, fh, sfx).exists()
+            for fh in daily_fhours
+            for sfx in suffixes
+        )
+
+    def _find_byte_range(self, idx_text: str, param: str = AIFS_VARIABLE) -> tuple[int | None, int | None]:
+        """Parse JSONL .index file; return (offset, end_byte_inclusive) for ``param``."""
         for line in idx_text.splitlines():
             line = line.strip()
             if not line:
@@ -162,7 +212,7 @@ class AIFSDownloaderParallel(BaseDownloader):
                 d = json.loads(line)
             except Exception:
                 continue
-            if d.get("param") == AIFS_VARIABLE:
+            if d.get("param") == param:
                 off = d.get("_offset")
                 ln = d.get("_length")
                 if off is None or ln is None:
@@ -171,13 +221,13 @@ class AIFSDownloaderParallel(BaseDownloader):
         return None, None
 
     def _download_task(self, task: DownloadTask) -> tuple[DownloadTask, str]:
-        init_date, cycle, fhour = task.init_date, task.cycle, task.fhour
-        out_file = self._tp_grib(init_date, cycle, fhour)
+        init_date, cycle, fhour, param = task.init_date, task.cycle, task.fhour, task.param
+        out_file = self._record_grib(init_date, cycle, fhour, param)
         grib_url, idx_url = self._remote_paths(init_date, cycle, fhour)
         status = self._byte_range_fetch(
             grib_url=grib_url,
             idx_url=idx_url,
-            idx_parser=self._find_byte_range,
+            idx_parser=lambda txt: self._find_byte_range(txt, param),
             out_path=out_file,
         )
         return task, status
@@ -189,38 +239,85 @@ class AIFSDownloaderParallel(BaseDownloader):
         daily_fhours: list[int],
         level: str,
     ) -> None:
-        """Compute tp(fh) - tp(fh-24) per daily fhour, write .npy. cfgrib is not thread-safe."""
-        work: list[tuple[Path, Path | None, Path]] = []
+        """Assemble all four variables per daily fhour. cfgrib is not thread-safe.
+
+        precip = tp(fh) - tp(fh-24); temp/wind/humidity are instantaneous
+        snapshots at fh (no diff). Humidity is derived from 2t + 2d (Magnus).
+        Each assembled .npy uses the variable suffix expected by extract_forecast.
+        """
+        # Each work item: (kind, npy_out, *grib_inputs).
+        work: list[tuple] = []
         skipped_existing = 0
         skipped_missing = 0
 
         for init_date in init_dates:
             for daily_fh in daily_fhours:
-                npy_out = self._daily_npy(init_date, cycle, daily_fh, level)
+                # ── precip (cumulative tp diff) ──
+                npy_out = self._var_npy(init_date, cycle, daily_fh, level)
                 if npy_out.exists():
                     skipped_existing += 1
-                    continue
-                cur_grib = self._tp_grib(init_date, cycle, daily_fh)
-                prev_fh = daily_fh - 24
-                prev_grib = self._tp_grib(init_date, cycle, prev_fh) if prev_fh >= 0 else None
-                if not cur_grib.exists():
-                    skipped_missing += 1
-                    continue
-                if prev_grib is not None and not prev_grib.exists():
-                    skipped_missing += 1
-                    continue
-                work.append((cur_grib, prev_grib, npy_out))
+                else:
+                    cur_grib = self._tp_grib(init_date, cycle, daily_fh)
+                    prev_fh = daily_fh - 24
+                    prev_grib = self._tp_grib(init_date, cycle, prev_fh) if prev_fh >= 0 else None
+                    if not cur_grib.exists() or (prev_grib is not None and not prev_grib.exists()):
+                        skipped_missing += 1
+                    else:
+                        work.append(("precip", npy_out, cur_grib, prev_grib))
+
+                # ── temp (2t, K -> degC) ──
+                temp_out = self._var_npy(init_date, cycle, daily_fh, "temp")
+                if temp_out.exists():
+                    skipped_existing += 1
+                else:
+                    t = self._record_grib(init_date, cycle, daily_fh, "2t")
+                    if t.exists():
+                        work.append(("temp", temp_out, t))
+                    else:
+                        skipped_missing += 1
+
+                # ── wind (10u/10v -> hypot) ──
+                wind_out = self._var_npy(init_date, cycle, daily_fh, "wind")
+                if wind_out.exists():
+                    skipped_existing += 1
+                else:
+                    u = self._record_grib(init_date, cycle, daily_fh, "10u")
+                    v = self._record_grib(init_date, cycle, daily_fh, "10v")
+                    if u.exists() and v.exists():
+                        work.append(("wind", wind_out, u, v))
+                    else:
+                        skipped_missing += 1
+
+                # ── humidity (2t + 2d -> RH) ──
+                hum_out = self._var_npy(init_date, cycle, daily_fh, "humidity")
+                if hum_out.exists():
+                    skipped_existing += 1
+                else:
+                    t = self._record_grib(init_date, cycle, daily_fh, "2t")
+                    td = self._record_grib(init_date, cycle, daily_fh, "2d")
+                    if t.exists() and td.exists():
+                        work.append(("humidity", hum_out, t, td))
+                    else:
+                        skipped_missing += 1
 
         if not work:
-            print(f"\nAssembly: 0 created | {skipped_existing} existed | {skipped_missing} skipped (missing tp)")
+            print(f"\nAssembly: 0 created | {skipped_existing} existed | {skipped_missing} skipped (missing grib)")
             return
 
-        print(f"  {len(work)} daily files to assemble (sequential cfgrib)...")
+        print(f"  {len(work)} variable files to assemble (sequential cfgrib)...")
         done = 0
         failed = 0
-        for cur, prev, npy_out in work:
+        for item in work:
+            kind, npy_out = item[0], item[1]
             try:
-                _convert_grib_to_npy(cur, prev, npy_out, self.output_dir)
+                if kind == "precip":
+                    _convert_grib_to_npy(item[2], item[3], npy_out, self.output_dir)
+                elif kind == "temp":
+                    _convert_temp_to_npy(item[2], npy_out, self.output_dir)
+                elif kind == "wind":
+                    _convert_wind_to_npy(item[2], item[3], npy_out, self.output_dir)
+                elif kind == "humidity":
+                    _convert_humidity_to_npy(item[2], item[3], npy_out, self.output_dir)
                 done += 1
             except Exception as e:
                 failed += 1
@@ -231,10 +328,11 @@ class AIFSDownloaderParallel(BaseDownloader):
                 print(f"  Assembly progress: {n}/{len(work)}", flush=True)
         # Clean up cfgrib sidecar idx files.
         for init_date in init_dates:
-            tp_dir = self._init_dir(init_date, cycle) / "_tp"
-            if tp_dir.exists():
-                for sidecar in tp_dir.glob("*.idx"):
-                    sidecar.unlink(missing_ok=True)
+            for sub in ("_tp", "_inst"):
+                raw_dir = self._init_dir(init_date, cycle) / sub
+                if raw_dir.exists():
+                    for sidecar in raw_dir.glob("*.idx"):
+                        sidecar.unlink(missing_ok=True)
         print(f"\nAssembly: {done} created | {skipped_existing} existed | {skipped_missing} skipped"
               + (f" | {failed} failed" if failed else ""))
 
@@ -257,28 +355,34 @@ class AIFSDownloaderParallel(BaseDownloader):
             raise ValueError("No init dates selected (post-clip).")
 
         daily_fhours = [d * 24 for d in range(1, AIFS_MAX_LEAD_H // 24 + 1)]
-        # Need tp at f0 and at every daily_fhour.
-        needed_fhours = sorted({0, *daily_fhours})
+        # tp needs f0 (for the first diff) plus every daily_fhour; instant params
+        # are snapshots only at the daily fhours.
+        tp_fhours = sorted({0, *daily_fhours})
 
         tasks: list[DownloadTask] = []
         skipped = 0
         for d in init_dates:
-            # If all dailies already exist for this init, skip the whole init.
-            if all(self._daily_npy(d, cycle, fh, level).exists() for fh in daily_fhours):
+            # If all variables already assembled for this init, skip the whole init.
+            if self._init_complete(d, cycle, daily_fhours, level):
                 skipped += 1
                 continue
-            for fh in needed_fhours:
-                if not self._tp_grib(d, cycle, fh).exists():
-                    tasks.append(DownloadTask(d, cycle, fh))
+            for fh in tp_fhours:
+                if not self._record_grib(d, cycle, fh, "tp").exists():
+                    tasks.append(DownloadTask(d, cycle, fh, "tp"))
+            for fh in daily_fhours:
+                for param in AIFS_INSTANT_PARAMS:
+                    if not self._record_grib(d, cycle, fh, param).exists():
+                        tasks.append(DownloadTask(d, cycle, fh, param))
 
         print("\n" + "=" * 70)
         print("Parallel AIFS (ECMWF) download")
         print(f"Period: {start.date()} to {end.date()} | Daily")
         print(f"Cycle: {cycle:02d}z | Lead 1-{AIFS_MAX_LEAD_H // 24} days")
-        print(f"tp fhours per init: {needed_fhours}")
+        print(f"tp fhours per init: {tp_fhours}")
+        print(f"Variables: tp (cumulative) + 2t/10u/10v/2d (instant)")
         print(f"Workers: {self.max_workers} | Retries: {self.max_retries}")
         print(f"Output: {self.output_dir.resolve()}")
-        print(f"Tasks: {len(tasks)} grib2 to download | {skipped} inits already complete")
+        print(f"Tasks: {len(tasks)} grib2 records to download | {skipped} inits already complete")
         print("=" * 70)
 
         results = self._run_parallel(
@@ -291,11 +395,11 @@ class AIFSDownloaderParallel(BaseDownloader):
         examples: list[str] = []
         for task, status in results:
             if status == "not_found_idx" and len(examples) < 5:
-                examples.append(f"Missing idx: {task.init_date:%Y-%m-%d} {task.cycle:02d}z f{task.fhour:03d}")
+                examples.append(f"Missing idx: {task.init_date:%Y-%m-%d} {task.cycle:02d}z f{task.fhour:03d} ({task.param})")
             elif status == "not_found_var" and len(examples) < 5:
-                examples.append(f"tp not found: {task.init_date:%Y-%m-%d} {task.cycle:02d}z f{task.fhour:03d}")
+                examples.append(f"{task.param} not found: {task.init_date:%Y-%m-%d} {task.cycle:02d}z f{task.fhour:03d}")
             elif status.startswith("failed") and len(examples) < 5:
-                examples.append(f"Failed: {task.init_date:%Y-%m-%d} {task.cycle:02d}z f{task.fhour:03d} -> {status}")
+                examples.append(f"Failed: {task.init_date:%Y-%m-%d} {task.cycle:02d}z f{task.fhour:03d} ({task.param}) -> {status}")
         if examples:
             print("Examples:")
             for e in examples:

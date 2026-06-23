@@ -72,6 +72,53 @@ def apply_land_mask(arr: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
     return out
 
 
+def normalize_and_crop(arr: np.ndarray, lats, lons):
+    """Normalize a (lat, lon) field to -180..180 lon, south-to-north lat, crop to CONUS.
+
+    Shared by the GRIB downloaders (GFS/AIFS) so every variable lands on the
+    exact same grid as precip — ``extract_forecast`` loads one grid + land mask
+    for all variables, so they must align. Returns ``(cropped, kept_lats, kept_lons)``.
+    """
+    from model_registry import US_CROP_BOUNDS
+
+    lats = np.asarray(lats)
+    lons = np.asarray(lons)
+    if lons.max() > 180:
+        lons = ((lons + 180) % 360) - 180
+        sort_idx = np.argsort(lons)
+        lons = lons[sort_idx]
+        arr = arr[:, sort_idx]
+    if lats[0] > lats[-1]:
+        lats = lats[::-1]
+        arr = arr[::-1, :]
+
+    west, south, east, north = US_CROP_BOUNDS
+    lat_idx = np.where((lats >= south) & (lats <= north))[0]
+    lon_idx = np.where((lons >= west) & (lons <= east))[0]
+    cropped = arr[np.ix_(lat_idx, lon_idx)].astype(np.float32)
+    return cropped, lats[lat_idx], lons[lon_idx]
+
+
+def grib_first_field(grib_path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Open a single-record GRIB2 via cfgrib; return (values float32, lats, lons).
+
+    Byte-range fetched records hold exactly one field, so the first data_var is
+    the one we asked for. cfgrib is not thread-safe — call from a single thread.
+    """
+    import xarray as xr
+
+    ds = xr.open_dataset(grib_path, engine="cfgrib")
+    if not ds.data_vars:
+        ds.close()
+        raise ValueError(f"No data variables in {grib_path}")
+    var = list(ds.data_vars)[0]
+    vals = ds[var].values.astype(np.float32)
+    lats = ds["latitude"].values
+    lons = ds["longitude"].values
+    ds.close()
+    return vals, lats, lons
+
+
 class BaseDownloader:
     """Shared init, session, and parallel run for model downloaders."""
 
@@ -136,6 +183,11 @@ class BaseDownloader:
         end = datetime(int(end_year), 12, 31)
         return self._download(start, end, **kwargs)
 
+    def forecast_variables(self, model_config: "ModelConfig") -> list:
+        """Resolve the model's declared variable keys to ForecastVariable instances."""
+        from forecast_variables import FORECAST_VARIABLES
+        return [FORECAST_VARIABLES[k] for k in model_config.variables]
+
     def extract_forecast(
         self,
         model_config: "ModelConfig",
@@ -163,8 +215,8 @@ class BaseDownloader:
         model_dir = self.output_dir
         if output_root is None:
             output_root = Path("stats_output")
-        forecast_dir = output_root / "forecast"
-        forecast_dir.mkdir(parents=True, exist_ok=True)
+        forecast_root = output_root / "forecast"
+        forecast_root.mkdir(parents=True, exist_ok=True)
 
         if init_date is None:
             all_inits = sorted(model_dir.glob(f"*/*_{cycle:02d}z"), reverse=True)
@@ -198,45 +250,57 @@ class BaseDownloader:
 
         land_mask = self._build_land_mask(lats, lons, transform)
 
-        lead_data: dict[int, np.ndarray] = {}
-        for fhour in forecast_hours:
-            lead_days = fhour // 24
-            npy_path = init_dir / f"f{fhour:03d}_surface.npy"
-            if not npy_path.exists():
-                print(f"  Skipping lead {lead_days} (missing {npy_path.name})")
+        # One folder per variable. Each daily intermediate is f{fh}_{suffix}.npy:
+        # precip keeps its historical "surface" suffix; instant vars use their key.
+        variables = self.forecast_variables(model_config)
+        vars_written = 0
+        for var in variables:
+            suffix = "surface" if var.key == "precip" else var.key
+            var_dir = forecast_root / var.key
+            var_dir.mkdir(parents=True, exist_ok=True)
+
+            lead_data: dict[int, np.ndarray] = {}
+            for fhour in forecast_hours:
+                lead_days = fhour // 24
+                npy_path = init_dir / f"f{fhour:03d}_{suffix}.npy"
+                if not npy_path.exists():
+                    print(f"  [{var.key}] Skipping lead {lead_days} (missing {npy_path.name})")
+                    continue
+                lead_data[lead_days] = self._apply_land_mask(np.load(npy_path), land_mask)
+
+            if not lead_data:
+                print(f"  [{var.key}] No data found; skipping variable.")
                 continue
-            lead_data[lead_days] = self._apply_land_mask(np.load(npy_path), land_mask)
-            print(f"  Lead {lead_days}: {npy_path.name}")
 
-        if not lead_data:
-            raise SystemExit("No forecast data found.")
+            np.savez_compressed(
+                var_dir / "metadata.npz",
+                lats=lats,
+                lons=lons,
+                transform=np.array(transform),
+                crs="EPSG:4326",
+                init_date=init_date.strftime("%Y-%m-%d"),
+            )
 
-        np.savez_compressed(
-            forecast_dir / "metadata.npz",
-            lats=lats,
-            lons=lons,
-            transform=np.array(transform),
-            crs="EPSG:4326",
-            init_date=init_date.strftime("%Y-%m-%d"),
-        )
+            for lead_days, data in sorted(lead_data.items()):
+                np.savez_compressed(var_dir / f"lead_{lead_days}.npz", value=data)
 
-        for lead_days, data in sorted(lead_data.items()):
-            np.savez_compressed(forecast_dir / f"lead_{lead_days}.npz", precip=data)
-            print(f"  Wrote lead_{lead_days}.npz")
+            def _write_window(start: int, end: int, arr: np.ndarray, _dir=var_dir) -> None:
+                wkey = window_to_key(start, end)
+                np.savez_compressed(_dir / f"lead_{wkey}.npz", value=arr)
 
-        def _write_window(start: int, end: int, arr: np.ndarray) -> None:
-            wkey = window_to_key(start, end)
-            np.savez_compressed(forecast_dir / f"lead_{wkey}.npz", precip=arr)
-            print(f"  Wrote lead_{wkey}.npz (avg of leads {start}-{end})")
+            n_windows = write_lead_windows(
+                lead_data,
+                lead_windows,
+                write_fn=_write_window,
+                combine_fn=lambda arrs: np.mean(arrs, axis=0),
+            )
+            print(f"  [{var.key}] Wrote {len(lead_data)} leads + {n_windows} windows -> {var_dir}")
+            vars_written += 1
 
-        write_lead_windows(
-            lead_data,
-            lead_windows,
-            write_fn=_write_window,
-            combine_fn=lambda arrs: np.mean(arrs, axis=0),
-        )
+        if vars_written == 0:
+            raise SystemExit("No forecast data found for any variable.")
 
-        print(f"\nWrote {len(lead_data)} lead files + windows to {forecast_dir}")
+        print(f"\nWrote {vars_written} variable folder(s) under {forecast_root}")
         print(f"Init date: {init_date.date()} {cycle:02d}z")
 
     @staticmethod

@@ -1,6 +1,6 @@
 # ModelAccuracy
 
-Precipitation forecast verification system. Downloads numerical and ML model forecasts (GFS, NBM, GraphCast, AIFS) and PRISM observations, computes verification statistics, generates map tiles, and serves an interactive viewer.
+Precipitation forecast verification system. Downloads numerical and ML model forecasts (GFS, NBM, WeatherNext 2, AIFS) and PRISM observations, computes verification statistics, generates map tiles, and serves an interactive viewer.
 
 **Current deployed version:** [https://d2375txx9cn814.cloudfront.net/](https://d2375txx9cn814.cloudfront.net/)
 
@@ -35,7 +35,7 @@ Open the URL Vite prints (default **http://localhost:5173**). Optional: set `MAP
 
 ### `download.py`
 
-Downloads model forecasts (GFS, NBM, GraphCast, AIFS) and PRISM observations.
+Downloads model forecasts (GFS, NBM, WeatherNext 2, AIFS) and PRISM observations.
 
 ```bash
 python download.py --start-date 2025-01-01 --end-date 2025-01-31   # all models + PRISM
@@ -46,7 +46,7 @@ python download.py --catchup                                         # fill gap 
 python download.py --no-prism --model nbm                            # skip PRISM
 ```
 
-- `--model {gfs,nbm,graphcast,aifs}`: download a specific model (default: all registered models)
+- `--model {gfs,nbm,weathernext2,aifs}`: download a specific model (default: all registered models)
 - `--forecast`: download today's forecast and extract into stats format (mutually exclusive with `--catchup`)
 - `--catchup`: auto-detect last downloaded date and fill through yesterday
 - `--no-prism`: skip PRISM observation download
@@ -137,7 +137,7 @@ Models are registered in `model_registry.py`:
 |-----|-------|---------------|-------|-------|
 | `gfs` | GFS | 0.25° global GRIB2 | 12z | 1–14 d |
 | `nbm` | NBM | 0.25° US grid `.npy` | 12z | 1–11 d |
-| `graphcast` | GraphCast | NOAA AIWP S3 (00z and/or 12z, probed per day) | 12z (default) | 1–10 d |
+| `weathernext2` | WeatherNext 2 (WNXT) | GCS Zarr ensemble mean | 00/06/12/18z (latest complete) | 1–10 d |
 | `aifs` | AIFS | ECMWF open data S3 | 12z | 1–14 d |
 
 ## Production deployment (AWS)
