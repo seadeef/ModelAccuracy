@@ -20,14 +20,16 @@ function geometryParts(geometry) {
   return [];
 }
 
-function buildAdminTitleSuffix(region) {
-  if (!region || region.type !== 'admin' || !region.name) return '';
-  return `  —  ${region.name}`;
+function buildBoundaryTitleSuffix(region) {
+  if (!region?.name) return '';
+  if (region.type === 'admin' || region.type === 'huc') return `  —  ${region.name}`;
+  return '';
 }
 
-function adminFilenameTag(region) {
-  if (!region || region.type !== 'admin' || !region.fips) return '';
-  return `_${region.level}${region.fips}`;
+function boundaryFilenameTag(region) {
+  if (region?.type === 'admin' && region.fips) return `_${region.level}${region.fips}`;
+  if (region?.type === 'huc' && region.huc) return `_huc${region.huc}`;
+  return '';
 }
 
 function loadImage(src) {
@@ -124,7 +126,7 @@ export async function exportMapImage({
     periodLabel = SEASON_NAMES[season] ? `${SEASON_NAMES[season]} (${season.toUpperCase()})` : season.toUpperCase();
   }
 
-  const title = `${modelLabel} ${statLabel} (${units})  \u2014  ${leadLabel}  \u2014  ${periodLabel}${buildAdminTitleSuffix(region)}`;
+  const title = `${modelLabel} ${statLabel} (${units})  \u2014  ${leadLabel}  \u2014  ${periodLabel}${buildBoundaryTitleSuffix(region)}`;
 
   const MIN_IMG_WIDTH = 800;
   const TITLE_H = 48;
@@ -144,13 +146,15 @@ export async function exportMapImage({
   const lngToSrcX = (lng) => ((lng - oW) / (oE - oW)) * tileW;
   const latToSrcY = (lat) => ((oMercN - mercY(lat)) / (oMercN - oMercS)) * tileH;
 
-  // Crop the source tile to an admin region's bbox when one is selected.
-  const adminGeometry = region?.type === 'admin' ? region.geometry : null;
-  const adminBounds = region?.type === 'admin' && Array.isArray(region.bounds) ? region.bounds : null;
+  // Crop the source tile to a boundary region's bbox when one is selected.
+  const clipGeometry = (region?.type === 'admin' || region?.type === 'huc') ? region.geometry : null;
+  const clipBounds = (region?.type === 'admin' || region?.type === 'huc') && Array.isArray(region.bounds)
+    ? region.bounds
+    : null;
 
   let srcX = 0, srcY = 0, srcW = tileW, srcH = tileH;
-  if (adminGeometry && adminBounds && adminBounds.length === 4) {
-    const [bw, bs, be, bn] = adminBounds;
+  if (clipGeometry && clipBounds && clipBounds.length === 4) {
+    const [bw, bs, be, bn] = clipBounds;
     const xL = lngToSrcX(bw);
     const xR = lngToSrcX(be);
     const yT = latToSrcY(bn);
@@ -210,11 +214,11 @@ export async function exportMapImage({
   ctx.imageSmoothingEnabled = scale > 1;
   ctx.imageSmoothingQuality = 'high';
 
-  if (adminGeometry) {
+  if (clipGeometry) {
     ctx.save();
-    // Build a clip path from the admin polygon(s); even-odd handles holes.
+    // Build a clip path from the boundary polygon(s); even-odd handles holes.
     ctx.beginPath();
-    for (const poly of geometryParts(adminGeometry)) {
+    for (const poly of geometryParts(clipGeometry)) {
       for (const ring of poly) {
         if (!Array.isArray(ring) || ring.length < 3) continue;
         for (let i = 0; i < ring.length; i++) {
@@ -236,7 +240,7 @@ export async function exportMapImage({
     ctx.lineCap = 'round';
     ctx.strokeStyle = 'rgba(40,40,40,0.85)';
     ctx.lineWidth = 1.4;
-    for (const poly of geometryParts(adminGeometry)) {
+    for (const poly of geometryParts(clipGeometry)) {
       for (const ring of poly) {
         if (!Array.isArray(ring) || ring.length < 3) continue;
         ctx.beginPath();
@@ -307,7 +311,7 @@ export async function exportMapImage({
       : period === 'seasonal' && season
         ? season
         : 'yearly';
-  const filename = `${model}_${statistic}_lead${leadTag}_${periodTag}${adminFilenameTag(region)}.png`;
+  const filename = `${model}_${statistic}_lead${leadTag}_${periodTag}${boundaryFilenameTag(region)}.png`;
 
   await new Promise((resolve, reject) => {
     canvas.toBlob(

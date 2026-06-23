@@ -80,12 +80,16 @@
   const showPointGuide = $derived(
     ui.activeTool === 'point' && !ui.hasUsedPinTool,
   );
-  const showAdminGuide = $derived(
-    (ui.activeTool === 'state' || ui.activeTool === 'county') && !ui.hasUsedAreaDrawTool,
+  const showBoundaryGuide = $derived(
+    (ui.activeTool === 'state' || ui.activeTool === 'county' || ui.activeTool === 'watershed')
+    && !ui.hasUsedAreaDrawTool,
   );
-  const adminGuideText = $derived(
-    ui.activeTool === 'county' ? 'Click a county to analyze' : 'Click a state to analyze',
-  );
+  const boundaryGuideText = $derived.by(() => {
+    if (ui.activeTool === 'county') return 'Click a county to analyze';
+    if (ui.activeTool === 'state') return 'Click a state to analyze';
+    const crumb = ui.wbdDrillPath.length ? `${ui.wbdDrillPath.join(' → ')} — ` : '';
+    return `${crumb}Click a watershed to drill down. Press Enter to analyze at the current level.`;
+  });
 
   /**
    * Session-scoped latch: the point guide pulses on its very first display
@@ -128,9 +132,9 @@
       </CenterGuide>
     {/if}
 
-    {#if showAdminGuide}
+    {#if showBoundaryGuide}
       <CenterGuide>
-        {adminGuideText}
+        {boundaryGuideText}
       </CenterGuide>
     {/if}
 

@@ -205,6 +205,28 @@ def store_from_env(
     return LocalStaticStore(root)
 
 
+def static_site_store_from_env(
+    *,
+    default_local_root: Path | None = None,
+) -> StaticStore:
+    """Return a store for browser-static assets (``static/`` subtree).
+
+    Local dev reads ``static_export/static/``.  Production reads from the same
+    S3 bucket as ``DATA_S3_URI`` at the ``static/`` prefix (matches
+    ``deploy_static.sh --static``).
+    """
+    if not _force_local_static():
+        stats_loc = _stats_s3_bucket_and_prefix()
+        if stats_loc is not None:
+            bucket, stats_prefix = stats_loc
+            parent = stats_prefix.rsplit("/", 1)[0] if "/" in stats_prefix else ""
+            static_prefix = f"{parent}/static" if parent else "static"
+            return S3StaticStore(bucket=bucket, prefix=static_prefix)
+
+    root = default_local_root or default_static_site_root()
+    return LocalStaticStore(root / "static")
+
+
 def forecast_store_from_env(
     *,
     default_local_root: Path | None = None,

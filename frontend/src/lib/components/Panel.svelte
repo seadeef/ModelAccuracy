@@ -75,6 +75,10 @@
     if (r.type === 'polygon') return `Polygon centered at: ${coord}`;
     if (r.type === 'rectangle') return `Rectangle centered at: ${coord}`;
     if (r.type === 'admin') return r.name ? `${r.name} \u2014 ${coord}` : coord;
+    if (r.type === 'huc') {
+      const tag = r.huc ? `HUC-${r.level} ${r.huc}` : `HUC-${r.level}`;
+      return r.name ? `${r.name} (${tag}) \u2014 ${coord}` : `${tag} \u2014 ${coord}`;
+    }
     return coord;
   }
 
@@ -689,6 +693,9 @@
     }
     if (r.type === 'admin' && r.level && r.fips) {
       return `a:${r.level}:${r.fips}`;
+    }
+    if (r.type === 'huc' && r.huc) {
+      return `h:${r.huc}`;
     }
     return '';
   }

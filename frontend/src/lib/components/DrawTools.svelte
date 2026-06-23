@@ -21,6 +21,7 @@
   const adminTools = [
     { id: 'state', label: 'Pick a state', icon: drawToolGlyph.state },
     { id: 'county', label: 'Pick a county', icon: drawToolGlyph.county },
+    { id: 'watershed', label: 'Pick a watershed', icon: drawToolGlyph.watershed },
   ];
 
   function toolTitle(tool) {
@@ -30,6 +31,9 @@
     }
     if (tool.id === 'state' || tool.id === 'county') {
       return `${tool.label} — Click a ${tool.id} on the map to select it`;
+    }
+    if (tool.id === 'watershed') {
+      return `${tool.label} — Click to drill down; press Enter to analyze at the current level`;
     }
     return `${tool.label} — Draw to get started`;
   }
@@ -95,6 +99,8 @@
     ui.selectedRegion = shape.region;
     if (shape.region?.type === 'admin') {
       ui.activeTool = shape.region.level || 'state';
+    } else if (shape.region?.type === 'huc') {
+      ui.activeTool = 'watershed';
     } else if (shape.region?.type) {
       ui.activeTool = shape.region.type;
     }
@@ -116,6 +122,7 @@
     if (t === 'rectangle') return '▭';
     if (t === 'polygon') return '⬠';
     if (t === 'admin') return region.level === 'county' ? '▦' : '◫';
+    if (t === 'huc') return '💧';
     return '📍';
   }
 </script>

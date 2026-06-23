@@ -144,7 +144,12 @@ verify_static_export() {
     echo "ERROR: $BOUNDARIES missing — run scripts/fetch_admin_boundaries.py." >&2
     exit 1
   fi
-  echo "OK: static_export/data contains grid.json; admin/boundaries.json present"
+  local WBD_CHUNKS="$ROOT/static_export/static/wbd/chunks/2/_root.json"
+  if [[ ! -f "$WBD_CHUNKS" ]]; then
+    echo "ERROR: $WBD_CHUNKS missing — run scripts/fetch_wbd_boundaries.py." >&2
+    exit 1
+  fi
+  echo "OK: static_export/data contains grid.json; admin/boundaries.json and wbd/chunks present"
 }
 
 collect_ecs_targets_for_redeploy() {

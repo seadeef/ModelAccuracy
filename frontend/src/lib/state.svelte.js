@@ -18,18 +18,21 @@ export const ui = $state({
   leadFractional: 1.0,
   activeWindow: null,
 
-  // Draw tools: 'point' | 'rectangle' | 'polygon' | 'state' | 'county' | null
+  // Draw tools: 'point' | 'rectangle' | 'polygon' | 'state' | 'county' | 'watershed' | null
   activeTool: 'point',
 
   // Selected region: null or
   //   { type: 'point'|'rectangle'|'polygon', coordinates, bounds? }
   //   { type: 'admin', level: 'state'|'county', fips, name, bounds, geometry }
+  //   { type: 'huc', huc, level, name, bounds, geometry }
   selectedRegion: null,
 
   /** Default pin guide stays until the user places a point selection at least once. */
   hasUsedPinTool: false,
-  /** After rectangle/polygon, pin-only guide omits the “draw an area” line. */
+  /** After rectangle/polygon/watershed, pin-only guide omits the “draw an area” line. */
   hasUsedAreaDrawTool: false,
+  /** Watershed drill breadcrumb (cleared on finalize or Escape). */
+  wbdDrillPath: [],
 });
 
 /** Look up a statistic's display label from the config-provided list. */

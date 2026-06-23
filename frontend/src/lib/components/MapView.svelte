@@ -11,6 +11,21 @@
   } from '../tile.js';
   import CenterGuide from './CenterGuide.svelte';
   import { feature as topojsonFeature } from 'topojson-client';
+  import {
+    geomBbox,
+    setupBoundaryLayer,
+    teardownBoundaryLayer,
+    createBoundaryHoverHandlers,
+    regionGeometryHoles,
+  } from '../mapBoundaryLayer.js';
+  import {
+    loadWbdIndex,
+    loadHuc2Geo,
+    loadHucChildren,
+    hasChildren,
+    nextHucLevel,
+    buildPendingFromFeature,
+  } from '../hucSelection.js';
 
   const [oW, oS, oE, oN] = TILE_IMAGE_BOUNDS_WGS84;
   const overlayCoords = [[oW, oN], [oE, oN], [oE, oS], [oW, oS]];
@@ -249,15 +264,26 @@
   const dimSourceId = 'selection-dim-source';
   const dimLayerId = 'selection-dim-fill';
 
-  // ── Admin (state / county) selection layer ──────────────────────────
-  const adminSourceId = 'admin-source';
-  const adminFillLayerId = 'admin-fill';
-  const adminOutlineLayerId = 'admin-outline';
-  /** Cache GeoJSON per level so toggling tools doesn't re-fetch. */
+  // ── Admin / watershed boundary selection layer ───────────────────────
+  const boundarySourceId = 'admin-source';
+  const boundaryFillLayerId = 'admin-fill';
+  const boundaryOutlineLayerId = 'admin-outline';
+  /** Cache GeoJSON per admin level so toggling tools doesn't re-fetch. */
   const adminGeoCache = new Map(); // level → FeatureCollection
-  let adminLevelLoaded = null;     // 'state' | 'county' | null
-  let adminHoveredId = null;
+  let boundaryModeLoaded = null;   // 'state' | 'county' | 'watershed-drill' | null
+  const boundaryHoveredRef = { current: null };
   let adminLoadAbort = null;
+  let wbdLoadAbort = null;
+  /** Drill state while watershed tool is active (before finalize). */
+  let wbdPending = $state(null);
+  let wbdIndex = null;
+  let wbdGeoCache = null;
+  let wbdGeoLevel = null;
+
+  const boundaryHover = createBoundaryHoverHandlers(() => map, {
+    sourceId: boundarySourceId,
+    hoveredIdRef: boundaryHoveredRef,
+  });
 
   function adminTopoUrl(level) {
     return `/static/admin/${level === 'county' ? 'counties' : 'states'}.topojson`;
@@ -297,22 +323,8 @@
     }
   }
 
-  function geomBbox(geom) {
-    let w = Infinity, e = -Infinity, s = Infinity, n = -Infinity;
-    const visit = (ring) => {
-      for (const [x, y] of ring) {
-        if (x < w) w = x;
-        if (x > e) e = x;
-        if (y < s) s = y;
-        if (y > n) n = y;
-      }
-    };
-    if (geom?.type === 'Polygon') {
-      for (const ring of geom.coordinates) visit(ring);
-    } else if (geom?.type === 'MultiPolygon') {
-      for (const poly of geom.coordinates) for (const ring of poly) visit(ring);
-    }
-    return [w, s, e, n];
+  function geomBboxFromRegion(geom) {
+    return geomBbox(geom);
   }
 
   async function setupAdminLayer(level) {
@@ -329,86 +341,36 @@
     if (!map) return;
     if (ui.activeTool !== level) return; // tool switched while loading
 
-    if (map.getSource(adminSourceId)) {
-      map.getSource(adminSourceId).setData(fc);
-    } else {
-      // Fill goes BELOW the dim mask so its hover tint dims outside the selection.
-      // Outline goes ABOVE the dim mask so borders stay crisp everywhere — otherwise
-      // the dim overlay washes out lines outside the cutout, which makes it hard to
-      // see what's clickable when zoomed in near a selection edge.
-      const fillBefore = map.getLayer(dimLayerId) ? dimLayerId
-                       : map.getLayer(drawFillLayerId) ? drawFillLayerId
-                       : undefined;
-      const outlineBefore = map.getLayer(drawFillLayerId) ? drawFillLayerId : undefined;
-      // No promoteId: each feature's top-level `id` is set to the padded FIPS
-      // string in loadAdminGeo, which MapLibre uses as the source feature id.
-      map.addSource(adminSourceId, { type: 'geojson', data: fc });
-      map.addLayer({
-        id: adminFillLayerId, type: 'fill', source: adminSourceId,
-        paint: {
-          'fill-color': '#26d9e8',
-          'fill-opacity': [
-            'case',
-            ['boolean', ['feature-state', 'hover'], false], 0.32,
-            0.08,
-          ],
-        },
-      }, fillBefore);
-      map.addLayer({
-        id: adminOutlineLayerId, type: 'line', source: adminSourceId,
-        paint: {
-          'line-color': '#26d9e8',
-          'line-width': [
-            'case',
-            ['boolean', ['feature-state', 'hover'], false], 2.4,
-            1.2,
-          ],
-          'line-opacity': 0.9,
-        },
-      }, outlineBefore);
-      map.on('mousemove', adminFillLayerId, handleAdminMouseMove);
-      map.on('mouseleave', adminFillLayerId, handleAdminMouseLeave);
-      map.on('click', adminFillLayerId, handleAdminClick);
-    }
-    adminLevelLoaded = level;
+    setupBoundaryLayer(map, {
+      sourceId: boundarySourceId,
+      fillLayerId: boundaryFillLayerId,
+      outlineLayerId: boundaryOutlineLayerId,
+      data: fc,
+      dimLayerId,
+      drawFillLayerId,
+      onClick: handleAdminClick,
+      onHoverEnter: boundaryHover.onHoverEnter,
+      onHoverLeave: boundaryHover.onHoverLeave,
+    });
+    boundaryModeLoaded = level;
+  }
+
+  function teardownBoundarySelectionLayer() {
+    if (!map) return;
+    teardownBoundaryLayer(map, {
+      sourceId: boundarySourceId,
+      fillLayerId: boundaryFillLayerId,
+      outlineLayerId: boundaryOutlineLayerId,
+      hoveredIdRef: boundaryHoveredRef,
+      onClick: boundaryModeLoaded === 'watershed-drill' ? handleWbdClick : handleAdminClick,
+      onHoverEnter: boundaryHover.onHoverEnter,
+      onHoverLeave: boundaryHover.onHoverLeave,
+    });
+    boundaryModeLoaded = null;
   }
 
   function teardownAdminLayer() {
-    if (!map) return;
-    if (adminHoveredId != null && map.getSource(adminSourceId)) {
-      map.setFeatureState({ source: adminSourceId, id: adminHoveredId }, { hover: false });
-      adminHoveredId = null;
-    }
-    if (map.getLayer(adminFillLayerId)) {
-      map.off('mousemove', adminFillLayerId, handleAdminMouseMove);
-      map.off('mouseleave', adminFillLayerId, handleAdminMouseLeave);
-      map.off('click', adminFillLayerId, handleAdminClick);
-      map.removeLayer(adminFillLayerId);
-    }
-    if (map.getLayer(adminOutlineLayerId)) map.removeLayer(adminOutlineLayerId);
-    if (map.getSource(adminSourceId)) map.removeSource(adminSourceId);
-    adminLevelLoaded = null;
-  }
-
-  function handleAdminMouseMove(e) {
-    if (!map) return;
-    map.getCanvas().style.cursor = 'pointer';
-    const f = e.features?.[0];
-    if (!f) return;
-    if (adminHoveredId != null && adminHoveredId !== f.id) {
-      map.setFeatureState({ source: adminSourceId, id: adminHoveredId }, { hover: false });
-    }
-    adminHoveredId = f.id;
-    map.setFeatureState({ source: adminSourceId, id: adminHoveredId }, { hover: true });
-  }
-
-  function handleAdminMouseLeave() {
-    if (!map) return;
-    map.getCanvas().style.cursor = 'crosshair';
-    if (adminHoveredId != null) {
-      map.setFeatureState({ source: adminSourceId, id: adminHoveredId }, { hover: false });
-      adminHoveredId = null;
-    }
+    teardownBoundarySelectionLayer();
   }
 
   function handleAdminClick(e) {
@@ -424,7 +386,7 @@
     const fc = adminGeoCache.get(level);
     const fullFeature = fc?.features?.find((feat) => feat.id === fips);
     const geometry = fullFeature?.geometry || f.geometry;
-    const bounds = geomBbox(geometry);
+    const bounds = geomBboxFromRegion(geometry);
     ui.selectedRegion = {
       type: 'admin',
       level,
@@ -435,6 +397,116 @@
     };
     ui.activeTool = level;
     ui.hasUsedAreaDrawTool = true;
+    teardownBoundarySelectionLayer();
+  }
+
+  function resetWbdDrill() {
+    wbdPending = null;
+    ui.wbdDrillPath = [];
+    wbdGeoCache = null;
+    wbdGeoLevel = null;
+  }
+
+  function finalizeWbd(pending) {
+    if (!pending?.huc) return;
+    ui.selectedRegion = {
+      type: 'huc',
+      huc: pending.huc,
+      level: pending.level,
+      name: pending.name,
+      bounds: pending.bounds,
+      geometry: pending.geometry,
+    };
+    ui.activeTool = 'watershed';
+    ui.hasUsedAreaDrawTool = true;
+    resetWbdDrill();
+    teardownBoundarySelectionLayer();
+  }
+
+  async function ensureWbdIndex() {
+    if (wbdIndex) return wbdIndex;
+    wbdIndex = await loadWbdIndex();
+    return wbdIndex;
+  }
+
+  async function setupWbdDrillLayer(fc) {
+    if (!map) return;
+    wbdGeoCache = fc;
+    setupBoundaryLayer(map, {
+      sourceId: boundarySourceId,
+      fillLayerId: boundaryFillLayerId,
+      outlineLayerId: boundaryOutlineLayerId,
+      data: fc,
+      dimLayerId,
+      drawFillLayerId,
+      onClick: handleWbdClick,
+      onHoverEnter: boundaryHover.onHoverEnter,
+      onHoverLeave: boundaryHover.onHoverLeave,
+    });
+    boundaryModeLoaded = 'watershed-drill';
+  }
+
+  async function loadWbdLevel(huc, level, fcLoader) {
+    if (wbdLoadAbort) wbdLoadAbort.abort();
+    wbdLoadAbort = new AbortController();
+    const signal = wbdLoadAbort.signal;
+    try {
+      const fc = await fcLoader();
+      if (signal.aborted || !map || ui.activeTool !== 'watershed' || ui.selectedRegion) return;
+      wbdGeoLevel = { huc, level };
+      await setupWbdDrillLayer(fc);
+      if (Array.isArray(fc?.features?.[0]?.geometry?.coordinates)) {
+        const bounds = fc.features.reduce((acc, f) => {
+          const b = geomBboxFromRegion(f.geometry);
+          if (!acc) return b;
+          return [
+            Math.min(acc[0], b[0]),
+            Math.min(acc[1], b[1]),
+            Math.max(acc[2], b[2]),
+            Math.max(acc[3], b[3]),
+          ];
+        }, null);
+        if (bounds) {
+          map.fitBounds([[bounds[0], bounds[1]], [bounds[2], bounds[3]]], { padding: 40, maxZoom: 10 });
+        }
+      }
+    } catch (err) {
+      if (err?.name !== 'AbortError') {
+        console.warn('[status] Failed to load WBD boundaries', err);
+      }
+    } finally {
+      wbdLoadAbort = null;
+    }
+  }
+
+  async function startWbdDrill() {
+    resetWbdDrill();
+    await ensureWbdIndex();
+    await loadWbdLevel('', 2, loadHuc2Geo);
+  }
+
+  async function handleWbdClick(e) {
+    const f = e.features?.[0];
+    if (!f) return;
+    const pending = buildPendingFromFeature(f, wbdGeoCache);
+    if (!pending.huc) return;
+    wbdPending = pending;
+    ui.wbdDrillPath = [...ui.wbdDrillPath, pending.name || pending.huc];
+    const index = await ensureWbdIndex();
+    if (hasChildren(index, pending.huc)) {
+      const childLevel = nextHucLevel(pending.level);
+      await loadWbdLevel(pending.huc, childLevel, () => loadHucChildren(pending.huc, childLevel));
+    } else {
+      finalizeWbd(pending);
+    }
+  }
+
+  async function setupWatershedTool() {
+    if (ui.selectedRegion?.type === 'huc') return;
+    if (boundaryModeLoaded !== 'watershed-drill') {
+      teardownBoundarySelectionLayer();
+      await startWbdDrill();
+    }
   }
 
   let rectStart = null;       // {lng, lat} for rectangle drag start
@@ -536,7 +608,7 @@
       for (const [lng, lat] of region.coordinates) {
         growToInclude(lng, lat);
       }
-    } else if (region.type === 'admin' && Array.isArray(region.bounds)) {
+    } else if ((region.type === 'admin' || region.type === 'huc') && Array.isArray(region.bounds)) {
       const [bw, bs, be, bn] = region.bounds;
       growToInclude(bw, bs);
       growToInclude(be, bn);
@@ -581,17 +653,9 @@
       const pts = region.coordinates;
       if (pts.length < 3) return emptyFeatureCollection();
       holes = [asClockwiseHoleRing([...pts, pts[0]])];
-    } else if (region.type === 'admin') {
-      // Use the outer ring of every MultiPolygon part as a separate hole.
-      const geom = region.geometry;
-      if (!geom) return emptyFeatureCollection();
-      const parts = geom.type === 'MultiPolygon' ? geom.coordinates
-                  : geom.type === 'Polygon' ? [geom.coordinates]
-                  : [];
-      holes = parts
-        .map((part) => part?.[0])
-        .filter((ring) => Array.isArray(ring) && ring.length >= 4)
-        .map((ring) => asClockwiseHoleRing([...ring]));
+    } else if (region.type === 'admin' || region.type === 'huc') {
+      const rings = regionGeometryHoles(region.geometry);
+      holes = rings.map((ring) => asClockwiseHoleRing([...ring]));
       if (!holes.length) return emptyFeatureCollection();
     } else {
       return emptyFeatureCollection();
@@ -922,6 +986,14 @@
     if (e.key === 'Enter' && ui.activeTool === 'polygon' && polyPoints.length >= 3) {
       finishPolygon();
     }
+    if (e.key === 'Enter' && ui.activeTool === 'watershed' && wbdPending && !ui.selectedRegion) {
+      finalizeWbd(wbdPending);
+    }
+    if (e.key === 'Escape' && ui.activeTool === 'watershed' && !ui.selectedRegion) {
+      resetWbdDrill();
+      teardownBoundarySelectionLayer();
+      void startWbdDrill();
+    }
     if (e.key === 'Escape') {
       if (isDrawing || polyPoints.length > 0 || rectStart) {
         cancelInProgressDraw();
@@ -945,12 +1017,21 @@
       canvas.style.cursor = '';
     }
     if (tool === 'state' || tool === 'county') {
-      if (adminLevelLoaded !== tool) {
-        teardownAdminLayer();
+      if (boundaryModeLoaded !== tool) {
+        teardownBoundarySelectionLayer();
+        resetWbdDrill();
         setupAdminLayer(tool);
       }
-    } else if (adminLevelLoaded != null) {
-      teardownAdminLayer();
+    } else if (tool === 'watershed') {
+      if (!ui.selectedRegion || ui.selectedRegion.type !== 'huc') {
+        void setupWatershedTool();
+      } else if (boundaryModeLoaded != null) {
+        teardownBoundarySelectionLayer();
+      }
+    } else if (boundaryModeLoaded != null) {
+      teardownBoundarySelectionLayer();
+      if (wbdLoadAbort) wbdLoadAbort.abort();
+      resetWbdDrill();
     }
   });
 
@@ -958,6 +1039,9 @@
   $effect(() => {
     if (!ui.selectedRegion && map) {
       clearDrawState();
+      if (ui.activeTool === 'watershed' && boundaryModeLoaded !== 'watershed-drill') {
+        void setupWatershedTool();
+      }
     }
   });
 
@@ -1069,7 +1153,7 @@
      */
     function refreshDimOnViewChange() {
       const r = ui.selectedRegion;
-      if (r && (r.type === 'rectangle' || r.type === 'polygon' || r.type === 'admin')) {
+      if (r && (r.type === 'rectangle' || r.type === 'polygon' || r.type === 'admin' || r.type === 'huc')) {
         updateDimMask();
       }
     }

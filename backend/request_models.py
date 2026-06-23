@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, model_validator
 
-VALID_REGION_TYPES = {"point", "rectangle", "polygon", "admin"}
+VALID_REGION_TYPES = {"point", "rectangle", "polygon", "admin", "huc"}
 VALID_ADMIN_LEVELS = {"state", "county"}
+VALID_HUC_LEVELS = {2, 4, 6, 8, 10, 12, 14, 16}
 
 
 class StatsRegion(BaseModel):
@@ -11,8 +12,10 @@ class StatsRegion(BaseModel):
     coordinates: list | None = None
     bounds: list[float] | None = None
     # admin type only:
-    level: str | None = None
+    level: str | int | None = None
     fips: str | None = None
+    # huc type only:
+    huc: str | None = None
 
     @model_validator(mode="after")
     def validate_shape(self) -> "StatsRegion":
@@ -26,6 +29,16 @@ class StatsRegion(BaseModel):
             expected = 2 if self.level == "state" else 5
             if len(self.fips) != expected:
                 raise ValueError(f"region.fips for {self.level} must be {expected} digits")
+        if self.type == "huc":
+            if not self.huc or not str(self.huc).isdigit():
+                raise ValueError("region.huc must be a numeric HUC code")
+            huc_len = len(str(self.huc))
+            if huc_len not in VALID_HUC_LEVELS:
+                raise ValueError(
+                    f"region.huc length must be one of {sorted(VALID_HUC_LEVELS)}"
+                )
+            if self.level is not None and int(self.level) != huc_len:
+                raise ValueError("region.level must match the digit count of region.huc")
         return self
 
 

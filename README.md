@@ -100,6 +100,8 @@ Use `python export_static.py --help` for `--output` and `--clean` (full export o
 
 Admin polygon boundaries (`static_export/static/admin/boundaries.json`) are produced by `scripts/fetch_admin_boundaries.py` — not by `export_static.py`.
 
+Watershed (WBD) data (`static_export/static/wbd/`) is produced by `scripts/fetch_wbd_boundaries.py` — separate from `export_static.py`. **`chunks/`** (backend stats masks) is baked into the API Docker image. **`index.json`**, **`huc2.topojson`**, and **`children/`** (frontend map drill) are deployed to S3 via `deploy_static.sh`. Run without `--branch` for the full national build; use `--branch 08` for a single test branch. For local dev without the ~2.7 GB GDB download, run `python scripts/generate_wbd_sample.py`.
+
 ## Statistics
 
 Verification statistics (computed from model + PRISM pairs):
@@ -146,7 +148,7 @@ Production splits `static_export/` across three deploy paths. Each shell script 
 
 | Artifact | Refreshes | Notes |
 |----------|-----------|-------|
-| [Dockerfile](Dockerfile) | API image | Bakes `static_export/data/` and `static_export/static/admin/boundaries.json`; fails if either is missing |
+| [Dockerfile](Dockerfile) | API image | Bakes `static_export/data/`, `static_export/static/admin/boundaries.json`, and `static_export/static/wbd/chunks/`; fails if any is missing |
 | [deploy_fargate.sh](deploy_fargate.sh) | API image → ECR (+ optional ECS redeploy) | Runs `export_static.py --data`, verifies data, `docker build`, ECR push (us-west-1 default) |
 | [deploy_static.sh](deploy_static.sh) | `static_export/static/` and `static_export/forecast/` → S3 | Static path also creates a `/static/*` CloudFront invalidation |
 | [deploy_frontend.sh](deploy_frontend.sh) | Vite SPA (`index.html`, `assets/`, favicons, `export_manifest.json`) → S3 | Invalidates non-hashed files; `assets/` URLs are content-hashed |
@@ -155,7 +157,7 @@ Routing in production: CloudFront fronts S3 (SPA shell, `/static/*`, `/assets/*`
 
 ### Fargate (`deploy_fargate.sh`)
 
-The Docker image **fails to build** if `static_export/data/<model>/grid.json` or `static_export/static/admin/boundaries.json` is missing. Fargate deploy refreshes **verification data** only — run `deploy_static.sh` and/or `deploy_frontend.sh` for the other parts.
+The Docker image **fails to build** if `static_export/data/<model>/grid.json`, `static_export/static/admin/boundaries.json`, or `static_export/static/wbd/chunks/` is missing. Fargate deploy refreshes **verification data** only — run `deploy_static.sh` and/or `deploy_frontend.sh` for the other parts.
 
 ```bash
 chmod +x deploy_fargate.sh
@@ -176,13 +178,13 @@ Common flags:
 
 ```bash
 ./deploy_static.sh                # default: --static and --forecast
-./deploy_static.sh --static       # tiles, ranges, config, zip, admin
+./deploy_static.sh --static       # tiles, ranges, config, zip, admin, wbd map assets
 ./deploy_static.sh --forecast     # daily forecast refresh (no CF invalidation)
 SKIP_BUILD=1 ./deploy_static.sh --static
 SKIP_INVALIDATE=1 ./deploy_static.sh --static
 ```
 
-Cache-Control mirrors `LongCacheStaticMiddleware` in `backend/api.py`: `zip/` and `admin/` are 1 yr immutable; `tiles/`, `ranges/`, and `config.json` are 300 s `must-revalidate`. The forecast S3 prefix is derived from `DATA_S3_URI` (sibling of the stats prefix); see the script header for the parsing rule.
+Cache-Control mirrors `LongCacheStaticMiddleware` in `backend/api.py`: `zip/`, `admin/`, and `wbd/` are 1 yr immutable; `tiles/`, `ranges/`, and `config.json` are 300 s `must-revalidate`. The forecast S3 prefix is derived from `DATA_S3_URI` (sibling of the stats prefix); see the script header for the parsing rule.
 
 ### Frontend (`deploy_frontend.sh`)
 

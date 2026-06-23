@@ -8,13 +8,16 @@ function headersWithAuth(base = {}) {
   return { ...base, ...authHeaders() };
 }
 
-/** Drop the (potentially large) ``geometry`` field from admin regions before sending.
- *  The backend resolves polygons from FIPS via ``backend/admin_boundaries.py``; the
+/** Drop the (potentially large) ``geometry`` field from admin/huc regions before sending.
+ *  The backend resolves polygons from FIPS/HUC via boundary modules; the
  *  frontend only carries ``geometry`` for local rendering (dim mask). */
 function regionPayload(region) {
-  if (!region || region.type !== 'admin' || !region.geometry) return region;
-  const { geometry: _g, ...rest } = region;
-  return rest;
+  if (!region) return region;
+  if ((region.type === 'admin' || region.type === 'huc') && region.geometry) {
+    const { geometry: _g, ...rest } = region;
+    return rest;
+  }
+  return region;
 }
 
 function verificationStatisticsOnly() {

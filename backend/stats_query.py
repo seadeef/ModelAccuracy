@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from backend import admin_boundaries
+from backend import admin_boundaries, wbd_boundaries
 from backend.static_store import LocalStaticStore, StaticStore, default_static_site_root
 from model_registry import MODEL_REGISTRY
 from statistics_plugins.registry import STATISTICS_BY_NAME
@@ -24,6 +24,7 @@ _bin_cache: dict[tuple, np.ndarray] = {}
 # cached above, so their ``id()`` is stable for the life of the process and
 # different (store, model) pairs produce distinct arrays.
 _admin_mask_cache: dict[tuple[int, int, str, str], np.ndarray] = {}
+_huc_mask_cache: dict[tuple[int, int, str], np.ndarray] = {}
 
 # Forecast data lives in a separate store (S3 prefix) updated daily without
 # redeploying the container.  TTL caches ensure new data is picked up.
@@ -386,6 +387,36 @@ def _admin_region_mask(
     return mask
 
 
+def _huc_region_mask(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    n_lat: int,
+    n_lon: int,
+    huc: str,
+) -> np.ndarray:
+    cache_key = (id(lats), id(lons), huc)
+    cached = _huc_mask_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        entry = wbd_boundaries.get_entry(huc)
+    except (KeyError, ValueError, wbd_boundaries.WbdBoundariesUnavailable):
+        empty = np.zeros(n_lat * n_lon, dtype=bool)
+        _huc_mask_cache[cache_key] = empty
+        return empty
+    polygons = entry.get("polygons") or []
+    mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
+    if not np.any(mask):
+        mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
+    if not np.any(mask):
+        west, south, east, north = entry["bbox"]
+        cx = (west + east) / 2
+        cy = (south + north) / 2
+        mask = _mask_nearest_cell(lats, lons, n_lat, n_lon, cx, cy)
+    _huc_mask_cache[cache_key] = mask
+    return mask
+
+
 def _build_region_mask(
     lats: np.ndarray,
     lons: np.ndarray,
@@ -424,6 +455,12 @@ def _build_region_mask(
         if not level or not fips:
             return mask
         return _admin_region_mask(lats, lons, n_lat, n_lon, level, fips)
+
+    if region_type == "huc":
+        huc = str(region.get("huc") or "")
+        if not huc:
+            return mask
+        return _huc_region_mask(lats, lons, n_lat, n_lon, huc)
 
     return mask
 

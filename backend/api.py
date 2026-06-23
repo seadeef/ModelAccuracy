@@ -104,6 +104,7 @@ class LongCacheStaticMiddleware(BaseHTTPMiddleware):
     _IMMUTABLE_PREFIXES = (
         "/static/zip/",
         "/static/admin/",
+        "/static/wbd/",
     )
 
     async def dispatch(self, request: Request, call_next):

@@ -35,6 +35,9 @@ function regionToken(region) {
   if (region.type === 'admin' && region.level && region.fips) {
     return `${region.level}-${region.fips}`;
   }
+  if (region.type === 'huc' && region.huc) {
+    return `huc-${region.huc}`;
+  }
   return region.type || 'region';
 }
 

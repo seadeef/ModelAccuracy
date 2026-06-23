@@ -19,3 +19,8 @@ gcsfs>=2024.1.0
 zarr>=3.0.0
 h5py>=3.10.0
 Pillow>=10.0.0
+
+# Build-time only (scripts/fetch_wbd_boundaries.py — not imported at API runtime)
+pyogrio>=0.7.0
+shapely>=2.0.0
+topojson>=1.9.0

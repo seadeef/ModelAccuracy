@@ -8,7 +8,7 @@
 #                non-/api/* to the S3 origin). Contains config.json, tiles/,
 #                ranges/, zip/, admin/.
 #                Cache-Control matches backend/api.py:LongCacheStaticMiddleware:
-#                  zip/, admin/                       → 1yr immutable
+#                  zip/, admin/, wbd/ (map assets only)     → 1yr immutable
 #                  tiles/, ranges/, config.json       → 300s must-revalidate
 #                A single /static/* CloudFront invalidation runs after upload.
 #
@@ -134,7 +134,7 @@ sync_static() {
   fi
   local dest="s3://$BUCKET/static"
 
-  # Immutable (zip codes + admin boundaries — change yearly at most).
+  # Immutable (zip + admin boundaries — change yearly at most).
   for sub in zip admin; do
     if [[ -d "$STATIC_SRC/$sub" ]]; then
       echo "==> Sync $dest/$sub/ ($CC_IMMUTABLE)"
@@ -143,6 +143,16 @@ sync_static() {
         --cache-control "$CC_IMMUTABLE"
     fi
   done
+
+  # WBD frontend map assets only (backend chunks/ are baked into the API image).
+  WBD="$STATIC_SRC/wbd"
+  if [[ -d "$WBD" ]]; then
+    echo "==> Sync $dest/wbd/ map assets ($CC_IMMUTABLE; excludes chunks/)"
+    aws s3 sync "$WBD" "$dest/wbd" \
+      --region "$AWS_REGION" --delete \
+      --cache-control "$CC_IMMUTABLE" \
+      --exclude "chunks/*"
+  fi
 
   # Mutable (refreshed each stats rerun).
   for sub in tiles ranges; do
