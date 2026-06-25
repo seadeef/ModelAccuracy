@@ -29,6 +29,11 @@ class StaticStore(Protocol):
     def read_bytes(self, relative_path: str) -> bytes:
         ...
 
+    def read_range(self, relative_path: str, offset: int, length: int) -> bytes:
+        """Read *length* bytes starting at *offset*. Used for point-region queries
+        that need a single grid cell rather than the whole ~156 KB bin."""
+        ...
+
     def exists(self, relative_path: str) -> bool:
         ...
 
@@ -46,6 +51,11 @@ class LocalStaticStore:
 
     def read_bytes(self, relative_path: str) -> bytes:
         return self._resolve(relative_path).read_bytes()
+
+    def read_range(self, relative_path: str, offset: int, length: int) -> bytes:
+        with self._resolve(relative_path).open("rb") as f:
+            f.seek(offset)
+            return f.read(length)
 
     def exists(self, relative_path: str) -> bool:
         rel = relative_path.lstrip("/")
@@ -79,6 +89,17 @@ class S3StaticStore:
     def read_bytes(self, relative_path: str) -> bytes:
         try:
             obj = self.client.get_object(Bucket=self.bucket, Key=self._key(relative_path))
+        except self.client.exceptions.NoSuchKey:
+            raise FileNotFoundError(relative_path)
+        return obj["Body"].read()
+
+    def read_range(self, relative_path: str, offset: int, length: int) -> bytes:
+        # HTTP Range is inclusive on both ends; bytes=0-3 returns the first 4 bytes.
+        rng = f"bytes={offset}-{offset + length - 1}"
+        try:
+            obj = self.client.get_object(
+                Bucket=self.bucket, Key=self._key(relative_path), Range=rng
+            )
         except self.client.exceptions.NoSuchKey:
             raise FileNotFoundError(relative_path)
         return obj["Body"].read()
@@ -132,6 +153,9 @@ class LogicalPathStripDataStore:
 
     def read_bytes(self, relative_path: str) -> bytes:
         return self._inner.read_bytes(self._mapped(relative_path))
+
+    def read_range(self, relative_path: str, offset: int, length: int) -> bytes:
+        return self._inner.read_range(self._mapped(relative_path), offset, length)
 
     def exists(self, relative_path: str) -> bool:
         return self._inner.exists(self._mapped(relative_path))

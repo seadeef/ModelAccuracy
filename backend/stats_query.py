@@ -77,6 +77,36 @@ def _read_forecast_bin_or_none(
         return None
 
 
+def _get_forecast_cell(
+    store: StaticStore, model: str, variable: str, lead_key: str, flat_idx: int,
+) -> float | None:
+    """Single grid-cell forecast value for point regions.
+
+    Reuses a resident full array when one is already cached; otherwise reads only
+    the 4 bytes at *flat_idx* via a byte-range request instead of pulling the whole
+    ~156 KB grid.  Returns the raw float (may be NaN — callers test ``isfinite``).
+    """
+    cache_key = (store.cache_key, model, variable, lead_key)
+    with _forecast_bin_cache_lock:
+        cached = _forecast_bin_cache.get(cache_key)
+        if cached is not None:
+            arr, ts = cached
+            if time.monotonic() - ts < _FORECAST_TTL:
+                _forecast_bin_cache.move_to_end(cache_key)
+                return float(arr[flat_idx]) if 0 <= flat_idx < arr.size else None
+    if flat_idx < 0:
+        return None
+    try:
+        raw = store.read_range(
+            f"{model}/{variable}/lead_{lead_key}.bin", flat_idx * 4, 4
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    if len(raw) < 4:
+        return None
+    return float(np.frombuffer(raw, dtype=np.float32)[0])
+
+
 def _data_bin_relative_path(
     model: str,
     stat_name: str,
@@ -163,6 +193,77 @@ def _read_bin_or_none(
         )
     except FileNotFoundError:
         return None
+
+
+def _get_bin_cell(
+    store: StaticStore,
+    model: str,
+    stat_name: str,
+    lead_key: str,
+    flat_idx: int,
+    *,
+    period: str,
+    month: str | None,
+    season: str | None,
+) -> float | None:
+    """Single grid-cell verification value for point regions (byte-range read).
+
+    Reuses a resident full array when cached; otherwise reads only the one float32
+    instead of the whole ~156 KB grid.  Returns the raw float (may be NaN).
+    """
+    cache_key = (store.cache_key, model, stat_name, lead_key, period, month, season)
+    with _bin_cache_lock:
+        cached = _bin_cache.get(cache_key)
+        if cached is not None:
+            _bin_cache.move_to_end(cache_key)
+            return float(cached[flat_idx]) if 0 <= flat_idx < cached.size else None
+    if flat_idx < 0:
+        return None
+    relative_path = str(_data_bin_relative_path(
+        model, stat_name, lead_key, period=period, month=month, season=season
+    ))
+    try:
+        raw = store.read_range(relative_path, flat_idx * 4, 4)
+    except (FileNotFoundError, OSError):
+        return None
+    if len(raw) < 4:
+        return None
+    return float(np.frombuffer(raw, dtype=np.float32)[0])
+
+
+def _cells_for_stats_parallel(
+    store: StaticStore,
+    model: str,
+    lead_key: str,
+    stat_names: list[str],
+    flat_idx: int,
+    *,
+    period: str,
+    month: str | None,
+    season: str | None,
+) -> dict[str, float | None]:
+    """Point-region counterpart of ``_bins_for_stats_parallel``: one byte-range cell
+    read per statistic instead of one full-grid read."""
+    if not stat_names:
+        return {}
+    if len(stat_names) == 1:
+        sn = stat_names[0]
+        return {sn: _get_bin_cell(
+            store, model, sn, lead_key, flat_idx, period=period, month=month, season=season
+        )}
+    out: dict[str, float | None] = {}
+    with ThreadPoolExecutor(max_workers=len(stat_names)) as ex:
+        future_to_stat = {
+            ex.submit(
+                _get_bin_cell,
+                store, model, sn, lead_key, flat_idx,
+                period=period, month=month, season=season,
+            ): sn
+            for sn in stat_names
+        }
+        for fut in as_completed(future_to_stat):
+            out[future_to_stat[fut]] = fut.result()
+    return out
 
 
 def _bins_for_stats_parallel(
@@ -515,25 +616,20 @@ def stats_for_region(
         lat_idx = int(np.argmin(np.abs(lats - lat)))
         lon_idx = int(np.argmin(np.abs(lons - lon)))
         flat_idx = lat_idx * n_lon + lon_idx
-        bins = _bins_for_stats_parallel(
+        # Only one cell is needed — read 4 bytes per stat, not the whole grid.
+        cells = _cells_for_stats_parallel(
             resolved_store,
             model,
             lead_key,
             stat_names,
+            flat_idx,
             period=period,
             month=month,
             season=season,
         )
         for stat_name in stat_names:
-            values = bins.get(stat_name)
-            if values is None:
-                result[stat_name] = _no_data_entry(stat_name)
-                continue
-            if values.size != n_lat * n_lon:
-                result[stat_name] = _no_data_entry(stat_name)
-                continue
-            value = float(values[flat_idx])
-            if not np.isfinite(value):
+            value = cells.get(stat_name)
+            if value is None or not np.isfinite(value):
                 result[stat_name] = _no_data_entry(stat_name)
                 continue
             result[stat_name] = {
@@ -586,6 +682,17 @@ def _winner_metric_label(stat_name: str) -> str:
     return "region_mean_value_lower_better"
 
 
+def _loss_from_value(v: float, stat_name: str) -> float | None:
+    """Per-cell loss (lower is better): abs for bias, negated for SACC, else identity."""
+    if not np.isfinite(v):
+        return None
+    if stat_name == "bias":
+        return float(abs(v))
+    if stat_name == "sacc":
+        return float(-v)
+    return float(v)
+
+
 def _region_loss_scalar(
     values: np.ndarray,
     stat_name: str,
@@ -598,14 +705,7 @@ def _region_loss_scalar(
     Matches ``export_static._scalar_loss_from_npz`` but over a mask or single grid cell.
     """
     if flat_idx is not None:
-        v = values[flat_idx]
-        if not np.isfinite(v):
-            return None
-        if stat_name == "bias":
-            return float(abs(v))
-        if stat_name == "sacc":
-            return float(-v)
-        return float(v)
+        return _loss_from_value(values[flat_idx], stat_name)
 
     if mask is None or not np.any(mask):
         return None
@@ -631,6 +731,24 @@ def _region_loss_for_model_lead(
     month: str | None,
     season: str | None,
 ) -> float | None:
+    lats, lons, n_lat, n_lon = _get_grid(store, model)
+    region_type = region.get("type")
+
+    if region_type == "point":
+        # Single cell — byte-range read instead of the whole grid.
+        lon = float(region["coordinates"][0])
+        lat = float(region["coordinates"][1])
+        lat_idx = int(np.argmin(np.abs(lats - lat)))
+        lon_idx = int(np.argmin(np.abs(lons - lon)))
+        flat_idx = lat_idx * n_lon + lon_idx
+        cell = _get_bin_cell(
+            store, model, stat_name, lead_key, flat_idx,
+            period=period, month=month, season=season,
+        )
+        if cell is None:
+            return None
+        return _loss_from_value(cell, stat_name)
+
     try:
         values = _get_bin(
             store,
@@ -643,19 +761,8 @@ def _region_loss_for_model_lead(
         )
     except FileNotFoundError:
         return None
-
-    lats, lons, n_lat, n_lon = _get_grid(store, model)
     if values.size != n_lat * n_lon:
         return None
-
-    region_type = region.get("type")
-    if region_type == "point":
-        lon = float(region["coordinates"][0])
-        lat = float(region["coordinates"][1])
-        lat_idx = int(np.argmin(np.abs(lats - lat)))
-        lon_idx = int(np.argmin(np.abs(lons - lon)))
-        flat_idx = lat_idx * n_lon + lon_idx
-        return _region_loss_scalar(values, stat_name, flat_idx=flat_idx)
 
     mask = _build_region_mask(lats, lons, n_lat, n_lon, region)
     return _region_loss_scalar(values, stat_name, mask=mask)
@@ -772,58 +879,73 @@ def forecast_all_models(
         for lead in range(cfg.lead_days_min, cfg.lead_days_max + 1):
             tasks.append((mk, str(lead)))
 
-    # Fan out all reads in parallel (from the forecast store).
-    bin_results: dict[tuple[str, str], np.ndarray | None] = {}
-    max_workers = min(len(tasks), 20)
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_to_key = {
-            ex.submit(
-                _read_forecast_bin_or_none, forecast_store, mk, variable, lead_key,
-            ): (mk, lead_key)
-            for mk, lead_key in tasks
-        }
-        for fut in as_completed(future_to_key):
-            bin_results[future_to_key[fut]] = fut.result()
+    region_type = region.get("type")
+    is_point = region_type == "point"
 
-    # Build per-model results.
+    # value_by_task[(model, lead_key)] = finite region value, or None for no_data.
+    value_by_task: dict[tuple[str, str], float | None] = {}
+    max_workers = min(len(tasks), 20)
+
+    if is_point:
+        # Each model has its own grid, so resolve the cell index per model, then
+        # read only that one float32 per (model, lead) — not the whole ~156 KB bin.
+        lon = float(region["coordinates"][0])
+        lat = float(region["coordinates"][1])
+        flat_by_model: dict[str, int] = {}
+        for mk in model_order:
+            lats, lons, n_lat, n_lon = _get_grid(store, mk)
+            lat_idx = int(np.argmin(np.abs(lats - lat)))
+            lon_idx = int(np.argmin(np.abs(lons - lon)))
+            flat_by_model[mk] = lat_idx * n_lon + lon_idx
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_to_key = {
+                ex.submit(
+                    _get_forecast_cell, forecast_store, mk, variable, lead_key,
+                    flat_by_model[mk],
+                ): (mk, lead_key)
+                for mk, lead_key in tasks
+            }
+            for fut in as_completed(future_to_key):
+                v = fut.result()
+                value_by_task[future_to_key[fut]] = (
+                    v if v is not None and np.isfinite(v) else None
+                )
+    else:
+        # Region masks need the full grid, so read whole bins and take the mean.
+        bin_results: dict[tuple[str, str], np.ndarray | None] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_to_key = {
+                ex.submit(
+                    _read_forecast_bin_or_none, forecast_store, mk, variable, lead_key,
+                ): (mk, lead_key)
+                for mk, lead_key in tasks
+            }
+            for fut in as_completed(future_to_key):
+                bin_results[future_to_key[fut]] = fut.result()
+        for mk in model_order:
+            lats, lons, n_lat, n_lon = _get_grid(store, mk)
+            mask = _build_region_mask(lats, lons, n_lat, n_lon, region)
+            cfg = MODEL_REGISTRY[mk]
+            for lead in range(cfg.lead_days_min, cfg.lead_days_max + 1):
+                lead_key = str(lead)
+                values = bin_results.get((mk, lead_key))
+                if values is None or values.size != n_lat * n_lon:
+                    value_by_task[(mk, lead_key)] = None
+                else:
+                    value_by_task[(mk, lead_key)] = _masked_mean(values, mask)
+
+    # Assemble per-model results from the resolved values.
     models_out: dict[str, dict] = {}
     for mk in model_order:
         cfg = MODEL_REGISTRY[mk]
-        lats, lons, n_lat, n_lon = _get_grid(store, mk)
-
-        region_type = region.get("type")
-        if region_type == "point":
-            lon = float(region["coordinates"][0])
-            lat = float(region["coordinates"][1])
-            lat_idx = int(np.argmin(np.abs(lats - lat)))
-            lon_idx = int(np.argmin(np.abs(lons - lon)))
-            flat_idx = lat_idx * n_lon + lon_idx
-            mask = None
-        else:
-            flat_idx = None
-            mask = _build_region_mask(lats, lons, n_lat, n_lon, region)
-
         leads_out: dict[str, dict] = {}
         for lead in range(cfg.lead_days_min, cfg.lead_days_max + 1):
             lead_key = str(lead)
-            values = bin_results.get((mk, lead_key))
-            if values is None or values.size != n_lat * n_lon:
+            v = value_by_task.get((mk, lead_key))
+            if v is None:
                 leads_out[lead_key] = {"value": None, "units": units, "no_data": True}
-                continue
-
-            if flat_idx is not None:
-                v = float(values[flat_idx])
-                if not np.isfinite(v):
-                    leads_out[lead_key] = {"value": None, "units": units, "no_data": True}
-                else:
-                    leads_out[lead_key] = {"value": v, "units": units, "no_data": False}
             else:
-                v = _masked_mean(values, mask)
-                if v is None:
-                    leads_out[lead_key] = {"value": None, "units": units, "no_data": True}
-                else:
-                    leads_out[lead_key] = {"value": v, "units": units, "no_data": False}
-
+                leads_out[lead_key] = {"value": float(v), "units": units, "no_data": False}
         models_out[mk] = {"leads": leads_out}
 
     # forecast_calendar.json is intentionally NOT included here: the SPA fetches it
