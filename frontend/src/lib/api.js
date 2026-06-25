@@ -226,31 +226,67 @@ export async function fetchForecastCalendar() {
 }
 
 /**
- * Region-mean forecast for a SINGLE variable (precip/temp/wind/humidity), every
- * model × lead, from `POST /api/stats/forecast`. The panel loads only the variable
- * it currently shows and fetches the others on demand when their button is clicked,
- * so a region pick costs one request rather than one per variable.
- * Returns `{ models, variable, forecast_calendar }`, or null. `forecast_calendar`
- * is fetched directly from the static asset so init dates stay current with new
- * exports without the backend echoing them; `forecast_calendar.per_model[modelKey]`
- * has `initDate` (ISO `YYYY-MM-DD`), `leadDaysMin`, `leadDaysMax`; valid date for
- * lead L = `initDate` + L calendar days.
+ * Region-mean forecast (precip) for every model × lead in one request.
+ * Returns `{ models, forecast_calendar }`. The `models` values come from the API
+ * (`POST /api/stats/forecast`); `forecast_calendar` is fetched directly from the
+ * static asset so init dates stay current with new forecast exports without the
+ * backend echoing them. `forecast_calendar.per_model[modelKey]` has `initDate`
+ * (ISO `YYYY-MM-DD`), `leadDaysMin`, `leadDaysMax`; valid date for lead L =
+ * `initDate` + L calendar days.
  */
-export async function fetchForecastForVariable({ region, variable = 'precip' }) {
+export async function fetchForecastAllModels({ region }) {
   try {
     const [resp, calendar] = await Promise.all([
       fetch(`${API_BASE}/api/stats/forecast`, {
         method: 'POST',
         headers: headersWithAuth({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ region: regionPayload(region), variable }),
+        body: JSON.stringify({ region: regionPayload(region) }),
       }),
       fetchForecastCalendar(),
     ]);
     if (!resp.ok) return null;
     const data = await resp.json();
-    if (!data?.models) return null;
     if (calendar) data.forecast_calendar = calendar;
     return data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Region-mean forecast for EVERY variable (precip/temp/wind/humidity) × every
+ * model × lead. Fires one `POST /api/stats/forecast` per variable in parallel so
+ * the panel's variable selector can show each variable's current value and switch
+ * between them with no refetch. The variable list comes from the forecast
+ * calendar's `variables` catalog (falls back to precip).
+ * Returns `{ [variable]: { models, variable, forecast_calendar } }`, or null.
+ */
+export async function fetchForecastAllVariables({ region }) {
+  try {
+    const calendar = await fetchForecastCalendar();
+    const variables = calendar?.variables?.map((v) => v.key) || ['precip'];
+    const region_ = regionPayload(region);
+    const entries = await Promise.all(
+      variables.map(async (variable) => {
+        try {
+          const resp = await fetch(`${API_BASE}/api/stats/forecast`, {
+            method: 'POST',
+            headers: headersWithAuth({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ region: region_, variable }),
+          });
+          if (!resp.ok) return [variable, null];
+          const data = await resp.json();
+          if (!data?.models) return [variable, null];
+          if (calendar) data.forecast_calendar = calendar;
+          return [variable, data];
+        } catch {
+          return [variable, null];
+        }
+      }),
+    );
+    const byVar = {};
+    for (const [variable, data] of entries) if (data) byVar[variable] = data;
+    return Object.keys(byVar).length ? byVar : null;
   } catch {
     return null;
   }

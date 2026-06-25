@@ -5,7 +5,7 @@
     PERIOD_HELP,
     SEASON_PERIOD_HELP,
   } from '../helpText.js';
-  import { fetchStatsAllLeads, fetchLeadWinnersForRegion, fetchForecastForVariable } from '../api.js';
+  import { fetchStatsAllLeads, fetchLeadWinnersForRegion, fetchForecastAllVariables } from '../api.js';
   import { downloadPanelStatsCsv } from '../exportPanelStatsCsv.js';
   import { getModelLeadBounds } from '../tile.js';
   import { modelPalette, statColor } from '../palette.js';
@@ -37,10 +37,6 @@
    *  map region (all models × leads). All variables are fetched together so the
    *  selector buttons show each variable's live value and switching is instant. */
   let forecastByVar = $state(null);
-  // Forecast variables already fetched (or in flight) for the current region's
-  // geometry — non-reactive so the lazy-load effect can read it without creating a
-  // reactive loop when it writes forecastByVar. Cleared whenever the region changes.
-  const forecastLoadedVars = new Set();
   /** Payload for the currently selected forecast variable (drives the top chart). */
   const forecastPayload = $derived(forecastByVar?.[ui.forecastVariable] ?? null);
   let lastForecastGeoKey = '';
@@ -227,16 +223,12 @@
     return { value: v, units: forecastUnitsForModel(modelKey) };
   }
 
-  /** Forecast-variable selector buttons, in display order. Shows the full catalog
-   *  (not just loaded variables) so unloaded ones stay clickable — each lazily
-   *  fetches its data on first click. Prefer the forecast calendar's variable list
-   *  (authoritative for what's exported); fall back to the static display order. */
+  /** Forecast-variable selector buttons: those we have data for, in display order. */
   const forecastVars = $derived.by(() => {
-    const anyPayload = forecastByVar ? Object.values(forecastByVar)[0] : null;
-    const catalog = anyPayload?.forecast_calendar?.variables?.map((v) => v.key);
-    const base = catalog?.length ? catalog : FORECAST_VAR_ORDER;
-    const ordered = FORECAST_VAR_ORDER.filter((k) => base.includes(k));
-    for (const k of base) if (!ordered.includes(k)) ordered.push(k);  // any extras after
+    const keys = forecastByVar ? Object.keys(forecastByVar) : [];
+    if (!keys.length) return FORECAST_VAR_ORDER.slice();  // show buttons before first load
+    const ordered = FORECAST_VAR_ORDER.filter((k) => keys.includes(k));
+    for (const k of keys) if (!ordered.includes(k)) ordered.push(k);  // any extras after
     return ordered;
   });
 
@@ -856,17 +848,11 @@
     });
   });
 
-  // Lazily fetch only the forecast variable currently shown. Reads ui.forecastVariable
-  // as well as the region, so switching variables loads the newly-selected one on
-  // demand (its button shows "—" until then). Switching region drops the per-variable
-  // cache and refetches just the active variable — not all four.
   $effect(() => {
     const region = ui.selectedRegion;
-    const variable = ui.forecastVariable;
     if (!region) {
       lastForecastGeoKey = '';
       forecastFetchGen += 1;
-      forecastLoadedVars.clear();
       forecastByVar = null;
       return;
     }
@@ -874,27 +860,17 @@
     if (!geo) {
       lastForecastGeoKey = '';
       forecastFetchGen += 1;
-      forecastLoadedVars.clear();
       forecastByVar = null;
       return;
     }
-    if (geo !== lastForecastGeoKey) {
-      lastForecastGeoKey = geo;
-      forecastFetchGen += 1;
-      forecastLoadedVars.clear();
-      forecastByVar = null;
-    }
-    if (forecastLoadedVars.has(variable)) return;  // already fetched / in flight
-    forecastLoadedVars.add(variable);
-    const gen = forecastFetchGen;
+    if (geo === lastForecastGeoKey) return;
+    lastForecastGeoKey = geo;
+    const fid = forecastFetchGen + 1;
+    forecastFetchGen = fid;
     queueMicrotask(async () => {
-      const data = await fetchForecastForVariable({ region, variable });
-      if (gen !== forecastFetchGen) return;  // region changed under us — discard
-      if (!data) {
-        forecastLoadedVars.delete(variable);  // let a later view retry
-        return;
-      }
-      forecastByVar = { ...(forecastByVar || {}), [variable]: data };
+      const data = await fetchForecastAllVariables({ region });
+      if (fid !== forecastFetchGen) return;
+      forecastByVar = data;  // { [variable]: payload } or null
     });
   });
 
