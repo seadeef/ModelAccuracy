@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 
 import numpy as np
 
@@ -20,7 +22,14 @@ from statistics_plugins.registry import STATISTICS_BY_NAME
 # GIL, which is sufficient for the ThreadPoolExecutor concurrency used below.
 # ---------------------------------------------------------------------------
 _grid_cache: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, int, int]] = {}
-_bin_cache: dict[tuple, np.ndarray] = {}
+# Verification stat bins (~156 KB each).  Bounded LRU so a long-lived Fargate
+# worker that serves many (model, stat, lead, accumulator) combinations can't
+# accumulate the entire dataset (~650 MB+) in RAM.  Same OrderedDict+Lock LRU as
+# wbd_boundaries._chunk_cache: a hit is moved to the end, the least-recently-used
+# entry is evicted first.  512 bins ≈ 80 MB resident.
+_BIN_CACHE_MAX = 512
+_bin_cache_lock = Lock()
+_bin_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 # Keyed by (id(lats), id(lons), level, fips); the grid arrays are themselves
 # cached above, so their ``id()`` is stable for the life of the process and
 # different (store, model) pairs produce distinct arrays.
@@ -30,7 +39,9 @@ _huc_mask_cache: dict[tuple[int, int, str], np.ndarray] = {}
 # Forecast data lives in a separate store (S3 prefix) updated daily without
 # redeploying the container.  TTL caches ensure new data is picked up.
 _FORECAST_TTL = 300
-_forecast_bin_cache: dict[tuple, tuple[np.ndarray, float]] = {}
+_FORECAST_CACHE_MAX = 512
+_forecast_bin_cache_lock = Lock()
+_forecast_bin_cache: "OrderedDict[tuple, tuple[np.ndarray, float]]" = OrderedDict()
 # forecast_calendar.json is no longer read by the backend — the SPA fetches it
 # directly from the static asset (/stats/forecast/forecast_calendar.json).
 
@@ -39,14 +50,21 @@ def _get_forecast_bin(
     store: StaticStore, model: str, variable: str, lead_key: str,
 ) -> np.ndarray:
     cache_key = (store.cache_key, model, variable, lead_key)
-    cached = _forecast_bin_cache.get(cache_key)
-    if cached is not None:
-        arr, ts = cached
-        if time.monotonic() - ts < _FORECAST_TTL:
-            return arr
+    with _forecast_bin_cache_lock:
+        cached = _forecast_bin_cache.get(cache_key)
+        if cached is not None:
+            arr, ts = cached
+            if time.monotonic() - ts < _FORECAST_TTL:
+                _forecast_bin_cache.move_to_end(cache_key)
+                return arr
+            del _forecast_bin_cache[cache_key]  # expired — drop the stale array
     raw_bytes = store.read_bytes(f"{model}/{variable}/lead_{lead_key}.bin")
     arr = np.frombuffer(raw_bytes, dtype=np.float32)
-    _forecast_bin_cache[cache_key] = (arr, time.monotonic())
+    with _forecast_bin_cache_lock:
+        _forecast_bin_cache[cache_key] = (arr, time.monotonic())
+        _forecast_bin_cache.move_to_end(cache_key)
+        while len(_forecast_bin_cache) > _FORECAST_CACHE_MAX:
+            _forecast_bin_cache.popitem(last=False)  # evict least-recently used
     return arr
 
 
@@ -105,15 +123,21 @@ def _get_bin(
     season: str | None = None,
 ) -> np.ndarray:
     cache_key = (store.cache_key, model, stat_name, lead_key, period, month, season)
-    cached = _bin_cache.get(cache_key)
-    if cached is not None:
-        return cached
+    with _bin_cache_lock:
+        cached = _bin_cache.get(cache_key)
+        if cached is not None:
+            _bin_cache.move_to_end(cache_key)
+            return cached
     relative_path = str(_data_bin_relative_path(
         model, stat_name, lead_key, period=period, month=month, season=season
     ))
     raw_bytes = store.read_bytes(relative_path)
     arr = np.frombuffer(raw_bytes, dtype=np.float32)
-    _bin_cache[cache_key] = arr
+    with _bin_cache_lock:
+        _bin_cache[cache_key] = arr
+        _bin_cache.move_to_end(cache_key)
+        while len(_bin_cache) > _BIN_CACHE_MAX:
+            _bin_cache.popitem(last=False)  # evict least-recently used
     return arr
 
 
