@@ -106,12 +106,12 @@ export function teardownBoundaryLayer(
   if (map.getSource(sourceId)) map.removeSource(sourceId);
 }
 
-export function createBoundaryHoverHandlers(getMap, { sourceId, hoveredIdRef }) {
+export function createBoundaryHoverHandlers(getMap, { sourceId, hoveredIdRef, pickFeature }) {
   function onHoverEnter(e) {
     const map = getMap();
     if (!map) return;
     map.getCanvas().style.cursor = 'pointer';
-    const f = e.features?.[0];
+    const f = pickFeature ? pickFeature(e.features ?? []) : e.features?.[0];
     if (!f) return;
     if (hoveredIdRef.current != null && hoveredIdRef.current !== f.id) {
       map.setFeatureState({ source: sourceId, id: hoveredIdRef.current }, { hover: false });

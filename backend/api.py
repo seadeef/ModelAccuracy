@@ -30,8 +30,7 @@ from backend.stats_service import query_forecast_all_models_payload, query_lead_
 
 
 STATIC_SITE_ROOT = _project_root / "static_export"
-STATIC_ASSETS_ROOT = STATIC_SITE_ROOT / "static"
-STATIC_DATA_ROOT = STATIC_SITE_ROOT / "data"
+STATIC_FRONTEND_ROOT = STATIC_SITE_ROOT / "frontend"
 STATIC_STORE = store_from_env(default_local_root=STATIC_SITE_ROOT)
 _FORECAST_STORE_CACHED: dict[str, object] = {}
 
@@ -95,16 +94,19 @@ class LongCacheStaticMiddleware(BaseHTTPMiddleware):
 
     _DEV = os.getenv("DEV", "").strip().lower() in ("1", "true", "yes")
 
+    # Data files and SPA assets are all served from the site root now.
     _MUTABLE_PREFIXES = (
-        "/static/tiles/",
-        "/static/ranges/",
-        "/static/config.json",
-        "/data/",
+        "/tiles/",
+        "/ranges/",
+        "/config.json",
+        "/model_data/",
+        "/forecast/",
     )
     _IMMUTABLE_PREFIXES = (
-        "/static/zip/",
-        "/static/admin/",
-        "/static/wbd/",
+        "/zip/",
+        "/admin/",
+        "/wbd/",
+        "/assets/",
     )
 
     async def dispatch(self, request: Request, call_next):
@@ -116,32 +118,13 @@ class LongCacheStaticMiddleware(BaseHTTPMiddleware):
             response.headers["Cache-Control"] = "public, max-age=300, must-revalidate"
         elif path.startswith(self._IMMUTABLE_PREFIXES):
             response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
-        elif path.startswith("/static/"):
-            response.headers["Cache-Control"] = "public, max-age=300, must-revalidate"
         return response
 
 
 app.add_middleware(LongCacheStaticMiddleware)
 # Production CDN gzips for us; this matters in dev (uvicorn behind Vite proxy) where
-# large JSON like /static/admin/*.topojson would otherwise ship raw.
+# large JSON like /admin/*.topojson would otherwise ship raw.
 app.add_middleware(GZipMiddleware, minimum_size=1024)
-
-# static_export/static: config, zip, tiles → /static/…
-# static_export/data: .bin, grid.json → /data/…
-if STATIC_ASSETS_ROOT.is_dir():
-    app.mount("/static", StaticFiles(directory=str(STATIC_ASSETS_ROOT)), name="static")
-else:
-    print(
-        "WARNING: static_export/static/ is missing — run export_static.py before serving the app.",
-        file=sys.stderr,
-    )
-if STATIC_DATA_ROOT.is_dir():
-    app.mount("/data", StaticFiles(directory=str(STATIC_DATA_ROOT)), name="data")
-else:
-    print(
-        "WARNING: static_export/data/ is missing — run export_static.py before serving the app.",
-        file=sys.stderr,
-    )
 
 
 @app.post("/api/stats/query")
@@ -180,4 +163,34 @@ def forecast_all_models(payload: ForecastAllModelsRequest):
     """Forecast values for all models across all leads for a region (load once, cache)."""
     return query_forecast_all_models_payload(
         payload, store=STATIC_STORE, forecast_store=_get_forecast_store(),
+    )
+
+
+class SiteStaticFiles(StaticFiles):
+    """Serve the flat data tree and the bundled SPA from a single mount at ``/``.
+
+    Lookups try the data root (``static_export/``: config.json, zip, tiles, ranges,
+    admin, wbd, model_data, forecast) first, then the SPA root
+    (``static_export/frontend/``: index.html, assets, favicons). The SPA stays
+    physically under ``frontend/`` but resolves at the site root, and ``/`` returns
+    its ``index.html`` (``html=True``).
+    """
+
+    def __init__(self, *, data_root: Path, spa_root: Path) -> None:
+        super().__init__(directory=str(data_root), html=True, check_dir=False)
+        # StaticFiles.lookup_path iterates self.all_directories (with traversal
+        # guards); append the SPA root so its files resolve at the root too.
+        if spa_root.is_dir():
+            self.all_directories.append(spa_root)
+
+
+# Mounted LAST so every /api route and /health match before this catch-all.
+# Data files and the SPA are all served from the site root: /config.json, /wbd/…,
+# /tiles/…, /model_data/…, plus / (index.html), /assets/…, /favicon.svg.
+if STATIC_SITE_ROOT.is_dir():
+    app.mount("/", SiteStaticFiles(data_root=STATIC_SITE_ROOT, spa_root=STATIC_FRONTEND_ROOT), name="site")
+else:
+    print(
+        "WARNING: static_export/ is missing — run export_static.py before serving the app.",
+        file=sys.stderr,
     )

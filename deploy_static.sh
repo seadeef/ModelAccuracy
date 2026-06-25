@@ -1,71 +1,55 @@
 #!/usr/bin/env bash
-# Sync the S3-served subtrees of static_export/ to the stats bucket.
+# Refresh the S3-served static site: download the latest forecast, rebuild the
+# static export, and sync it to the stats bucket. No command-line options.
 #
-# Two subtrees actually need to be in S3 in production:
+# Steps:
+#   1. python3 download.py --forecast        # latest forecast → stats_output/{model}/forecast/
+#   2. python3 export_static.py --static      # builds static_export/ root assets AND static_export/forecast/
+#   3. aws s3 sync static_export/{config.json,zip,admin,wbd,tiles,ranges} → s3://$BUCKET/… (root)
+#   4. aws s3 sync static_export/forecast/ → s3://$BUCKET/$FORECAST_PREFIX/
+#   5. CloudFront invalidation of the data paths (/config.json, /zip/*, /admin/*, …)
 #
-#   --static     static_export/static/   → s3://$BUCKET/static/
-#                Browser-fetched via CloudFront (default behavior routes
-#                non-/api/* to the S3 origin). Contains config.json, tiles/,
-#                ranges/, zip/, admin/.
-#                Cache-Control matches backend/api.py:LongCacheStaticMiddleware:
-#                  zip/, admin/, wbd/ (map assets only)     → 1yr immutable
-#                  tiles/, ranges/, config.json       → 300s must-revalidate
-#                A single /static/* CloudFront invalidation runs after upload.
+# The two synced subtrees:
 #
-#   --forecast   static_export/forecast/ → s3://$BUCKET/$FORECAST_PREFIX/
-#                Read by the Fargate backend via forecast_store_from_env
-#                (refreshes every ~5 min), so daily forecast updates can ship
-#                without rebuilding the API image. FORECAST_PREFIX is the
-#                sibling of the DATA_S3_URI stats prefix:
-#                  s3://bucket            → s3://bucket/forecast/
-#                  s3://bucket/static     → s3://bucket/forecast/
-#                  s3://bucket/a/b        → s3://bucket/a/forecast/
-#                No CloudFront invalidation (backend reads S3 directly).
+#   static_export/ root      Browser-fetched via CloudFront from the site root
+#                            (config.json, tiles/, ranges/, zip/, admin/, wbd/ map assets),
+#                            uploaded to s3://$BUCKET/… (keys mirror the local layout).
+#                            They share the bucket root with the SPA (./deploy_frontend.sh);
+#                            each sync uses --delete only within its own subdir.
+#                            Cache-Control matches backend/api.py:LongCacheStaticMiddleware:
+#                              zip/, admin/, wbd/ (map assets only)  → 1yr immutable
+#                              tiles/, ranges/, config.json          → 300s must-revalidate
 #
-# What this script does NOT upload:
+#   static_export/forecast/  Read by the Fargate backend via forecast_store_from_env
+#                            (refreshes every ~5 min), so daily forecast updates ship
+#                            without rebuilding the API image. FORECAST_PREFIX is the
+#                            sibling of the DATA_S3_URI stats prefix:
+#                              s3://bucket            → s3://bucket/forecast/
+#                              s3://bucket/prefix     → s3://bucket/forecast/
+#                              s3://bucket/a/b        → s3://bucket/a/forecast/
+#                            No CloudFront invalidation (backend reads S3 directly).
 #
-#   * SPA shell (index.html, assets/, favicons) — use ./deploy_frontend.sh.
-#   * static_export/data/ (verification .bin + grid.json) — baked into the API
-#     image by Dockerfile COPY and read from disk by the backend (see
-#     store_from_env in backend/static_store.py). Refreshed by rebuilding the
-#     image with ./deploy_fargate.sh.
-#
-# Default (no flags): both --static and --forecast.
+# Not uploaded here:
+#   * SPA shell (frontend/index.html, assets/, favicons) — use ./deploy_frontend.sh.
+#   * static_export/model_data/ (verification .bin + grid.json) — baked into the API
+#     image by Dockerfile COPY; refreshed by rebuilding via ./deploy_fargate.sh.
 #
 # Env (loaded from .env if present):
-#   DATA_S3_URI                  s3://bucket[/prefix]
-#   CLOUDFRONT_DISTRIBUTION_ID   required only when --static is enabled (unless SKIP_INVALIDATE=1)
+#   DATA_S3_URI                  s3://bucket[/prefix]  (required)
+#   CLOUDFRONT_DISTRIBUTION_ID   required unless SKIP_INVALIDATE=1
 #   AWS_REGION                   default us-west-1
 #   AWS_PROFILE                  optional
-#   SKIP_BUILD=1                 upload existing static_export/<subtree>/ (skip rebuild)
-#   SKIP_INVALIDATE=1            skip the /static/* CloudFront invalidation
-#
-# Usage:
-#   ./deploy_static.sh                       # static + forecast
-#   ./deploy_static.sh --forecast            # daily forecast refresh
-#   ./deploy_static.sh --static              # tile/config/zip/admin refresh
-#   SKIP_BUILD=1 ./deploy_static.sh --static # upload pre-built static/
+#   SKIP_BUILD=1                 skip download+export; upload existing static_export/
+#   SKIP_INVALIDATE=1            skip the data-paths CloudFront invalidation
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
-DO_STATIC=0
-DO_FORECAST=0
-for arg in "$@"; do
-  case "$arg" in
-    --static)   DO_STATIC=1 ;;
-    --forecast) DO_FORECAST=1 ;;
-    *)
-      echo "ERROR: unknown argument: $arg" >&2
-      echo "Usage: $0 [--static] [--forecast]" >&2
-      exit 2
-      ;;
-  esac
-done
-if [[ $DO_STATIC -eq 0 && $DO_FORECAST -eq 0 ]]; then
-  DO_STATIC=1; DO_FORECAST=1
+if [[ $# -gt 0 ]]; then
+  echo "ERROR: $0 takes no arguments (got: $*)" >&2
+  exit 2
 fi
 
 if [[ -f "$ROOT/.env" ]]; then
@@ -105,26 +89,28 @@ if [[ -n "${AWS_PROFILE:-}" ]]; then
 fi
 
 SITE="$ROOT/static_export"
-STATIC_SRC="$SITE/static"
+# Flat layout: browser data assets live at the static_export root, uploaded to the
+# S3 bucket root (keys mirror the local layout → served from the site root, e.g.
+# /config.json, /wbd/…). They share the root with the SPA (./deploy_frontend.sh).
+STATIC_SRC="$SITE"
 FORECAST_SRC="$SITE/forecast"
 
 CC_MUTABLE="public, max-age=300, must-revalidate"
 CC_IMMUTABLE="public, max-age=31536000, immutable"
 
-run_build() {
-  local mode="$1" src="$2"
+build() {
   if [[ -n "${SKIP_BUILD:-}" ]]; then
-    echo "==> SKIP_BUILD set — using existing $src"
+    echo "==> SKIP_BUILD set — using existing $SITE"
     return
   fi
-  # Do NOT rm $src first. export_static.py writes via _write_*_if_changed
-  # helpers (export_static.py:_write_text_if_changed / _write_bytes_if_changed),
-  # so unchanged files keep their mtime and `aws s3 sync` skips them — the
-  # whole point of preserving 100k stable ZIP JSONs across deploys. A blanket
-  # wipe would also nuke static/admin/ (regenerated by scripts/fetch_admin_boundaries.py,
-  # not by export_static.py --static).
-  echo "==> Rebuilding $mode (export_static.py --$mode)"
-  python3 export_static.py "--$mode"
+  # Download the freshest forecast for every model, then export the static tree.
+  # export_static.py --static writes both the root data assets and forecast/ via the
+  # _write_*_if_changed helpers, so unchanged files keep their mtime and the
+  # `aws s3 sync` calls below skip them.
+  echo "==> Downloading latest forecast (download.py --forecast)"
+  python3 download.py --forecast
+  echo "==> Rebuilding static export (export_static.py --static)"
+  python3 export_static.py --static
 }
 
 sync_static() {
@@ -132,7 +118,10 @@ sync_static() {
     echo "ERROR: $STATIC_SRC does not exist — run without SKIP_BUILD." >&2
     exit 1
   fi
-  local dest="s3://$BUCKET/static"
+  # Data files are served from the site root now (no /stats prefix). Each sync
+  # targets a specific subdir with --delete; config.json + the forecast calendar
+  # use cp (no --delete) so they don't disturb the SPA files that share the root.
+  local dest="s3://$BUCKET"
 
   # Immutable (zip + admin boundaries — change yearly at most).
   for sub in zip admin; do
@@ -170,6 +159,16 @@ sync_static() {
       --region "$AWS_REGION" \
       --cache-control "$CC_MUTABLE"
   fi
+
+  # Browser-facing copy of the forecast calendar only (init dates). The SPA fetches
+  # /forecast/forecast_calendar.json directly so it stays current with new forecasts;
+  # the forecast *bins* stay at $FORECAST_PREFIX (backend-read, below).
+  if [[ -f "$FORECAST_SRC/forecast_calendar.json" ]]; then
+    echo "==> Upload $dest/forecast/forecast_calendar.json ($CC_MUTABLE)"
+    aws s3 cp "$FORECAST_SRC/forecast_calendar.json" "$dest/forecast/forecast_calendar.json" \
+      --region "$AWS_REGION" \
+      --cache-control "$CC_MUTABLE"
+  fi
 }
 
 sync_forecast() {
@@ -183,31 +182,23 @@ sync_forecast() {
     --region "$AWS_REGION" --delete
 }
 
-if [[ $DO_STATIC -eq 1 ]]; then
-  run_build static "$STATIC_SRC"
-  sync_static
-fi
+build
+sync_static
+sync_forecast
 
-if [[ $DO_FORECAST -eq 1 ]]; then
-  run_build forecast "$FORECAST_SRC"
-  sync_forecast
-fi
-
-if [[ $DO_STATIC -eq 1 && -z "${SKIP_INVALIDATE:-}" ]]; then
+if [[ -z "${SKIP_INVALIDATE:-}" ]]; then
   if [[ -z "${CLOUDFRONT_DISTRIBUTION_ID:-}" ]]; then
     echo "ERROR: CLOUDFRONT_DISTRIBUTION_ID not set (use SKIP_INVALIDATE=1 to skip)." >&2
     exit 1
   fi
-  echo "==> CloudFront invalidation ($CLOUDFRONT_DISTRIBUTION_ID): /static/*"
+  echo "==> CloudFront invalidation ($CLOUDFRONT_DISTRIBUTION_ID): data paths at root"
   aws cloudfront create-invalidation \
     --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
-    --paths "/static/*" \
+    --paths "/config.json" "/zip/*" "/admin/*" "/wbd/*" "/tiles/*" "/ranges/*" "/forecast/*" \
     --query 'Invalidation.{Id:Id,Status:Status}' --output table
-elif [[ $DO_STATIC -eq 1 ]]; then
+else
   echo "==> SKIP_INVALIDATE set — not invalidating CloudFront"
 fi
 
-if [[ $DO_FORECAST -eq 1 ]]; then
-  echo "==> Forecast: backend re-reads S3 within ~5 min."
-fi
+echo "==> Forecast: backend re-reads S3 within ~5 min."
 echo "==> Done"

@@ -33,15 +33,17 @@ function faviconIcoFallback() {
 }
 
 export default defineConfig({
+  // SPA and data files are all served from the site root (base '/').
   // Load env vars (including VITE_*) from the project-root .env, matching the
   // rest of the stack (backend/api.py, deploy_frontend.sh) so there's one source of truth.
   envDir: path.resolve(__dirname, '..'),
   plugins: [svelte(), faviconIcoFallback()],
   server: {
+    // Proxy the API and every root-level data path to the backend; Vite serves
+    // the SPA (/, /assets, /@vite, …) itself.
     proxy: {
-      '/api': 'http://localhost:8000',
-      '/static': 'http://localhost:8000',
-      '/data': 'http://localhost:8000',
+      '^/(api|config\\.json|wbd|admin|tiles|ranges|zip|model_data|forecast)(/|$)':
+        'http://localhost:8000',
     },
   },
   build: { outDir: 'dist' },

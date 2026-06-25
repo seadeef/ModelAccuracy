@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Rebuild the Svelte SPA and upload its artifacts to S3, then invalidate CloudFront.
 #
-# Scope: only the Vite output (index.html, assets/, favicon.svg|ico, export_manifest.json).
-# Does NOT touch static_export/{static,data,forecast}/:
-#   * static/ (config, tiles, ranges, zip, admin)   — ./deploy_static.sh --static
-#   * forecast/ (forecast .bin + calendar)          — ./deploy_static.sh --forecast
-#   * data/ (verification .bin + grid.json)         — baked into the API image;
-#                                                     rebuild via ./deploy_fargate.sh
+# Scope: only the bundled Vite SPA (static_export/frontend/: index.html, assets/,
+# favicon.svg|ico). Its CONTENTS upload to the bucket ROOT so index.html serves at /.
+# Does NOT touch the rest of static_export/:
+#   * root data assets (config, tiles, ranges, zip, admin, wbd) — ./deploy_static.sh
+#   * forecast/ (forecast .bin + calendar)                      — ./deploy_static.sh
+#   * model_data/ (verification .bin + grid.json)              — baked into the API image;
+#                                                                rebuild via ./deploy_fargate.sh
 #
 # Invalidation is scoped to non-hashed files. Files under /assets/ are content-hashed
 # by Vite, so their URLs change on every build and don't need invalidation.
@@ -53,36 +54,40 @@ if [[ -n "${AWS_PROFILE:-}" ]]; then
   echo "==> Using AWS_PROFILE=${AWS_PROFILE}"
 fi
 
-SITE="$ROOT/static_export"
+SPA="$ROOT/static_export/frontend"
 
 if [[ -z "${SKIP_BUILD:-}" ]]; then
   echo "==> Building frontend (export_static.py --frontend)"
   python3 export_static.py --frontend
 else
-  echo "==> SKIP_BUILD set — using existing static_export/"
+  echo "==> SKIP_BUILD set — using existing static_export/frontend/"
 fi
 
-if [[ ! -f "$SITE/index.html" || ! -d "$SITE/assets" ]]; then
-  echo "ERROR: $SITE is missing index.html or assets/ — run without SKIP_BUILD." >&2
+if [[ ! -f "$SPA/index.html" || ! -d "$SPA/assets" ]]; then
+  echo "ERROR: $SPA is missing index.html or assets/ — run without SKIP_BUILD." >&2
   exit 1
 fi
 
+# The SPA lives in static_export/frontend/ locally, but its contents are uploaded to
+# the bucket ROOT so index.html is served at /. assets/ is content-hashed and SPA-only,
+# so --delete is safe there; index.html + favicons use cp (no --delete) to leave the
+# sibling data files (./deploy_static.sh) untouched.
 echo "==> Sync s3://$BUCKET/assets/ (immutable, 1yr cache)"
-aws s3 sync "$SITE/assets" "s3://$BUCKET/assets" \
+aws s3 sync "$SPA/assets" "s3://$BUCKET/assets" \
   --region "$AWS_REGION" \
   --delete \
   --cache-control "public, max-age=31536000, immutable"
 
 echo "==> Upload index.html (no-cache)"
-aws s3 cp "$SITE/index.html" "s3://$BUCKET/index.html" \
+aws s3 cp "$SPA/index.html" "s3://$BUCKET/index.html" \
   --region "$AWS_REGION" \
   --cache-control "no-cache, must-revalidate" \
   --content-type "text/html; charset=utf-8"
 
-for f in favicon.svg favicon.ico export_manifest.json; do
-  if [[ -f "$SITE/$f" ]]; then
+for f in favicon.svg favicon.ico; do
+  if [[ -f "$SPA/$f" ]]; then
     echo "==> Upload $f"
-    aws s3 cp "$SITE/$f" "s3://$BUCKET/$f" \
+    aws s3 cp "$SPA/$f" "s3://$BUCKET/$f" \
       --region "$AWS_REGION" \
       --cache-control "public, max-age=86400"
   fi
@@ -92,7 +97,7 @@ if [[ -z "${SKIP_INVALIDATE:-}" ]]; then
   echo "==> CloudFront invalidation ($DISTRIBUTION_ID)"
   aws cloudfront create-invalidation \
     --distribution-id "$DISTRIBUTION_ID" \
-    --paths "/index.html" "/favicon.svg" "/favicon.ico" "/export_manifest.json" "/" \
+    --paths "/" "/index.html" "/favicon.svg" "/favicon.ico" \
     --query 'Invalidation.{Id:Id,Status:Status}' --output table
 else
   echo "==> SKIP_INVALIDATE set — not invalidating CloudFront"

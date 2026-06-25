@@ -1,5 +1,6 @@
 # ModelAccuracy API + static_export (disk-backed stats, same as local dev).
-# Build after: python export_static.py --data (or full export_static.py), or ./deploy_fargate.sh.
+# Build after: python export_static.py --image (or full export_static.py), or ./deploy_fargate.sh.
+# Docker COPY below is read-only — all files are produced by export_static.py into static_export/.
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -13,17 +14,17 @@ COPY model_registry.py stats_grid_metadata.py ./
 COPY backend ./backend
 COPY statistics_plugins ./statistics_plugins
 # Only bake in what the backend reads from disk:
-#   data/                        — store_from_env → LocalStaticStore (stats + grid.json)
-#   static/admin/boundaries.json — backend/admin_boundaries.py reads at first use
-#   static/wbd/chunks/             — backend/wbd_boundaries.py lazy-loads at first use
+#   model_data/                  — store_from_env → LocalStaticStore (stats + grid.json)
+#   admin/boundaries.json        — backend/admin_boundaries.py reads at first use
+#   wbd/chunks/                  — backend/wbd_boundaries.py lazy-loads at first use
 # Everything else under static_export/ is browser-served from S3 (via CloudFront)
 # or backend-read from S3 (forecast/); see deploy_static.sh.
-COPY static_export/data ./static_export/data
-COPY static_export/static/admin/boundaries.json ./static_export/static/admin/boundaries.json
-COPY static_export/static/wbd/chunks ./static_export/static/wbd/chunks
+COPY static_export/model_data ./static_export/model_data
+COPY static_export/admin/boundaries.json ./static_export/admin/boundaries.json
+COPY static_export/wbd/chunks ./static_export/wbd/chunks
 
 # Keep in sync with verify_static_export() in deploy_fargate.sh
-RUN python3 -c "import pathlib,sys; r=pathlib.Path('static_export/data'); (r.is_dir() or (print('ERROR: static_export/data missing',file=sys.stderr), sys.exit(1))); (any((p/'grid.json').is_file() for p in r.iterdir() if p.is_dir()) or (print('ERROR: need static_export/data/<model>/grid.json',file=sys.stderr), sys.exit(1))); (pathlib.Path('static_export/static/admin/boundaries.json').is_file() or (print('ERROR: static_export/static/admin/boundaries.json missing — run scripts/fetch_admin_boundaries.py',file=sys.stderr), sys.exit(1))); (pathlib.Path('static_export/static/wbd/chunks/2/_root.json').is_file() or (print('ERROR: static_export/static/wbd/chunks missing — run scripts/fetch_wbd_boundaries.py',file=sys.stderr), sys.exit(1)))"
+RUN python3 -c "import pathlib,sys; r=pathlib.Path('static_export/model_data'); (r.is_dir() or (print('ERROR: static_export/model_data missing',file=sys.stderr), sys.exit(1))); (any((p/'grid.json').is_file() for p in r.iterdir() if p.is_dir()) or (print('ERROR: need static_export/model_data/<model>/grid.json',file=sys.stderr), sys.exit(1))); (pathlib.Path('static_export/admin/boundaries.json').is_file() or (print('ERROR: static_export/admin/boundaries.json missing — run export_static.py --image',file=sys.stderr), sys.exit(1))); (pathlib.Path('static_export/wbd/chunks/2/_root.json').is_file() or (print('ERROR: static_export/wbd/chunks missing — run export_static.py --image',file=sys.stderr), sys.exit(1)))"
 
 # Non-secret runtime config baked from build args (sourced from .env by deploy_fargate.sh).
 # Build fails if any are missing. ECS task-def env vars still override these at runtime.

@@ -23,23 +23,23 @@ _data_exists_cache: dict[str, bool] = {}
 
 
 def _data_exists(store: StaticStore) -> bool:
-    """Cache the ``exists("data")`` probe -- only positive results are cached so a
+    """Cache the ``exists("model_data")`` probe -- only positive results are cached so a
     newly-populated S3 prefix is picked up without restarting the Lambda."""
     if _data_exists_cache.get(store.cache_key):
         return True
-    result = store.exists("data")
+    result = store.exists("model_data")
     if result:
         _data_exists_cache[store.cache_key] = True
     return result
 
 
 def _stats_data_missing_message(store: StaticStore) -> str:
-    base = "static_export/data is missing. Run export_static.py before serving the app."
+    base = "static_export/model_data is missing. Run export_static.py before serving the app."
     if store.cache_key.startswith("s3://"):
         return (
             f"No stats data found under {store.cache_key}. "
-            "DATA_S3_URI must point at the stats root in S3 (same layout as static_export/data/: "
-            "<model>/grid.json, no data/ segment in keys). Check the URI, object keys, and Lambda IAM "
+            "DATA_S3_URI must point at the stats root in S3 (same layout as static_export/model_data/: "
+            "<model>/grid.json, no model_data/ segment in keys). Check the URI, object keys, and Lambda IAM "
             "(s3:GetObject, s3:ListBucket)."
         )
     return base

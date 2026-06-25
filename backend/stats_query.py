@@ -30,23 +30,8 @@ _huc_mask_cache: dict[tuple[int, int, str], np.ndarray] = {}
 # redeploying the container.  TTL caches ensure new data is picked up.
 _FORECAST_TTL = 300
 _forecast_bin_cache: dict[tuple, tuple[np.ndarray, float]] = {}
-_forecast_calendar_cache: dict[str, tuple[dict | None, float]] = {}
-
-
-def _read_forecast_calendar(store: StaticStore) -> dict | None:
-    key = store.cache_key
-    cached = _forecast_calendar_cache.get(key)
-    if cached is not None:
-        val, ts = cached
-        if time.monotonic() - ts < _FORECAST_TTL:
-            return val
-    try:
-        raw = store.read_text("forecast_calendar.json")
-        cal = json.loads(raw)
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        cal = None
-    _forecast_calendar_cache[key] = (cal, time.monotonic())
-    return cal
+# forecast_calendar.json is no longer read by the backend — the SPA fetches it
+# directly from the static asset (/stats/forecast/forecast_calendar.json).
 
 
 def _get_forecast_bin(store: StaticStore, model: str, lead_key: str) -> np.ndarray:
@@ -79,7 +64,7 @@ def _data_bin_relative_path(
     month: str | None = None,
     season: str | None = None,
 ) -> Path:
-    path = Path("data") / model / stat_name
+    path = Path("model_data") / model / stat_name
     if period == "monthly" and month is not None:
         path = path / "monthly" / month
     elif period == "seasonal" and season is not None:
@@ -92,7 +77,7 @@ def _get_grid(store: StaticStore, model: str) -> tuple[np.ndarray, np.ndarray, i
     cached = _grid_cache.get(key)
     if cached is not None:
         return cached
-    relative_path = str(Path("data") / model / "grid.json")
+    relative_path = str(Path("model_data") / model / "grid.json")
     grid_text = store.read_text(relative_path)
     payload = json.loads(grid_text)
     lats = np.asarray(payload["lats"], dtype=np.float64)
@@ -736,10 +721,10 @@ def forecast_all_models(
 ) -> dict[str, object]:
     """Forecast values for all models × all leads for a region (yearly only).
 
-    *store* provides grids (``data/{model}/grid.json``).  *forecast_store* is
-    the separate forecast tree (``{model}/lead_{n}.bin``,
-    ``forecast_calendar.json``) that can be updated on S3 daily without
-    redeploying the container.
+    *store* provides grids (``model_data/{model}/grid.json``).  *forecast_store* is
+    the separate forecast tree (``{model}/lead_{n}.bin``) that can be updated on S3
+    daily without redeploying the container.  ``forecast_calendar.json`` is fetched
+    by the SPA directly from the static asset, not echoed here.
     """
     model_order = tuple(sorted(MODEL_REGISTRY.keys()))
     units = STATISTICS_BY_NAME["forecast"].spec.units
@@ -809,11 +794,10 @@ def forecast_all_models(
 
         models_out[mk] = {"leads": leads_out}
 
-    forecast_calendar = _read_forecast_calendar(forecast_store)
-    result: dict[str, object] = {"models": models_out}
-    if forecast_calendar is not None:
-        result["forecast_calendar"] = forecast_calendar
-    return result
+    # forecast_calendar.json is intentionally NOT included here: the SPA fetches it
+    # directly from the static asset (/stats/forecast/forecast_calendar.json) so init
+    # dates stay current with new forecast exports without the backend echoing them.
+    return {"models": models_out}
 
 
 def stats_for_region_all_leads(

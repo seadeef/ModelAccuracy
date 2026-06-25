@@ -3,7 +3,7 @@
   import maplibregl from 'maplibre-gl';
   import 'maplibre-gl/dist/maplibre-gl.css';
   import { appConfig, ui, accuracyStatKeys } from '../state.svelte.js';
-  import { FALLBACK_STYLE_URL, TILE_IMAGE_BOUNDS_WGS84 } from '../constants.js';
+  import { FALLBACK_STYLE_URL, TILE_IMAGE_BOUNDS_WGS84, STATIC_BASE } from '../constants.js';
   import { fetchConfig } from '../api.js';
   import {
     tileUrl, preloadLeads, clearLeadImages, getLeadImage,
@@ -277,16 +277,26 @@
   /** Drill state while watershed tool is active (before finalize). */
   let wbdPending = $state(null);
   let wbdIndex = null;
-  let wbdGeoCache = null;
+  let wbdGeoCache = null;       // accumulated FeatureCollection of every shown level
   let wbdGeoLevel = null;
+  /**
+   * Every HUC feature shown so far this drill, keyed by huc id. Drilling *adds*
+   * the clicked region's children rather than replacing the layer, so coarse
+   * boundaries (e.g. all HUC2s) stay on-screen alongside the deepened region.
+   */
+  let wbdAccum = new Map();
 
   const boundaryHover = createBoundaryHoverHandlers(() => map, {
     sourceId: boundarySourceId,
     hoveredIdRef: boundaryHoveredRef,
+    // While drilling, overlapping levels mean the topmost hit may be the coarse
+    // parent; highlight the deepest region so hover matches what a click selects.
+    pickFeature: (features) =>
+      boundaryModeLoaded === 'watershed-drill' ? deepestHucFeature(features) : features?.[0],
   });
 
   function adminTopoUrl(level) {
-    return `/static/admin/${level === 'county' ? 'counties' : 'states'}.topojson`;
+    return `${STATIC_BASE}/admin/${level === 'county' ? 'counties' : 'states'}.topojson`;
   }
 
   /**
@@ -405,6 +415,7 @@
     ui.wbdDrillPath = [];
     wbdGeoCache = null;
     wbdGeoLevel = null;
+    wbdAccum = new Map();
   }
 
   function finalizeWbd(pending) {
@@ -451,11 +462,21 @@
     wbdLoadAbort = new AbortController();
     const signal = wbdLoadAbort.signal;
     try {
-      const fc = await fcLoader();
+      const fc = await fcLoader(signal);
       if (signal.aborted || !map || ui.activeTool !== 'watershed' || ui.selectedRegion) return;
       wbdGeoLevel = { huc, level };
-      await setupWbdDrillLayer(fc);
-      if (Array.isArray(fc?.features?.[0]?.geometry?.coordinates)) {
+      // Merge the freshly loaded level into the accumulator and render the union,
+      // so prior levels' boundaries persist beneath the newly revealed children.
+      for (const feat of fc.features ?? []) {
+        if (feat?.id != null) wbdAccum.set(feat.id, feat);
+      }
+      const combined = { type: 'FeatureCollection', features: [...wbdAccum.values()] };
+      await setupWbdDrillLayer(combined);
+      // Only reposition when drilling into a specific parent (subsequent clicks).
+      // The initial HUC2 load (`huc === ''`) spans Alaska, Hawaii, the Caribbean
+      // and the Pacific territories, so fitting its union flings the camera out
+      // across the whole Pacific — leave the camera where the user already is.
+      if (huc && Array.isArray(fc?.features?.[0]?.geometry?.coordinates)) {
         const bounds = fc.features.reduce((acc, f) => {
           const b = geomBboxFromRegion(f.geometry);
           if (!acc) return b;
@@ -485,17 +506,31 @@
     await loadWbdLevel('', 2, loadHuc2Geo);
   }
 
+  // Levels overlap now that boundaries accumulate, so a point inside an
+  // already-drilled region hits both the coarse parent and its finer child.
+  // Prefer the deepest (longest huc) feature under the cursor.
+  function deepestHucFeature(features) {
+    return (features ?? []).reduce((best, cur) => {
+      const len = String(cur?.properties?.huc ?? cur?.id ?? '').length;
+      const bestLen = best ? String(best.properties?.huc ?? best.id ?? '').length : -1;
+      return len > bestLen ? cur : best;
+    }, null);
+  }
+
   async function handleWbdClick(e) {
-    const f = e.features?.[0];
+    const f = deepestHucFeature(e.features);
     if (!f) return;
     const pending = buildPendingFromFeature(f, wbdGeoCache);
     if (!pending.huc) return;
     wbdPending = pending;
     ui.wbdDrillPath = [...ui.wbdDrillPath, pending.name || pending.huc];
+    // The user has engaged the watershed tool — drop the center guide hint
+    // (matches the state/county tools, which clear it on their first click).
+    ui.hasUsedAreaDrawTool = true;
     const index = await ensureWbdIndex();
     if (hasChildren(index, pending.huc)) {
       const childLevel = nextHucLevel(pending.level);
-      await loadWbdLevel(pending.huc, childLevel, () => loadHucChildren(pending.huc, childLevel));
+      await loadWbdLevel(pending.huc, childLevel, (signal) => loadHucChildren(pending.huc, childLevel, signal));
     } else {
       finalizeWbd(pending);
     }
@@ -676,9 +711,22 @@
     };
   }
 
+  /**
+   * Region the dim mask should cut a hole for: the finalized selection, or —
+   * while drilling the watershed tool — the region whose children are currently
+   * shown, so the rest of the map dims as the user drills deeper.
+   */
+  function activeDimRegion() {
+    if (ui.selectedRegion) return ui.selectedRegion;
+    if (ui.activeTool === 'watershed' && wbdPending?.geometry) {
+      return { ...wbdPending, type: 'huc' };
+    }
+    return null;
+  }
+
   function updateDimMask() {
     if (!map?.getSource(dimSourceId)) return;
-    map.getSource(dimSourceId).setData(dimMaskGeoJson(ui.selectedRegion));
+    map.getSource(dimSourceId).setData(dimMaskGeoJson(activeDimRegion()));
   }
 
   const DEFAULT_LINE_WIDTH = 2;
@@ -1045,9 +1093,12 @@
     }
   });
 
-  // Dim outside selection; pulse the pin only when the saved region is a point
+  // Dim outside selection; pulse the pin only when the saved region is a point.
+  // Read both reactive deps up front: `wbdPending` so the dim follows each drill
+  // click, before the `!map` bail-out (else the dep isn't tracked on first run).
   $effect(() => {
     const region = ui.selectedRegion;
+    const _pending = wbdPending;
     if (!map?.getSource(dimSourceId)) return;
     updateDimMask();
     if (region?.type === 'point') startPinPulse();
@@ -1153,7 +1204,8 @@
      */
     function refreshDimOnViewChange() {
       const r = ui.selectedRegion;
-      if (r && (r.type === 'rectangle' || r.type === 'polygon' || r.type === 'admin' || r.type === 'huc')) {
+      if ((r && (r.type === 'rectangle' || r.type === 'polygon' || r.type === 'admin' || r.type === 'huc'))
+          || (ui.activeTool === 'watershed' && wbdPending)) {
         updateDimMask();
       }
     }

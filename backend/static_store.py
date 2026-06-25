@@ -9,7 +9,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 def default_static_site_root() -> Path:
-    """``static_export``: site root; ``data/*`` is read for static stats (URL ``/data``)."""
+    """``static_export``: site root; ``model_data/*`` is read for static stats (URL ``/model_data``)."""
     return _PROJECT_ROOT / "static_export"
 
 try:
@@ -111,7 +111,7 @@ class S3StaticStore:
 
 
 class LogicalPathStripDataStore:
-    """Maps app paths ``data/...`` to object keys ``...`` under the S3 prefix (``<model>/grid.json``, etc.)."""
+    """Maps app paths ``model_data/...`` to object keys ``...`` under the S3 prefix (``<model>/grid.json``, etc.)."""
 
     def __init__(self, inner: StaticStore):
         self._inner = inner
@@ -121,10 +121,10 @@ class LogicalPathStripDataStore:
     @staticmethod
     def _mapped(relative_path: str) -> str:
         p = relative_path.lstrip("/")
-        if p == "data":
+        if p == "model_data":
             return ""
-        if p.startswith("data/"):
-            return p[5:].lstrip("/")
+        if p.startswith("model_data/"):
+            return p[len("model_data/"):].lstrip("/")
         return p
 
     def read_text(self, relative_path: str) -> str:
@@ -138,7 +138,7 @@ class LogicalPathStripDataStore:
 
 
 def _s3_stats_store(bucket: str, prefix: str = "") -> StaticStore:
-    """S3 layout matches ``static_export/data/`` *contents* (``<model>/…``), not a ``data/`` prefix in the bucket."""
+    """S3 layout matches ``static_export/model_data/`` *contents* (``<model>/…``), not a ``model_data/`` prefix in the bucket."""
     return LogicalPathStripDataStore(S3StaticStore(bucket=bucket, prefix=prefix))
 
 
@@ -186,7 +186,7 @@ def _lambda_s3_store_or_raise() -> StaticStore:
     raise RuntimeError(
         "Lambda is configured to read stats only from S3. Set DATA_S3_URI to "
         "s3://bucket/prefix where that prefix holds the exported stats tree (same layout as "
-        "static_export/data/: <model>/grid.json and .bin paths)."
+        "static_export/model_data/: <model>/grid.json and .bin paths)."
     )
 
 
@@ -209,22 +209,21 @@ def static_site_store_from_env(
     *,
     default_local_root: Path | None = None,
 ) -> StaticStore:
-    """Return a store for browser-static assets (``static/`` subtree).
+    """Return a store for browser-static assets (the flat ``static_export`` tree).
 
-    Local dev reads ``static_export/static/``.  Production reads from the same
-    S3 bucket as ``DATA_S3_URI`` at the ``static/`` prefix (matches
-    ``deploy_static.sh --static``).
+    Local dev reads ``static_export/``.  Production reads from the same
+    S3 bucket as ``DATA_S3_URI`` at the bucket root, where ``deploy_static.sh``
+    uploads the data files (served from the site root).
     """
     if not _force_local_static():
         stats_loc = _stats_s3_bucket_and_prefix()
         if stats_loc is not None:
             bucket, stats_prefix = stats_loc
             parent = stats_prefix.rsplit("/", 1)[0] if "/" in stats_prefix else ""
-            static_prefix = f"{parent}/static" if parent else "static"
-            return S3StaticStore(bucket=bucket, prefix=static_prefix)
+            return S3StaticStore(bucket=bucket, prefix=parent)
 
     root = default_local_root or default_static_site_root()
-    return LocalStaticStore(root / "static")
+    return LocalStaticStore(root)
 
 
 def forecast_store_from_env(

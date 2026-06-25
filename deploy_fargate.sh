@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the API Docker image (export_static.py --data → verify → build) and push to Amazon ECR.
+# Build the API Docker image (export_static.py --image → verify → build) and push to Amazon ECR.
 #
 # Prerequisites: Docker, AWS CLI v2, Python 3 (for export_static.py), credentials with ECR push.
 #
@@ -10,7 +10,7 @@
 #   LOCAL_IMAGE      default modelaccuracy-api:build  (local name before tag to ECR)
 #   DOCKER_PLATFORM  default linux/amd64 (Fargate x86). Use linux/arm64 for Graviton Fargate
 #                    or faster local builds on Apple Silicon when SKIP_PUSH=1.
-#   SKIP_EXPORT=1    skip python3 export_static.py --data (use existing static_export/data/)
+#   SKIP_EXPORT=1    skip python3 export_static.py --image (use existing static_export/)
 #   SKIP_PUSH=1      build only; do not login/push to ECR
 #   ECR_PUSH_LATEST=1   also tag and push :latest (in addition to IMAGE_TAG), same as --tag-latest
 #   ECS_FORCE_REDEPLOY=1  after push (or alone with SKIP_PUSH), run ECS force-new-deployment; same as --force-redeploy
@@ -116,12 +116,12 @@ ecs_service_resolved() {
   else printf ''; fi
 }
 
-# Set when FORCE_ECS_REDEPLOY; collected immediately before export_static.py --data (see below).
+# Set when FORCE_ECS_REDEPLOY; collected immediately before export_static.py --image (see below).
 ECS_CLUSTER_VAL=""
 ECS_SERVICE_VAL=""
 
 verify_static_export() {
-  local DATA="$ROOT/static_export/data"
+  local DATA="$ROOT/static_export/model_data"
   if [[ ! -d "$DATA" ]]; then
     echo "ERROR: $DATA is not a directory. Run export_static.py first (or unset SKIP_EXPORT)." >&2
     exit 1
@@ -139,17 +139,17 @@ verify_static_export() {
     echo "ERROR: no */grid.json under $DATA (need at least one model export)." >&2
     exit 1
   fi
-  local BOUNDARIES="$ROOT/static_export/static/admin/boundaries.json"
+  local BOUNDARIES="$ROOT/static_export/admin/boundaries.json"
   if [[ ! -f "$BOUNDARIES" ]]; then
-    echo "ERROR: $BOUNDARIES missing — run scripts/fetch_admin_boundaries.py." >&2
+    echo "ERROR: $BOUNDARIES missing — run export_static.py --image." >&2
     exit 1
   fi
-  local WBD_CHUNKS="$ROOT/static_export/static/wbd/chunks/2/_root.json"
+  local WBD_CHUNKS="$ROOT/static_export/wbd/chunks/2/_root.json"
   if [[ ! -f "$WBD_CHUNKS" ]]; then
-    echo "ERROR: $WBD_CHUNKS missing — run scripts/fetch_wbd_boundaries.py." >&2
+    echo "ERROR: $WBD_CHUNKS missing — run export_static.py --image (after load_boundaries.py --wbd or --wbd-sample)." >&2
     exit 1
   fi
-  echo "OK: static_export/data contains grid.json; admin/boundaries.json and wbd/chunks present"
+  echo "OK: static_export/model_data contains grid.json; admin/boundaries.json and wbd/chunks present"
 }
 
 collect_ecs_targets_for_redeploy() {
@@ -184,13 +184,13 @@ collect_ecs_targets_for_redeploy() {
 collect_ecs_targets_for_redeploy
 
 if [[ -z "${SKIP_EXPORT:-}" ]]; then
-  echo "==> export_static.py --data"
-  python3 export_static.py --data
+  echo "==> export_static.py --image"
+  python3 export_static.py --image
 else
-  echo "==> SKIP_EXPORT set — using existing static_export/data/"
+  echo "==> SKIP_EXPORT set — using existing static_export/"
 fi
 
-echo "==> verify static_export/data"
+echo "==> verify static_export (Docker image inputs)"
 verify_static_export
 
 echo "==> docker build --platform ${DOCKER_PLATFORM} -t ${LOCAL_IMAGE}"

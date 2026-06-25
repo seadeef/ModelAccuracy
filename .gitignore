@@ -18,6 +18,8 @@ archive/
 
 # Data and outputs (large or generated)
 model_data/
+boundary_data/
+.cache/
 prism_data/
 stats_output/
 tiles_output/

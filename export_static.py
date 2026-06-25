@@ -4,9 +4,12 @@
 Reads from stats_output/ and tiles_output/, writes to static_export/:
 
     static_export/                 ← upload this folder as the site root (S3, etc.)
-        index.html
-        assets/
-        data/                      ← URL prefix /data (grid, verification .bin only)
+        config.json                ← the only regular file at the root
+        frontend/                  ← bundled Vite SPA; its CONTENTS serve at the site root
+            index.html             ← served at /
+            assets/                ← served at /assets/
+            favicon.svg / favicon.ico
+        model_data/                ← grid + verification .bin (baked into the API image)
             {model}/
                 grid.json
                 {stat}/…           (bias, rmse, … — NOT forecast)
@@ -16,33 +19,58 @@ Reads from stats_output/ and tiles_output/, writes to static_export/:
                 lead_1.bin
                 lead_2.bin
                 …
-        static/                    ← URL prefix /static (config, zip, tiles, ranges)
-            config.json
-            zip/
-                95124.json
-            tiles/
-                {model}/{stat}/lead_1.png
-                ...
-            ranges/
-                {model}/{stat}/yearly.json
-                {model}/{stat}/monthly/{MM}.json
-                {model}/{stat}/seasonal/{djf|…}.json
+        zip/                       ← config + these dirs serve from the site root (e.g. /zip/…)
+            95124.json
+        tiles/
+            {model}/{stat}/lead_1.png
+            ...
+        ranges/
+            {model}/{stat}/yearly.json
+            {model}/{stat}/monthly/{MM}.json
+            {model}/{stat}/seasonal/{djf|…}.json
+        admin/
+            boundaries.json
+            states.topojson
+            counties.topojson
+        wbd/
+            chunks/ …
+            children/ …
+            index.json
+            huc2.topojson
+
+URL scheme: every browser-fetched data file is served from the site root mirroring
+this layout (e.g. ``/config.json``, ``/wbd/index.json``, ``/model_data/…``); the SPA
+(``frontend/`` contents) is served from the root too (``/`` → ``index.html``).
+
+Boundary source data lives in ``boundary_data/`` (data only), populated by
+``load_boundaries.py``. ``export_static.py`` reads it and writes
+``static_export/`` (the deploy input tree).
 
 Build modes (at most one; omit all for a full export):
 
-* ``--static`` — only ``static_export/static/`` (config.json, zip JSON, tile PNGs, ranges).
-* ``--data`` — only ``static_export/data/`` (``.bin`` layers, ``grid.json``).
-* ``--forecast`` — only forecast layers + ``forecast_calendar.json`` under
-  ``static_export/forecast/``.  Designed for the daily update workflow: run
-  ``download.py --forecast``, then ``export_static.py --forecast``, then sync
-  ``static_export/forecast/`` to the ``forecast/`` prefix of the stats S3 bucket
-  (same bucket as ``DATA_S3_URI``).  The running container picks
-  up new data within ~5 minutes.
-* ``--frontend`` — only site-root Vite output (``index.html``, ``assets/``); refreshes
-  ``export_manifest.json``. Removes prior SPA artifacts first.
+* ``--image`` — Docker image inputs: admin/HUC polygon exports + ``model_data/`` (``.bin`` + ``grid.json``).
+* ``--static`` — S3/CloudFront assets: ``zip/``, admin/HUC TopoJSON, ``config.json``,
+  ``tiles/``, ``ranges/``, and ``forecast/`` (bins + ``forecast_calendar.json``).
+* ``--data`` — only ``static_export/model_data/``.
+* ``--forecast`` — only ``static_export/forecast/``.
+* ``--frontend`` — only the bundled Vite SPA under ``static_export/frontend/``.
+
+Boundary export flags (combinable with each other; not with build modes above):
+
+* ``--zip`` — ``zip/{code}.json`` from ``boundary_data/zip/zip_lookup.csv``.
+* ``--admin`` — ``boundaries.json`` + ``states.topojson`` + ``counties.topojson``.
+* ``--huc`` — WBD map assets (``huc2.topojson``, ``children/``, ``index.json``) + ``chunks/``.
+
+WBD export depth is capped by ``--max-huc-level`` (default 12) to bound image size /
+S3 object count; ``boundary_data/`` keeps the full HU16 source for re-export.
+
+Load boundaries first when ``boundary_data/`` is empty::
+
+    python load_boundaries.py            # zip + admin + wbd
+    python load_boundaries.py --wbd-sample   # synthetic WBD layers for local dev
 
 ``--clean`` deletes the entire output directory first; only allowed for a **full**
-export (no ``--static`` / ``--data`` / ``--forecast`` / ``--frontend``).
+export (no ``--static`` / ``--image`` / ``--data`` / ``--forecast`` / ``--frontend``).
 
 The .bin files are raw float32 arrays (row-major, height × width).
 
@@ -58,11 +86,26 @@ import json
 import os
 import shutil
 import subprocess
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 from dotenv import load_dotenv
 
+from boundary_paths import (
+    ADMIN_COUNTIES_TOPOJSON,
+    ADMIN_SOURCE_LABEL,
+    ADMIN_STATES_TOPOJSON,
+    WBD_LAYERS_DIR,
+    WBD_SOURCE_LABEL,
+    ZIP_LOOKUP_CSV,
+)
+from wbd_core import DEFAULT_MAX_HUC_LEVEL
+from wbd_core import HU_LEVELS as WBD_HU_LEVELS
+from wbd_core import in_branch as _wbd_in_branch
+from wbd_core import layer_cache_path as _wbd_layer_cache_path
+from wbd_core import parent_huc as _wbd_parent_huc
+from wbd_core import polygons_bbox as _polygons_bbox
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from stats_grid_metadata import load_model_metadata
 from statistics_plugins.registry import (
@@ -77,10 +120,16 @@ STATS_ROOT = _PROJECT_ROOT / "stats_output"
 TILES_ROOT = _PROJECT_ROOT / "tiles_output"
 EXPORT_ROOT = _PROJECT_ROOT / "static_export"
 FRONTEND_ROOT = _PROJECT_ROOT / "frontend"
-# Served at /static (config, zip, tiles). ``data/`` is top-level → /data.
-STATIC_ASSETS_DIR_NAME = "static"
-DATA_DIR_NAME = "data"
+# Flat layout: config.json, zip/, admin/, wbd/, tiles/, ranges/ live at the
+# site root and are served from the URL root. Model verification data is
+# ``model_data/``; the built SPA is bundled under ``frontend/`` and its contents
+# are served from the site root too (``/`` → index.html).
+DATA_DIR_NAME = "model_data"
 FORECAST_DIR_NAME = "forecast"
+FRONTEND_DIR_NAME = "frontend"
+# Served WBD depth (chunks baked into the image + map assets on S3). Default comes
+# from wbd_core.DEFAULT_MAX_HUC_LEVEL — the one knob shared with the loader.
+# Override per-run with --max-huc-level.
 
 
 def _write_text_if_changed(path: Path, content: str) -> bool:
@@ -97,6 +146,7 @@ def _write_text_if_changed(path: Path, content: str) -> bool:
             return False
     except (FileNotFoundError, UnicodeDecodeError):
         pass
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
     return True
 
@@ -112,12 +162,19 @@ def _write_bytes_if_changed(path: Path, content: bytes) -> bool:
             return False
     except FileNotFoundError:
         pass
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return True
 
 
 def _get_forecast_init_date(model_key: str) -> str | None:
-    meta_path = STATS_ROOT / model_key / "forecast" / "metadata.npz"
+    # Read the init date from the same source the bins come from (multi-variable
+    # forecast/{precip}/metadata.npz when present, else legacy flat metadata.npz),
+    # so the calendar can't drift from the exported forecast values.
+    src_dir, _ = _forecast_source(model_key)
+    meta_path = src_dir / "metadata.npz"
+    if not meta_path.exists():
+        meta_path = STATS_ROOT / model_key / "forecast" / "metadata.npz"
     if not meta_path.exists():
         return None
     try:
@@ -125,6 +182,419 @@ def _get_forecast_init_date(model_key: str) -> str | None:
         return str(meta["init_date"])
     except Exception:
         return None
+
+
+def _resolve_zip_lookup_csv() -> Path:
+    if not ZIP_LOOKUP_CSV.is_file():
+        raise FileNotFoundError(
+            "zip lookup missing — run python load_boundaries.py --zip"
+        )
+    return ZIP_LOOKUP_CSV
+
+
+def export_zip_directory(export_dir: Path) -> None:
+    """Write ``static/zip/{code}.json`` lookup files (frontend reads these, not the CSV)."""
+    csv_path = _resolve_zip_lookup_csv()
+    zip_dir = export_dir / "zip"
+    zip_dir.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            z = row.get("zip", "").strip()
+            if len(z) < 5:
+                continue
+            code = z[:5]
+            payload = {
+                "lat": round(float(row["lat"]), 6),
+                "lon": round(float(row["lon"]), 6),
+                "bounds": [
+                    round(float(row["min_lon"]), 6),
+                    round(float(row["min_lat"]), 6),
+                    round(float(row["max_lon"]), 6),
+                    round(float(row["max_lat"]), 6),
+                ],
+            }
+            _write_text_if_changed(zip_dir / f"{code}.json", json.dumps(payload))
+            count += 1
+    total_bytes = sum(p.stat().st_size for p in zip_dir.glob("*.json"))
+    print(f"  {zip_dir}/ ({count} files, {total_bytes / (1024 * 1024):.1f} MB)")
+
+
+def _admin_decode_arcs(topology: dict) -> list[list[list[float]]]:
+    transform = topology.get("transform")
+    raw_arcs = topology["arcs"]
+    if transform is None:
+        return [[list(map(float, p)) for p in arc] for arc in raw_arcs]
+    sx, sy = transform["scale"]
+    tx, ty = transform["translate"]
+    decoded: list[list[list[float]]] = []
+    for arc in raw_arcs:
+        out: list[list[float]] = []
+        x = 0
+        y = 0
+        for dx, dy in arc:
+            x += dx
+            y += dy
+            out.append([x * sx + tx, y * sy + ty])
+        decoded.append(out)
+    return decoded
+
+
+def _admin_stitch_ring(arc_indices: list[int], arcs: list[list[list[float]]]) -> list[list[float]]:
+    ring: list[list[float]] = []
+    for n, idx in enumerate(arc_indices):
+        arc = list(reversed(arcs[~idx])) if idx < 0 else arcs[idx]
+        ring.extend(arc if n == 0 else arc[1:])
+    return ring
+
+
+def _admin_geometry_to_polygons(geom: dict, arcs: list[list[list[float]]]) -> list[list[list[list[float]]]]:
+    gtype = geom.get("type")
+    if gtype == "Polygon":
+        return [[_admin_stitch_ring(ring_arcs, arcs) for ring_arcs in geom["arcs"]]]
+    if gtype == "MultiPolygon":
+        return [
+            [_admin_stitch_ring(ring_arcs, arcs) for ring_arcs in poly_arcs]
+            for poly_arcs in geom["arcs"]
+        ]
+    return []
+
+
+def _admin_build_boundaries(topology: dict, object_name: str) -> dict[str, dict]:
+    arcs = _admin_decode_arcs(topology)
+    collection = topology["objects"][object_name]
+    boundaries: dict[str, dict] = {}
+    for geom in collection.get("geometries", []):
+        fips = str(geom.get("id") or "").strip()
+        if not fips:
+            continue
+        name = (geom.get("properties") or {}).get("name") or ""
+        polygons = _admin_geometry_to_polygons(geom, arcs)
+        if not polygons:
+            continue
+        boundaries[fips] = {"name": name, "bbox": _polygons_bbox(polygons), "polygons": polygons}
+    return boundaries
+
+
+def _admin_slim_topology(topology: dict, object_name: str) -> dict:
+    keep = topology["objects"][object_name]
+    return {
+        "type": "Topology",
+        "transform": topology.get("transform"),
+        "bbox": topology.get("bbox"),
+        "arcs": topology["arcs"],
+        "objects": {object_name: keep},
+    }
+
+
+def export_admin_boundaries(
+    out_dir: Path,
+    *,
+    write_boundaries_json: bool = True,
+    write_topojson: bool = True,
+) -> None:
+    if not ADMIN_STATES_TOPOJSON.is_file() or not ADMIN_COUNTIES_TOPOJSON.is_file():
+        missing = [p for p in (ADMIN_STATES_TOPOJSON, ADMIN_COUNTIES_TOPOJSON) if not p.is_file()]
+        raise FileNotFoundError(
+            "admin boundaries missing — run python load_boundaries.py --admin "
+            f"({', '.join(str(p) for p in missing)})"
+        )
+    states_topo = json.loads(ADMIN_STATES_TOPOJSON.read_text(encoding="utf-8"))
+    counties_topo = json.loads(ADMIN_COUNTIES_TOPOJSON.read_text(encoding="utf-8"))
+    written: list[Path] = []
+    if write_boundaries_json:
+        boundaries = {
+            "version": 1,
+            "source": ADMIN_SOURCE_LABEL,
+            "states": _admin_build_boundaries(states_topo, "states"),
+            "counties": _admin_build_boundaries(counties_topo, "counties"),
+        }
+        boundaries_path = out_dir / "boundaries.json"
+        _write_text_if_changed(boundaries_path, json.dumps(boundaries, separators=(",", ":")))
+        written.append(boundaries_path)
+    if write_topojson:
+        states_topo_path = out_dir / "states.topojson"
+        counties_topo_path = out_dir / "counties.topojson"
+        _write_text_if_changed(
+            states_topo_path,
+            json.dumps(_admin_slim_topology(states_topo, "states"), separators=(",", ":")),
+        )
+        _write_text_if_changed(
+            counties_topo_path,
+            json.dumps(_admin_slim_topology(counties_topo, "counties"), separators=(",", ":")),
+        )
+        for old in ("states.geojson", "counties.geojson"):
+            p = out_dir / old
+            if p.exists():
+                p.unlink()
+        written.extend((states_topo_path, counties_topo_path))
+    for p in written:
+        print(f"  {p} ({p.stat().st_size:,} bytes)")
+
+
+def _wbd_features_to_topojson(features: list[dict], object_name: str) -> dict:
+    from topojson import Topology
+
+    geojson = {"type": "FeatureCollection", "features": features}
+    topo = Topology(geojson, prequantize=False, presimplify=False)
+    obj = topo.to_dict()
+    objects = obj.get("objects", {})
+    # The topojson library names its single object "data" by default; rename it to
+    # `object_name` so the frontend can look it up as `huc{level}`.
+    keep = objects.get(object_name) or (next(iter(objects.values())) if objects else None)
+    if keep is not None:
+        return {
+            "type": "Topology",
+            "transform": obj.get("transform"),
+            "bbox": obj.get("bbox"),
+            "arcs": obj["arcs"],
+            "objects": {object_name: keep},
+        }
+    return obj
+
+
+def _wbd_load_layer_units(layers_dir: Path, level: int) -> dict[str, dict]:
+    path = _wbd_layer_cache_path(layers_dir, level)
+    if not path.is_file():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return data.get("units") or {}
+
+
+def _prune_stale(root: Path, keep: set[Path], suffix: str) -> int:
+    """Delete ``*suffix`` files under *root* not in *keep*, then drop empty dirs.
+
+    Keeps the served WBD tree matching the current source + ``--max-huc-level``:
+    units removed from the source (or levels excluded by a lowered cap) leave no
+    orphaned chunk/children files to be baked into the image or synced to S3.
+    Files in *keep* are untouched, so ``_write_*_if_changed`` mtimes survive.
+    """
+    if not root.is_dir():
+        return 0
+    removed = 0
+    for p in root.rglob(f"*{suffix}"):
+        if p.resolve() not in keep:
+            p.unlink()
+            removed += 1
+    for d in sorted((d for d in root.rglob("*") if d.is_dir()),
+                    key=lambda x: len(x.parts), reverse=True):
+        try:
+            d.rmdir()  # succeeds only if empty
+        except OSError:
+            pass
+    return removed
+
+
+def export_wbd_boundaries(
+    out_dir: Path,
+    branch: str = "",
+    *,
+    write_chunks: bool = True,
+    write_map_assets: bool = True,
+    max_level: int = DEFAULT_MAX_HUC_LEVEL,
+) -> None:
+    if not WBD_LAYERS_DIR.is_dir():
+        raise FileNotFoundError(
+            "WBD layers missing — run python load_boundaries.py --wbd"
+        )
+    units_by_level: dict[int, dict[str, dict]] = {}
+    available_levels: list[int] = []
+    for level in WBD_HU_LEVELS:
+        if level > max_level:
+            break  # HU_LEVELS is ascending — skip the heavier deep layers entirely
+        units = _wbd_load_layer_units(WBD_LAYERS_DIR, level)
+        if not units:
+            continue
+        if branch:
+            units = {
+                huc: entry
+                for huc, entry in units.items()
+                if level == 2 or _wbd_in_branch(huc, branch)
+            }
+        if not units:
+            continue
+        units_by_level[level] = units
+        available_levels.append(level)
+    if not units_by_level.get(2):
+        raise RuntimeError("no HUC-2 units in layer cache")
+    index: dict[str, dict] = {}
+    child_levels = sorted(lv for lv in available_levels if lv > 2)
+    for level in available_levels:
+        for huc, entry in units_by_level[level].items():
+            next_level = level + 2
+            has_children = False
+            if next_level in available_levels:
+                child_bucket = units_by_level[next_level]
+                has_children = any(_wbd_parent_huc(ch) == huc for ch in child_bucket)
+            index[huc] = {"name": entry["name"], "level": level, "hasChildren": has_children}
+    huc2_features = []
+    for huc, entry in sorted(units_by_level[2].items()):
+        polys = entry["polygons"]
+        if not polys:
+            continue
+        geom = (
+            {"type": "Polygon", "coordinates": polys[0]}
+            if len(polys) == 1
+            else {"type": "MultiPolygon", "coordinates": polys}
+        )
+        huc2_features.append(
+            {
+                "type": "Feature",
+                "id": huc,
+                "properties": {"huc": huc, "name": entry["name"], "level": 2},
+                "geometry": geom,
+            }
+        )
+    huc2_topo = _wbd_features_to_topojson(huc2_features, "huc2")
+    huc2_path = out_dir / "huc2.topojson"
+    if write_map_assets:
+        _write_text_if_changed(huc2_path, json.dumps(huc2_topo, separators=(",", ":")))
+    chunks_dir = out_dir / "chunks"
+    children_dir = out_dir / "children"
+    written_chunks: set[Path] = set()
+    written_children: set[Path] = set()
+    for level in child_levels:
+        parent_level = level - 2
+        by_parent: dict[str, dict[str, dict]] = defaultdict(dict)
+        for huc, entry in units_by_level[level].items():
+            parent = _wbd_parent_huc(huc)
+            if not parent:
+                continue
+            by_parent[parent][huc] = {
+                "name": entry["name"],
+                "bbox": entry["bbox"],
+                "polygons": entry["polygons"],
+            }
+        for parent, units in sorted(by_parent.items()):
+            if branch and not _wbd_in_branch(parent, branch) and parent != branch:
+                if not any(_wbd_in_branch(u, branch) for u in units):
+                    continue
+            if write_chunks:
+                chunk_path = chunks_dir / str(parent_level) / f"{parent}.json"
+                written_chunks.add(chunk_path.resolve())
+                _write_text_if_changed(
+                    chunk_path,
+                    json.dumps({"parent": parent, "level": level, "units": units}, separators=(",", ":")),
+                )
+            if write_map_assets:
+                child_features = []
+                for huc, entry in sorted(units.items()):
+                    polys = entry["polygons"]
+                    geom = (
+                        {"type": "Polygon", "coordinates": polys[0]}
+                        if len(polys) == 1
+                        else {"type": "MultiPolygon", "coordinates": polys}
+                    )
+                    child_features.append(
+                        {
+                            "type": "Feature",
+                            "id": huc,
+                            "properties": {"huc": huc, "name": entry["name"], "level": level},
+                            "geometry": geom,
+                        }
+                    )
+                child_topo = _wbd_features_to_topojson(child_features, f"huc{level}")
+                child_path = children_dir / str(level) / f"{parent}.topojson"
+                written_children.add(child_path.resolve())
+                _write_text_if_changed(
+                    child_path,
+                    json.dumps(child_topo, separators=(",", ":")),
+                )
+    root_units = {
+        huc: {"name": e["name"], "bbox": e["bbox"], "polygons": e["polygons"]}
+        for huc, e in units_by_level[2].items()
+    }
+    if write_chunks:
+        root_path = chunks_dir / "2" / "_root.json"
+        written_chunks.add(root_path.resolve())
+        _write_text_if_changed(
+            root_path,
+            json.dumps({"parent": "", "level": 2, "units": root_units}, separators=(",", ":")),
+        )
+    index_path = out_dir / "index.json"
+    if write_map_assets:
+        _write_text_if_changed(
+            index_path,
+            json.dumps(
+                {
+                    "version": 1,
+                    "source": WBD_SOURCE_LABEL,
+                    "levels": available_levels,
+                    "units": index,
+                },
+                separators=(",", ":"),
+            ),
+        )
+    # Prune stale artifacts so the served tree matches the current source + cap.
+    # Each mode only prunes what it writes (--image → chunks, --static → children).
+    if write_chunks:
+        stale = _prune_stale(chunks_dir, written_chunks, ".json")
+        if stale:
+            print(f"  pruned {stale} stale chunk file(s)")
+    if write_map_assets:
+        stale = _prune_stale(children_dir, written_children, ".topojson")
+        if stale:
+            print(f"  pruned {stale} stale children topojson(s)")
+    if write_map_assets:
+        for p in (index_path, huc2_path):
+            print(f"  {p} ({p.stat().st_size:,} bytes)")
+    if write_chunks:
+        print(f"  {sum(1 for _ in chunks_dir.rglob('*.json'))} chunk files under {chunks_dir}/")
+
+
+def export_boundary_parts(
+    site_root: Path,
+    *,
+    zip: bool = False,
+    admin_topo: bool = False,
+    admin_polys: bool = False,
+    huc_topo: bool = False,
+    huc_polys: bool = False,
+    huc_max_level: int = DEFAULT_MAX_HUC_LEVEL,
+) -> None:
+    """Write selected boundary artifacts at the ``static_export/`` root from cache."""
+    assets_dir = site_root
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    if zip:
+        print("  zip/...")
+        export_zip_directory(assets_dir)
+    if admin_topo or admin_polys:
+        print("  admin/...")
+        export_admin_boundaries(
+            assets_dir / "admin",
+            write_boundaries_json=admin_polys,
+            write_topojson=admin_topo,
+        )
+    if huc_topo or huc_polys:
+        print(f"  wbd/... (≤ HU{huc_max_level})")
+        export_wbd_boundaries(
+            assets_dir / "wbd",
+            write_chunks=huc_polys,
+            write_map_assets=huc_topo,
+            max_level=huc_max_level,
+        )
+
+
+def export_boundaries(site_root: Path, huc_max_level: int = DEFAULT_MAX_HUC_LEVEL) -> None:
+    """All boundary parts (zip, admin topo+polys, HUC topo+polys)."""
+    export_boundary_parts(
+        site_root,
+        zip=True,
+        admin_topo=True,
+        admin_polys=True,
+        huc_topo=True,
+        huc_polys=True,
+        huc_max_level=huc_max_level,
+    )
+
+
+def export_s3_assets(site_root: Path, maptiler_key: str) -> None:
+    """Export S3 core assets: config, tiles, ranges (not zip or boundary TopoJSON)."""
+    assets_dir = site_root
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    export_config(assets_dir, maptiler_key)
+    export_tiles(assets_dir)
+    export_value_ranges(assets_dir)
 
 
 # ── config.json ─────────────────────────────────────────────────────
@@ -159,42 +629,6 @@ def export_config(export_dir: Path, maptiler_key: str) -> None:
     out = export_dir / "config.json"
     _write_text_if_changed(out, json.dumps(config_data, indent=2))
     print(f"  {out}")
-
-
-# ── zip/NNNNN.json (from zip_lookup.csv) ────────────────────────────
-
-def export_zip_directory(export_dir: Path, csv_path: Path) -> None:
-    if not csv_path.exists():
-        print(f"  SKIP: {csv_path} not found")
-        return
-
-    zip_dir = export_dir / "zip"
-    zip_dir.mkdir(parents=True, exist_ok=True)
-
-    count = 0
-    with open(csv_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            z = row.get("zip", "").strip()
-            if len(z) < 5:
-                continue
-            code = z[:5]
-            payload = {
-                "lat": round(float(row["lat"]), 6),
-                "lon": round(float(row["lon"]), 6),
-                "bounds": [
-                    round(float(row["min_lon"]), 6),
-                    round(float(row["min_lat"]), 6),
-                    round(float(row["max_lon"]), 6),
-                    round(float(row["max_lat"]), 6),
-                ],
-            }
-            out_path = zip_dir / f"{code}.json"
-            _write_text_if_changed(out_path, json.dumps(payload))
-            count += 1
-
-    total_bytes = sum(p.stat().st_size for p in zip_dir.glob("*.json"))
-    size_mb = total_bytes / (1024 * 1024)
-    print(f"  {zip_dir}/ ({count} files, {size_mb:.1f} MB)")
 
 
 # ── data layers (.bin) ──────────────────────────────────────────────
@@ -287,21 +721,41 @@ def _export_layer(npz_path: Path, field: str, out_dir: Path) -> int:
     return 1
 
 
-def export_forecast_data_layers(forecast_root: Path) -> None:
-    """Export ``stats_output/{model}/forecast/lead_*.npz`` → ``forecast/{model}/*.bin``.
+# The forecast point/region series is the precip variable. The multi-variable
+# downloaders write ``forecast/{var}/lead_*.npz`` with the array under ``"value"``;
+# older single-variable runs wrote ``forecast/lead_*.npz`` under the variable name
+# (e.g. ``"precip"``). Prefer the multi-variable layout so re-downloaded forecasts
+# are actually picked up — the legacy flat files are left stale on disk otherwise.
+def _forecast_source(model_key: str) -> tuple[Path, str]:
+    """Return ``(dir, npz_key)`` for a model's forecast precip series.
 
-    Writes to a separate ``forecast/`` tree (not under ``data/``) so forecast
-    data can be uploaded to S3 independently and is never baked into the
-    Fargate image.
+    Multi-variable layout (``forecast/precip/lead_*.npz`` keyed ``"value"``) wins;
+    falls back to the legacy flat layout (``forecast/lead_*.npz`` keyed by the
+    render field) for older exports.
     """
-    field = STATISTICS_BY_NAME["forecast"].spec.render_field
+    variable = STATISTICS_BY_NAME["forecast"].spec.render_field
+    base = STATS_ROOT / model_key / "forecast"
+    var_dir = base / variable
+    if var_dir.is_dir() and any(var_dir.glob("lead_*.npz")):
+        return var_dir, "value"
+    return base, variable
+
+
+def export_forecast_data_layers(forecast_root: Path) -> None:
+    """Export a model's forecast precip series → ``forecast/{model}/*.bin``.
+
+    Reads the multi-variable ``forecast/{precip}/lead_*.npz`` (or the legacy flat
+    layout) via ``_forecast_source``. Writes to a separate ``forecast/`` tree (not
+    under ``model_data/``) so forecast data can be uploaded to S3 independently and
+    is never baked into the Fargate image.
+    """
     total = 0
     for model_key in MODEL_REGISTRY:
-        forecast_dir = STATS_ROOT / model_key / "forecast"
-        if not forecast_dir.is_dir():
+        src_dir, npz_key = _forecast_source(model_key)
+        if not src_dir.is_dir():
             continue
-        for npz_path in sorted(forecast_dir.glob("lead_*.npz")):
-            total += _export_layer(npz_path, field, forecast_root / model_key)
+        for npz_path in sorted(src_dir.glob("lead_*.npz")):
+            total += _export_layer(npz_path, npz_key, forecast_root / model_key)
     print(f"  {total} forecast .bin files (forecast/{{model}}/)")
 
 
@@ -325,24 +779,51 @@ def export_forecast_calendar(forecast_root: Path) -> None:
 
 # ── tiles (copy PNGs) ──────────────────────────────────────────────
 
+def _copy_file_if_changed(src: Path, dst: Path) -> bool:
+    """Copy *src* → *dst* only if content differs, preserving mtime when unchanged.
+
+    Like the ``_write_*_if_changed`` helpers, this keeps ``aws s3 sync`` from
+    re-uploading byte-identical tiles on a rerun. Returns True if a copy occurred.
+    """
+    try:
+        if dst.stat().st_size == src.stat().st_size and dst.read_bytes() == src.read_bytes():
+            return False
+    except FileNotFoundError:
+        pass
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return True
+
+
 def export_tiles(export_dir: Path) -> None:
+    """Mirror ``tiles_output/{model}/`` PNGs into ``static/tiles/`` idempotently."""
     tiles_dest = export_dir / "tiles"
     if not TILES_ROOT.exists():
         print("  SKIP: tiles_output/ not found")
         return
 
-    count = 0
+    total = copied = pruned = 0
     for model_key in MODEL_REGISTRY:
         src = TILES_ROOT / model_key
-        if not src.exists():
-            continue
         dst = tiles_dest / model_key
+        if not src.exists():
+            # Model no longer produces tiles — drop any stale exported copy.
+            if dst.exists():
+                shutil.rmtree(dst)
+            continue
+        src_rel = {p.relative_to(src) for p in src.rglob("*.png")}
+        for rel in sorted(src_rel):
+            total += 1
+            if _copy_file_if_changed(src / rel, dst / rel):
+                copied += 1
+        # Prune tiles that no longer exist in the source.
         if dst.exists():
-            shutil.rmtree(dst)
-        shutil.copytree(src, dst)
-        count += sum(1 for _ in dst.rglob("*.png"))
+            for p in dst.rglob("*.png"):
+                if p.relative_to(dst) not in src_rel:
+                    p.unlink()
+                    pruned += 1
 
-    print(f"  {count} tile PNGs copied to {tiles_dest}")
+    print(f"  {total} tile PNGs ({copied} updated, {pruned} pruned) under {tiles_dest}")
 
 
 def _compute_export_value_range(
@@ -452,15 +933,11 @@ def export_value_ranges(assets_dir: Path) -> None:
 
 
 def clear_site_frontend_artifacts(site_root: Path) -> None:
-    """Remove prior Vite output at the site root (hashed chunks under ``assets/``)."""
-    index = site_root / "index.html"
-    if index.is_file():
-        index.unlink()
-        print(f"  removed {index}")
-    assets = site_root / "assets"
-    if assets.is_dir():
-        shutil.rmtree(assets)
-        print(f"  removed {assets}/")
+    """Remove the prior bundled SPA (``static_export/frontend/``)."""
+    frontend_dir = site_root / FRONTEND_DIR_NAME
+    if frontend_dir.is_dir():
+        shutil.rmtree(frontend_dir)
+        print(f"  removed {frontend_dir}/")
 
 
 def build_static_frontend(frontend_out_dir: Path) -> None:
@@ -481,25 +958,25 @@ def build_static_frontend(frontend_out_dir: Path) -> None:
     print(f"  Frontend built to {frontend_out_dir}")
 
 
-def write_export_manifest(site_root: Path) -> None:
-    """Small schema marker for ops (paths intentionally relative / portable)."""
-    manifest = {
-        "schema": "model-accuracy-static-site/v1",
-        "static_assets_dir": STATIC_ASSETS_DIR_NAME,
-        "data_dir": DATA_DIR_NAME,
-        "url_prefix_for_assets": "/static",
-        "url_prefix_for_data": "/data",
-        "legend_ranges_dir": f"{STATIC_ASSETS_DIR_NAME}/ranges",
-    }
-    out = site_root / "export_manifest.json"
-    _write_text_if_changed(out, json.dumps(manifest, indent=2))
-    print(f"  {out}")
-
-
 # ── main ────────────────────────────────────────────────────────────
 
 def _maptiler_key() -> str:
     return os.getenv("MAPTILER_API_KEY", "")
+
+
+def _has_boundary_flags(args: argparse.Namespace) -> bool:
+    return any((args.zip, args.admin, args.huc))
+
+
+def _resolve_boundary_parts(args: argparse.Namespace) -> dict[str, bool]:
+    # --admin / --huc each export both halves (TopoJSON for S3 + polygons for the image).
+    return {
+        "zip": args.zip,
+        "admin_topo": args.admin,
+        "admin_polys": args.admin,
+        "huc_topo": args.huc,
+        "huc_polys": args.huc,
+    }
 
 
 def main() -> None:
@@ -516,62 +993,121 @@ def main() -> None:
     )
     parser.add_argument(
         "--static", action="store_true",
-        help="Only rebuild static_export/static/ (config, zip, tiles, ranges)",
+        help="S3/CloudFront export: zip/, admin/HUC TopoJSON, config, tiles, ranges, forecast/",
+    )
+    parser.add_argument(
+        "--image", action="store_true",
+        help="Docker image export: admin/HUC polygons + static_export/model_data/",
     )
     parser.add_argument(
         "--data", action="store_true",
-        help="Only rebuild static_export/data/ (.bin layers and grid.json)",
+        help="Only rebuild static_export/model_data/ (.bin layers and grid.json)",
     )
     parser.add_argument(
         "--forecast", action="store_true",
-        help="Only rebuild forecast bins + forecast_calendar.json under static_export/data/",
+        help="Only rebuild forecast bins + forecast_calendar.json under static_export/forecast/",
     )
     parser.add_argument(
         "--frontend", action="store_true",
-        help="Only rebuild site-root Vite SPA (index.html, assets/) and export_manifest.json",
+        help="Only rebuild the bundled Vite SPA under static_export/frontend/",
+    )
+    parser.add_argument(
+        "--zip", action="store_true",
+        help="Only zip/{code}.json from boundary_data/zip/zip_lookup.csv",
+    )
+    parser.add_argument(
+        "--admin", action="store_true",
+        help="Admin boundaries.json + states/counties TopoJSON",
+    )
+    parser.add_argument(
+        "--huc", action="store_true",
+        help="WBD map TopoJSON/index + chunks/ polygon tree",
+    )
+    parser.add_argument(
+        "--max-huc-level", type=int, choices=WBD_HU_LEVELS, default=DEFAULT_MAX_HUC_LEVEL,
+        help=f"Deepest WBD HU level to export (default: {DEFAULT_MAX_HUC_LEVEL}; "
+             "boundary_data/ keeps full HU16 source)",
     )
     args = parser.parse_args()
 
-    mode_count = int(args.static) + int(args.data) + int(args.forecast) + int(args.frontend)
+    mode_count = (
+        int(args.static) + int(args.image) + int(args.data)
+        + int(args.forecast) + int(args.frontend)
+    )
     if mode_count > 1:
-        parser.error("Use at most one of --static, --data, --forecast, --frontend.")
+        parser.error("Use at most one of --static, --image, --data, --forecast, --frontend.")
     if args.clean and mode_count:
-        parser.error("--clean applies only to a full export (omit --static, --data, --forecast, and --frontend).")
+        parser.error(
+            "--clean applies only to a full export "
+            "(omit --static, --image, --data, --forecast, and --frontend)."
+        )
+    if _has_boundary_flags(args) and mode_count:
+        parser.error(
+            "Boundary flags (--zip, --admin, --huc) cannot combine "
+            "with --static, --image, --data, --forecast, or --frontend."
+        )
 
     site_root = Path(args.output)
 
+    if _has_boundary_flags(args) and mode_count == 0:
+        parts = _resolve_boundary_parts(args)
+        if not any(parts.values()):
+            parser.error("No boundary export selected.")
+        site_root.mkdir(parents=True, exist_ok=True)
+        print("Exporting boundaries...")
+        export_boundary_parts(site_root, **parts, huc_max_level=args.max_huc_level)
+        print(f"\nDone. Boundaries under {site_root}")
+        return
+
     if args.frontend:
         site_root.mkdir(parents=True, exist_ok=True)
+        frontend_root = site_root / FRONTEND_DIR_NAME
         print("--frontend: clearing old Vite output...")
         clear_site_frontend_artifacts(site_root)
         print("Building static frontend...")
-        build_static_frontend(site_root)
-        write_export_manifest(site_root)
+        build_static_frontend(frontend_root)
         spa_bytes = sum(
-            f.stat().st_size
-            for f in site_root.rglob("*")
-            if f.is_file()
-            and "data" not in f.relative_to(site_root).parts[:1]
-            and "static" not in f.relative_to(site_root).parts[:1]
+            f.stat().st_size for f in frontend_root.rglob("*") if f.is_file()
         )
-        print(f"\nDone (--frontend). Site-root SPA + manifest ~ {spa_bytes / (1024 * 1024):.2f} MB under {site_root}")
+        print(f"\nDone (--frontend). SPA ~ {spa_bytes / (1024 * 1024):.2f} MB under {frontend_root}")
         return
 
     if args.static:
         site_root.mkdir(parents=True, exist_ok=True)
-        assets_dir = site_root / STATIC_ASSETS_DIR_NAME
-        assets_dir.mkdir(parents=True, exist_ok=True)
         maptiler_key = _maptiler_key()
-        print("--static: exporting config...")
-        export_config(assets_dir, maptiler_key)
-        print("--static: exporting ZIP directory...")
-        export_zip_directory(assets_dir, _PROJECT_ROOT / "backend" / "zip_lookup.csv")
-        print("--static: exporting tiles...")
-        export_tiles(assets_dir)
-        print("--static: exporting legend ranges...")
-        export_value_ranges(assets_dir)
-        write_export_manifest(site_root)
-        print(f"\nDone (--static). Assets under {assets_dir}")
+        print("--static: exporting zip/ and admin/HUC TopoJSON...")
+        export_boundary_parts(
+            site_root, zip=True, admin_topo=True, huc_topo=True,
+            huc_max_level=args.max_huc_level,
+        )
+        print("--static: exporting config, tiles, ranges...")
+        export_s3_assets(site_root, maptiler_key)
+        forecast_root = site_root / FORECAST_DIR_NAME
+        forecast_root.mkdir(parents=True, exist_ok=True)
+        print("--static: exporting forecast data layers...")
+        export_forecast_data_layers(forecast_root)
+        print("--static: exporting forecast calendar...")
+        export_forecast_calendar(forecast_root)
+        print(
+            f"\nDone (--static). S3 assets under {site_root} "
+            f"and {forecast_root}"
+        )
+        return
+
+    if args.image:
+        site_root.mkdir(parents=True, exist_ok=True)
+        print("--image: exporting admin/HUC polygons...")
+        export_boundary_parts(
+            site_root, admin_polys=True, huc_polys=True,
+            huc_max_level=args.max_huc_level,
+        )
+        data_root = site_root / DATA_DIR_NAME
+        data_root.mkdir(parents=True, exist_ok=True)
+        print("--image: exporting data layers...")
+        export_data_layers(data_root)
+        print("--image: exporting model grids...")
+        export_model_grids(data_root)
+        print(f"\nDone (--image). Docker inputs under {site_root}")
         return
 
     if args.data:
@@ -582,7 +1118,6 @@ def main() -> None:
         export_data_layers(data_root)
         print("--data: exporting model grids...")
         export_model_grids(data_root)
-        write_export_manifest(site_root)
         print(f"\nDone (--data). Data under {data_root}")
         return
 
@@ -594,29 +1129,29 @@ def main() -> None:
         export_forecast_data_layers(forecast_root)
         print("--forecast: exporting forecast calendar...")
         export_forecast_calendar(forecast_root)
-        write_export_manifest(site_root)
         print(f"\nDone (--forecast). Forecast data under {forecast_root}")
         return
 
     if args.clean and site_root.exists():
         shutil.rmtree(site_root)
     site_root.mkdir(parents=True, exist_ok=True)
-    assets_dir = site_root / STATIC_ASSETS_DIR_NAME
     data_root = site_root / DATA_DIR_NAME
     forecast_root = site_root / FORECAST_DIR_NAME
-    assets_dir.mkdir(parents=True, exist_ok=True)
     data_root.mkdir(parents=True, exist_ok=True)
     forecast_root.mkdir(parents=True, exist_ok=True)
 
     maptiler_key = _maptiler_key()
-    print("Exporting config...")
-    export_config(assets_dir, maptiler_key)
+    print("Exporting boundaries...")
+    export_boundaries(site_root, huc_max_level=args.max_huc_level)
 
-    print("Exporting ZIP directory...")
-    export_zip_directory(assets_dir, _PROJECT_ROOT / "backend" / "zip_lookup.csv")
+    print("Exporting S3 static assets (config, tiles, ranges)...")
+    export_s3_assets(site_root, maptiler_key)
 
     print("Exporting data layers...")
     export_data_layers(data_root)
+
+    print("Exporting model grids...")
+    export_model_grids(data_root)
 
     print("Exporting forecast data layers...")
     export_forecast_data_layers(forecast_root)
@@ -624,19 +1159,8 @@ def main() -> None:
     print("Exporting forecast calendar...")
     export_forecast_calendar(forecast_root)
 
-    print("Exporting model grids (for static stats queries)...")
-    export_model_grids(data_root)
-
-    print("Exporting tiles...")
-    export_tiles(assets_dir)
-
-    print("Exporting legend ranges (for client map download)...")
-    export_value_ranges(assets_dir)
-
     print("Building static frontend...")
-    build_static_frontend(site_root)
-
-    write_export_manifest(site_root)
+    build_static_frontend(site_root / FRONTEND_DIR_NAME)
 
     total_size = sum(f.stat().st_size for f in site_root.rglob("*") if f.is_file())
     print(f"\nDone. Total export: {total_size / (1024 * 1024):.1f} MB in {site_root}")

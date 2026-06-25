@@ -29,7 +29,7 @@ uvicorn backend.api:app --reload --host 0.0.0.0 --port 8000
 cd frontend && npm install && npm run dev
 ```
 
-Open the URL Vite prints (default **http://localhost:5173**). Optional: set `MAPTILER_API_KEY` in `.env` (read by `export_static.py` and baked into `static/config.json`) for a custom basemap; without it the SPA falls back to a free OSM-style tileset.
+Open the URL Vite prints (default **http://localhost:5173**). Optional: set `MAPTILER_API_KEY` in `.env` (read by `export_static.py` and baked into `config.json`) for a custom basemap; without it the SPA falls back to a free OSM-style tileset.
 
 ## Scripts
 
@@ -88,19 +88,33 @@ Generates tiles for yearly, current month, and current season. Forecast tiles ar
 
 ### `export_static.py`
 
-Builds `static_export/` for disk-backed serving: Vite SPA (`index.html`, `assets/`), `static_export/static/` (config, zip lookups, tiles, ranges, admin), `static_export/data/` (grid metadata and verification `.bin` arrays), and `static_export/forecast/` (forecast `.bin` arrays + `forecast_calendar.json`). Run this before `docker build` or local API use.
+Builds the flat `static_export/` tree for disk-backed serving: the bundled Vite SPA (`static_export/frontend/`: `index.html`, `assets/`, favicons), the root data assets (`config.json`, `zip/`, `tiles/`, `ranges/`, `admin/`, `wbd/`), `static_export/model_data/` (grid metadata and verification `.bin` arrays), and `static_export/forecast/` (forecast `.bin` arrays + `forecast_calendar.json`). `config.json` is the only regular file at the root. Run this before `docker build` or local API use.
 
 - `python export_static.py` — full export (all of the above).
-- `python export_static.py --static` — only `static_export/static/` (config, zip, tiles, ranges).
-- `python export_static.py --data` — only `static_export/data/` (verification `.bin` + `grid.json`).
+- `python export_static.py --image` — Docker image: admin/HUC polygons + `static_export/model_data/`.
+- `python export_static.py --static` — S3/CloudFront: `zip/`, admin/HUC TopoJSON, `config.json`, `tiles/`, `ranges/`, and `forecast/` (bins + `forecast_calendar.json`).
+- `python export_static.py --data` — only `static_export/model_data/` (verification `.bin` + `grid.json`).
 - `python export_static.py --forecast` — only `static_export/forecast/` (forecast bins + `forecast_calendar.json`).
-- `python export_static.py --frontend` — only site-root SPA + `export_manifest.json`.
+- `python export_static.py --frontend` — only the bundled SPA under `static_export/frontend/`.
+
+Boundary flags (combinable with each other, not with build modes): `--zip`, `--admin`, `--huc`. Each writes both halves of its output — `--admin`/`--huc` produce the TopoJSON used by S3 *and* the polygon JSON baked into the image.
 
 Use `python export_static.py --help` for `--output` and `--clean` (full export only).
 
-Admin polygon boundaries (`static_export/static/admin/boundaries.json`) are produced by `scripts/fetch_admin_boundaries.py` — not by `export_static.py`.
+``boundary_data/`` holds only data (like ``model_data/``): normalized ``zip/``,
+``admin/``, and ``wbd/layers/`` outputs at the top level, plus a ``cache/`` for the
+large transient WBD GDB download. It is populated by ``load_boundaries.py``.
+Export modes write the deploy tree ``static_export/``; Docker and S3 deploys only copy from there:
 
-Watershed (WBD) data (`static_export/static/wbd/`) is produced by `scripts/fetch_wbd_boundaries.py` — separate from `export_static.py`. **`chunks/`** (backend stats masks) is baked into the API Docker image. **`index.json`**, **`huc2.topojson`**, and **`children/`** (frontend map drill) are deployed to S3 via `deploy_static.sh`. Run without `--branch` for the full national build; use `--branch 08` for a single test branch. For local dev without the ~2.7 GB GDB download, run `python scripts/generate_wbd_sample.py`.
+```bash
+python load_boundaries.py                 # zip + admin + wbd (downloads ~2.7 GB GDB for --wbd)
+python export_static.py --image           # Docker: admin/HUC polys + data/
+./deploy_fargate.sh                       # COPY static_export/{data,static/...} into image
+python export_static.py --static          # S3: zip + topos + config/tiles/ranges + forecast
+./deploy_static.sh                        # download forecast → export --static → sync S3 + invalidate
+```
+
+`load_boundaries.py` takes additive `--zip` / `--admin` / `--wbd` selectors (all run when none are given). For local dev without the ~2.7 GB GDB: `python load_boundaries.py --wbd-sample` then `python export_static.py --image`.
 
 ## Statistics
 
@@ -117,10 +131,9 @@ Display statistics:
 
 ## API and static URLs
 
-The FastAPI app (`backend.api:app`) does **not** serve the SPA at `/`; use Vite dev (or CloudFront/S3 + ALB in production) for HTML. The API mounts:
+The FastAPI app (`backend.api:app`) serves both the SPA and the data files from the site root (handy for running the backend standalone); in normal dev you'd use Vite, and in production CloudFront/S3 fronts the static site. The API mounts:
 
-- `/static/…` — files under `static_export/static/`
-- `/data/…` — files under `static_export/data/`
+- `/…` (site root) — data files from the flat `static_export/` root (`/config.json`, `/zip/…`, `/tiles/…`, `/ranges/…`, `/admin/…`, `/wbd/…`, `/model_data/…`, `/forecast/…`) **and** the bundled SPA (`/` → `index.html`, `/assets/…`, `/favicon.svg`) from `static_export/frontend/`. The backend serves both from one mount that searches the data root then `frontend/`, registered after all `/api` routes.
 
 Dynamic routes:
 
@@ -148,16 +161,16 @@ Production splits `static_export/` across three deploy paths. Each shell script 
 
 | Artifact | Refreshes | Notes |
 |----------|-----------|-------|
-| [Dockerfile](Dockerfile) | API image | Bakes `static_export/data/`, `static_export/static/admin/boundaries.json`, and `static_export/static/wbd/chunks/`; fails if any is missing |
-| [deploy_fargate.sh](deploy_fargate.sh) | API image → ECR (+ optional ECS redeploy) | Runs `export_static.py --data`, verifies data, `docker build`, ECR push (us-west-1 default) |
-| [deploy_static.sh](deploy_static.sh) | `static_export/static/` and `static_export/forecast/` → S3 | Static path also creates a `/static/*` CloudFront invalidation |
-| [deploy_frontend.sh](deploy_frontend.sh) | Vite SPA (`index.html`, `assets/`, favicons, `export_manifest.json`) → S3 | Invalidates non-hashed files; `assets/` URLs are content-hashed |
+| [Dockerfile](Dockerfile) | API image | Bakes `static_export/model_data/`, `static_export/admin/boundaries.json`, and `static_export/wbd/chunks/`; fails if any is missing |
+| [deploy_fargate.sh](deploy_fargate.sh) | API image → ECR (+ optional ECS redeploy) | Runs `export_static.py --image`, verifies data, `docker build`, ECR push (us-west-1 default) |
+| [deploy_static.sh](deploy_static.sh) | `static_export/` root data assets → `s3://$BUCKET/` (root) and `static_export/forecast/` → S3 | No flags: downloads the latest forecast, runs `export_static.py --static`, syncs both subtrees, and invalidates the data paths (`/config.json`, `/zip/*`, `/admin/*`, …) |
+| [deploy_frontend.sh](deploy_frontend.sh) | Bundled SPA (`static_export/frontend/`: `index.html`, `assets/`, favicons) → `s3://$BUCKET/` (root) | Invalidates non-hashed files; `/assets/` URLs are content-hashed |
 
-Routing in production: CloudFront fronts S3 (SPA shell, `/static/*`, `/assets/*`) and the ALB-backed Fargate API (`/api/*`, `/data/*`). The backend reads forecast `.bin` files directly from S3 (refreshed every ~5 min); verification data is read from disk inside the container.
+Routing in production: CloudFront fronts S3 (the SPA at `/` and data files at the site root: `/config.json`, `/wbd/*`, …) and the ALB-backed Fargate API (`/api/*`). Both the SPA and data share the bucket root; each deploy script uses `--delete` only within its own subdirs so they don't clobber each other. The backend reads forecast `.bin` files directly from S3 (refreshed every ~5 min); verification data is read from disk inside the container.
 
 ### Fargate (`deploy_fargate.sh`)
 
-The Docker image **fails to build** if `static_export/data/<model>/grid.json`, `static_export/static/admin/boundaries.json`, or `static_export/static/wbd/chunks/` is missing. Fargate deploy refreshes **verification data** only — run `deploy_static.sh` and/or `deploy_frontend.sh` for the other parts.
+The Docker image **fails to build** if `static_export/model_data/<model>/grid.json`, `static_export/admin/boundaries.json`, or `static_export/wbd/chunks/` is missing. Fargate deploy refreshes **verification data** only — run `deploy_static.sh` and/or `deploy_frontend.sh` for the other parts.
 
 ```bash
 chmod +x deploy_fargate.sh
@@ -167,7 +180,7 @@ chmod +x deploy_fargate.sh
 Common flags:
 
 - `IMAGE_TAG=v1.2.3 ./deploy_fargate.sh`
-- `SKIP_EXPORT=1 ./deploy_fargate.sh` — use existing `static_export/data/`
+- `SKIP_EXPORT=1 ./deploy_fargate.sh` — use existing `static_export/model_data/`
 - `SKIP_PUSH=1 ./deploy_fargate.sh` — build only, no ECR push
 - `./deploy_fargate.sh --tag-latest` (or `ECR_PUSH_LATEST=1`) — also push `:latest`
 - `./deploy_fargate.sh --force-redeploy` (or `ECS_FORCE_REDEPLOY=1`) — `aws ecs update-service --force-new-deployment` after push; needs `ECS_CLUSTER`/`ECS_CLUSTER_ARN` + `ECS_SERVICE`/`ECS_SERVICE_ARN` (or interactive prompt)
@@ -176,12 +189,14 @@ Common flags:
 
 ### Static + forecast (`deploy_static.sh`)
 
+Takes no arguments. It runs `download.py --forecast`, then `export_static.py --static`
+(which builds both the `static_export/` root data assets and `static_export/forecast/`), syncs both
+subtrees to S3 (data at the bucket root, forecast under the forecast prefix), and invalidates the data paths.
+
 ```bash
-./deploy_static.sh                # default: --static and --forecast
-./deploy_static.sh --static       # tiles, ranges, config, zip, admin, wbd map assets
-./deploy_static.sh --forecast     # daily forecast refresh (no CF invalidation)
-SKIP_BUILD=1 ./deploy_static.sh --static
-SKIP_INVALIDATE=1 ./deploy_static.sh --static
+./deploy_static.sh                       # download forecast → export --static → sync + invalidate
+SKIP_BUILD=1 ./deploy_static.sh          # skip download+export, upload existing static_export/
+SKIP_INVALIDATE=1 ./deploy_static.sh     # skip the CloudFront invalidation
 ```
 
 Cache-Control mirrors `LongCacheStaticMiddleware` in `backend/api.py`: `zip/`, `admin/`, and `wbd/` are 1 yr immutable; `tiles/`, `ranges/`, and `config.json` are 300 s `must-revalidate`. The forecast S3 prefix is derived from `DATA_S3_URI` (sibling of the stats prefix); see the script header for the parsing rule.
@@ -194,7 +209,7 @@ SKIP_BUILD=1 ./deploy_frontend.sh # upload existing static_export/
 SKIP_INVALIDATE=1 ./deploy_frontend.sh
 ```
 
-Uploads `index.html` (no-cache), `assets/` (1 yr immutable), `favicon.*`, and `export_manifest.json`; CloudFront invalidation covers only the non-hashed files. Requires `CLOUDFRONT_DISTRIBUTION_ID` in `.env`.
+Uploads the SPA contents to the bucket root `s3://$BUCKET/`: `index.html` (no-cache), `assets/` (1 yr immutable), and `favicon.*`; CloudFront invalidation covers only the non-hashed files. Requires `CLOUDFRONT_DISTRIBUTION_ID` in `.env`.
 
 ### Environment variables
 
@@ -212,7 +227,7 @@ Most ECS task / build-time env vars are read from `.env` at the repo root by all
 | `COGNITO_DOMAIN_PREFIX` | Hosted UI domain label (`*.auth.<region>.amazoncognito.com`) — one of `COGNITO_DOMAIN_PREFIX` or `COGNITO_OAUTH_BASE_URL` is required |
 | `COGNITO_OAUTH_BASE_URL` | Optional full https origin for Hosted UI (overrides prefix+region) |
 | `DYNAMODB_USER_ITEMS_TABLE` | DynamoDB table for saved shapes (required, no default) |
-| `MAPTILER_API_KEY` | Optional MapTiler key; baked into `static/config.json` by `export_static.py` |
+| `MAPTILER_API_KEY` | Optional MapTiler key; baked into `config.json` by `export_static.py` |
 | `WARM_CACHE` | `1` / `true` / `yes` — preload all models' `grid.json` at backend startup |
 | `PORT` | Listen port (default **8080**) |
 | `DEV` | `1` / `true` — backend skips production cache headers, reaches for disk over S3 |

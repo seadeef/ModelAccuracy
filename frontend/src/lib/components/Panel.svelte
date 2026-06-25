@@ -13,10 +13,10 @@
 
   let { onleadchange, onstatchange, onperiodchange, onmodelchange } = $props();
 
-  let canvasEl;
-  let ensembleForecastCanvasEl;
+  let canvasEl = $state();
+  let ensembleForecastCanvasEl = $state();
   /** Wraps forecast + accuracy chart sections; shared X for lead scrub / hover. */
-  let chartTrackRegionEl;
+  let chartTrackRegionEl = $state();
   let loading = $state(false);
   let leadData = $state([]);
   /** Chart / card highlight; must match `ui.statistic` when the panel opens (map layer). */
@@ -585,7 +585,7 @@
 
   /**
    * Good / ok / bad tiers for panel values (same units as API: % for SACC/NRMSE/NMAD, mm for bias).
-   * Cutoffs rounded from a one-off analysis of static_export/static/ranges (legend vmin/vmax per
+   * Cutoffs rounded from a one-off analysis of static_export/ranges (legend vmin/vmax per
    * model/stat/period) so tiers sit near the scale of real outputs instead of mistaken 0–1 bounds.
    */
   function colorClass(statName, value) {

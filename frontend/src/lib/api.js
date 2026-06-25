@@ -199,20 +199,55 @@ export async function fetchStatsAllLeads({
 }
 
 /**
+ * Forecast init dates per model, fetched directly from the static asset
+ * `${STATIC_BASE}/forecast/forecast_calendar.json` (NOT the API) so the SPA
+ * always reflects the latest exported forecast independently of the backend.
+ * Shape: `{ per_model: { [modelKey]: { initDate, leadDaysMin, leadDaysMax } } }`.
+ * Cached in-memory for `FORECAST_CALENDAR_TTL_MS`; the asset itself is served
+ * with a short Cache-Control so CloudFront/browser also refresh it.
+ */
+const FORECAST_CALENDAR_TTL_MS = 5 * 60 * 1000;
+let _calendarCache = { data: null, at: 0 };
+
+export async function fetchForecastCalendar() {
+  const now = Date.now();
+  if (_calendarCache.data && now - _calendarCache.at < FORECAST_CALENDAR_TTL_MS) {
+    return _calendarCache.data;
+  }
+  try {
+    const resp = await fetch(`${STATIC_BASE}/forecast/forecast_calendar.json`, { cache: 'no-cache' });
+    if (!resp.ok) return _calendarCache.data;
+    const data = await resp.json();
+    _calendarCache = { data, at: now };
+    return data;
+  } catch {
+    return _calendarCache.data;
+  }
+}
+
+/**
  * Region-mean forecast (precip) for every model × lead in one request.
- * Response: `{ models, forecast_calendar }` where `forecast_calendar.per_model[modelKey]`
- * has `initDate` (ISO `YYYY-MM-DD`), `leadDaysMin`, `leadDaysMax`.
- * Valid date for integer lead L = `initDate` + L calendar days.
+ * Returns `{ models, forecast_calendar }`. The `models` values come from the API
+ * (`POST /api/stats/forecast`); `forecast_calendar` is fetched directly from the
+ * static asset so init dates stay current with new forecast exports without the
+ * backend echoing them. `forecast_calendar.per_model[modelKey]` has `initDate`
+ * (ISO `YYYY-MM-DD`), `leadDaysMin`, `leadDaysMax`; valid date for lead L =
+ * `initDate` + L calendar days.
  */
 export async function fetchForecastAllModels({ region }) {
   try {
-    const resp = await fetch(`${API_BASE}/api/stats/forecast`, {
-      method: 'POST',
-      headers: headersWithAuth({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ region: regionPayload(region) }),
-    });
+    const [resp, calendar] = await Promise.all([
+      fetch(`${API_BASE}/api/stats/forecast`, {
+        method: 'POST',
+        headers: headersWithAuth({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ region: regionPayload(region) }),
+      }),
+      fetchForecastCalendar(),
+    ]);
     if (!resp.ok) return null;
-    return await resp.json();
+    const data = await resp.json();
+    if (calendar) data.forecast_calendar = calendar;
+    return data;
   } catch {
     return null;
   }

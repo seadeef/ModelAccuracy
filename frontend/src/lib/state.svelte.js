@@ -1,4 +1,4 @@
-// App config (loaded once from /static/config.json); data layers use /data (see constants.js).
+// App config (loaded once from /config.json); all data files load from the site root (see constants.js).
 export const appConfig = $state({
   models: [],
   defaultModel: 'gfs',

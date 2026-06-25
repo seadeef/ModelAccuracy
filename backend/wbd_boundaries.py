@@ -1,22 +1,28 @@
 """Lookup for US WBD watershed boundaries by HUC code.
 
-Lazy-loads per-parent chunk JSON from ``static_export/static/wbd/chunks/``
+Lazy-loads per-parent chunk JSON from ``static_export/wbd/chunks/``
 (baked into the Docker image).  Map display TopoJSON and ``index.json`` are
-frontend-only assets on S3 / ``/static/wbd/``.
+frontend-only assets on S3 / ``/wbd/``.
 """
 
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 from threading import Lock
 
 from backend.static_store import default_static_site_root
 
-_CHUNKS_ROOT = default_static_site_root() / "static" / "wbd" / "chunks"
+_CHUNKS_ROOT = default_static_site_root() / "wbd" / "chunks"
+
+# Bound the in-memory chunk cache so a process that drills across many parents
+# doesn't accumulate every visited chunk's sibling polygons forever. LRU: a
+# cache hit is moved to the end, the least-recently-used entry is evicted first.
+_CHUNK_CACHE_MAX = 256
 
 _lock = Lock()
-_chunk_cache: dict[str, dict] = {}
+_chunk_cache: "OrderedDict[str, dict]" = OrderedDict()
 
 
 class WbdBoundariesUnavailable(RuntimeError):
@@ -31,17 +37,15 @@ def _chunk_path(parent_level: int, parent_huc: str) -> Path:
 def _load_chunk(parent_level: int, parent_huc: str) -> dict:
     path = _chunk_path(parent_level, parent_huc)
     key = str(path.resolve())
-    cached = _chunk_cache.get(key)
-    if cached is not None:
-        return cached
     with _lock:
         cached = _chunk_cache.get(key)
         if cached is not None:
+            _chunk_cache.move_to_end(key)  # mark most-recently used
             return cached
         if not _CHUNKS_ROOT.is_dir():
             raise WbdBoundariesUnavailable(
                 f"WBD chunks not found at {_CHUNKS_ROOT}; "
-                "run scripts/fetch_wbd_boundaries.py"
+                "run export_static.py --image (after load_boundaries.py --wbd)"
             )
         try:
             data = json.loads(path.read_text())
@@ -52,6 +56,8 @@ def _load_chunk(parent_level: int, parent_huc: str) -> dict:
                 f"WBD chunk at {path} is not valid JSON"
             ) from exc
         _chunk_cache[key] = data
+        while len(_chunk_cache) > _CHUNK_CACHE_MAX:
+            _chunk_cache.popitem(last=False)  # evict least-recently used
         return data
 
 

@@ -12,8 +12,8 @@ export const SEASON_NAMES = {
 
 export const FALLBACK_STYLE_URL = 'https://demotiles.maplibre.org/style.json';
 
-/** Config, zip, tiles → ``static_export/static`` (``/static``). */
-export const STATIC_BASE = '/static';
+/** Config, zip, tiles, ranges, admin, wbd, model_data, forecast — all served from the site root. */
+export const STATIC_BASE = '';
 
 // Keep in sync with backend/tile_overlay_constants.py TILE_IMAGE_BOUNDS_WGS84.
 export const TILE_IMAGE_BOUNDS_WGS84 = [

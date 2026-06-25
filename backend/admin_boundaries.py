@@ -1,8 +1,8 @@
 """Lookup for US admin (state/county) boundaries by FIPS code.
 
-Reads ``static_export/static/admin/boundaries.json`` once at first use and
-caches it in process.  The file is produced by ``scripts/fetch_admin_boundaries.py``
-from the us-atlas TopoJSON (US Census Cartographic Boundary Files, 2017).
+Reads ``static_export/admin/boundaries.json`` once at first use and
+The file is produced by ``export_static.py --image`` or ``--admin`` from
+``boundary_data/admin/`` (populated by ``load_boundaries.py --admin``).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from threading import Lock
 
 from backend.static_store import default_static_site_root
 
-_DEFAULT_PATH = default_static_site_root() / "static" / "admin" / "boundaries.json"
+_DEFAULT_PATH = default_static_site_root() / "admin" / "boundaries.json"
 
 _VALID_LEVELS = ("state", "county")
 _BUCKET_BY_LEVEL = {"state": "states", "county": "counties"}
@@ -38,7 +38,7 @@ def _load(path: Path = _DEFAULT_PATH) -> dict:
         except FileNotFoundError as exc:
             raise AdminBoundariesUnavailable(
                 f"admin boundaries not found at {path}; "
-                "run scripts/fetch_admin_boundaries.py"
+                "run export_static.py --image (after load_boundaries.py)"
             ) from exc
         except json.JSONDecodeError as exc:
             raise AdminBoundariesUnavailable(
