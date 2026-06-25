@@ -5,7 +5,7 @@
     PERIOD_HELP,
     SEASON_PERIOD_HELP,
   } from '../helpText.js';
-  import { fetchStatsAllLeads, fetchLeadWinnersForRegion, fetchForecastAllModels } from '../api.js';
+  import { fetchStatsAllLeads, fetchLeadWinnersForRegion, fetchForecastAllVariables } from '../api.js';
   import { downloadPanelStatsCsv } from '../exportPanelStatsCsv.js';
   import { getModelLeadBounds } from '../tile.js';
   import { modelPalette, statColor } from '../palette.js';
@@ -33,19 +33,52 @@
   let winnersGen = 0;
   let leadFetchGen = 0;
 
-  /** ``POST /api/stats/forecast`` — all models × leads for the map region (yearly precip). */
-  let forecastPayload = $state(null);
+  /** ``POST /api/stats/forecast`` per variable — { [variable]: { models, ... } } for the
+   *  map region (all models × leads). All variables are fetched together so the
+   *  selector buttons show each variable's live value and switching is instant. */
+  let forecastByVar = $state(null);
+  /** Payload for the currently selected forecast variable (drives the top chart). */
+  const forecastPayload = $derived(forecastByVar?.[ui.forecastVariable] ?? null);
   let lastForecastGeoKey = '';
   let forecastFetchGen = 0;
+
+  /** Forecast-variable selector buttons (top chart), in display order. */
+  const FORECAST_VAR_ORDER = ['precip', 'wind', 'humidity', 'temp'];
+  const FORECAST_VAR_LABEL = { precip: 'Precip', temp: 'Temp', wind: 'Wind', humidity: 'Humidity' };
+  /** Accent color per forecast variable (mirrors the data colormaps: blue/teal/green/orange). */
+  const FORECAST_VAR_COLOR = { precip: '#4a90d9', temp: '#e8743b', wind: '#2bb3a3', humidity: '#5fae46' };
+
+  /** Custom model dropdown (replaces the native <select> so only the model NAME is
+   *  colored by its model color while the date range stays neutral — native
+   *  <option> text can only be a single color). */
+  let modelMenuOpen = $state(false);
+  let modelSelectEl = $state();
+  function selectModel(key) {
+    modelMenuOpen = false;
+    if (key === ui.model) return;
+    onmodelchange?.({ target: { value: key } });
+  }
+  /** One window handler for both click-outside and Escape (matches the toolbar idiom). */
+  function handleModelMenuWindow(e) {
+    if (!modelMenuOpen) return;
+    if (e.type === 'keydown') {
+      if (e.key === 'Escape') modelMenuOpen = false;
+      return;
+    }
+    if (modelSelectEl && !modelSelectEl.contains(e.target)) modelMenuOpen = false;
+  }
 
   /** Coalesce chart scrub → map updates to one per frame (reduces overlapping MapLibre `updateImage` / AbortError). */
   let chartScrubRafId = 0;
   let pendingScrubLead = null;
 
-  /** Plot area insets; y-labels drawn inline over chart, no reserved margins needed. */
+  /** Plot area insets; y-labels drawn inline over chart, no reserved margins needed.
+   *  The chart title now lives in its own header row above the canvas (see .chart-label),
+   *  so PLOT_TOP only has to reserve room for the floating hover-value pill and the
+   *  topmost y-axis tick — it no longer shares this band with the title text. */
   const PAD = { left: 4, right: 4, bottom: 6 };
   const PLOT_TOP = 26;
-  const HOVER_LABEL_Y = 16;
+  const HOVER_LABEL_Y = 15;
 
   function regionCenter() {
     const r = ui.selectedRegion;
@@ -156,8 +189,8 @@
   }
 
   /** Per-lead forecast values for one model (aligned to leadMin..leadMax). */
-  function forecastSeriesArray(modelKey) {
-    const leadsObj = forecastPayload?.models?.[modelKey]?.leads;
+  function forecastSeriesArray(modelKey, payload = forecastPayload) {
+    const leadsObj = payload?.models?.[modelKey]?.leads;
     if (!leadsObj) return null;
     const n = leadMax - leadMin + 1;
     const arr = [];
@@ -172,8 +205,8 @@
     return arr;
   }
 
-  function forecastUnitsForModel(modelKey) {
-    const leadsObj = forecastPayload?.models?.[modelKey]?.leads;
+  function forecastUnitsForModel(modelKey, payload = forecastPayload) {
+    const leadsObj = payload?.models?.[modelKey]?.leads;
     if (!leadsObj) return '';
     for (let d = leadMin; d <= leadMax; d++) {
       const u = leadsObj[String(d)]?.units;
@@ -188,6 +221,30 @@
     const v = interpValue(arr, hl);
     if (v === null) return null;
     return { value: v, units: forecastUnitsForModel(modelKey) };
+  }
+
+  /** Forecast-variable selector buttons: those we have data for, in display order. */
+  const forecastVars = $derived.by(() => {
+    const keys = forecastByVar ? Object.keys(forecastByVar) : [];
+    if (!keys.length) return FORECAST_VAR_ORDER.slice();  // show buttons before first load
+    const ordered = FORECAST_VAR_ORDER.filter((k) => keys.includes(k));
+    for (const k of keys) if (!ordered.includes(k)) ordered.push(k);  // any extras after
+    return ordered;
+  });
+
+  /** Current value of forecast variable ``varKey`` at the hover lead for the active model.
+   *  Mirrors ``statAtHoverLead`` so the top-chart buttons read like the bottom-chart ones. */
+  function forecastVarAtHoverLead(varKey) {
+    const payload = forecastByVar?.[varKey];
+    const arr = forecastSeriesArray(ui.model, payload);
+    if (!arr) return null;
+    const v = interpValue(arr, chartLead);
+    if (v === null || v === undefined) return null;
+    return { value: v, units: forecastUnitsForModel(ui.model, payload) };
+  }
+
+  function selectForecastVariable(varKey) {
+    ui.forecastVariable = varKey;
   }
 
   /** Validity date for forecast lead (API rule: ``initDate`` + ``lead`` calendar days, UTC). */
@@ -367,14 +424,14 @@
     ctx.restore();
 
     // Y-axis labels: left margin at x=0
-    ctx.font = '9px "DM Sans", system-ui';
+    ctx.font = '10px "DM Sans", system-ui';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
     for (let i = 0; i <= 4; i++) {
       const v = yMin + (yMax - yMin) * i / 4;
       const y = yForValue(v);
       const txt = yTickFmt(v);
-      ctx.fillStyle = 'rgba(140,148,160,0.55)';
+      ctx.fillStyle = 'rgba(188,195,206,0.92)';
       ctx.fillText(txt, 2, y);
     }
 
@@ -399,7 +456,7 @@
       ctx.beginPath(); ctx.moveTo(barX - capW, yBot); ctx.lineTo(barX + capW, yBot); ctx.stroke();
 
       // Labels at top and bottom
-      ctx.font = '600 8px "DM Sans", system-ui';
+      ctx.font = '600 9px "DM Sans", system-ui';
       ctx.textAlign = 'center';
       const topVal = firstDataVal > lastDataVal ? firstDataVal : lastDataVal;
       const botVal = firstDataVal > lastDataVal ? lastDataVal : firstDataVal;
@@ -417,7 +474,7 @@
         const sign = perDay >= 0 ? '+' : '';
         const arrow = perDay > 0 ? '\u2191' : perDay < 0 ? '\u2193' : '';
         const rateTxt = `${arrow}${sign}${perDay.toFixed(2)}/d`;
-        ctx.font = '600 7px "DM Sans", system-ui';
+        ctx.font = '600 8px "DM Sans", system-ui';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         const midY = (yTop + yBot) / 2;
@@ -451,7 +508,7 @@
           const units = leadData[0]?.stats?.[st]?.units || '';
           const label = units ? `${val.toFixed(2)} ${units}` : val.toFixed(2);
           ctx.save();
-          ctx.font = '600 11px "DM Sans", system-ui';
+          ctx.font = '600 12px "DM Sans", system-ui';
           ctx.textAlign = 'center';
           ctx.textBaseline = 'middle';
           const tw = ctx.measureText(label).width;
@@ -796,14 +853,14 @@
     if (!region) {
       lastForecastGeoKey = '';
       forecastFetchGen += 1;
-      forecastPayload = null;
+      forecastByVar = null;
       return;
     }
     const geo = regionGeometryKey(region);
     if (!geo) {
       lastForecastGeoKey = '';
       forecastFetchGen += 1;
-      forecastPayload = null;
+      forecastByVar = null;
       return;
     }
     if (geo === lastForecastGeoKey) return;
@@ -811,9 +868,9 @@
     const fid = forecastFetchGen + 1;
     forecastFetchGen = fid;
     queueMicrotask(async () => {
-      const data = await fetchForecastAllModels({ region });
+      const data = await fetchForecastAllVariables({ region });
       if (fid !== forecastFetchGen) return;
-      forecastPayload = data?.models ? data : null;
+      forecastByVar = data;  // { [variable]: payload } or null
     });
   });
 
@@ -968,14 +1025,14 @@
     ctx.restore();
 
     // Y-axis labels: left margin at x=0
-    ctx.font = '9px "DM Sans", system-ui';
+    ctx.font = '10px "DM Sans", system-ui';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'middle';
     for (let i = 0; i <= 4; i++) {
       const v = yMin + ySpan * i / 4;
       const y = yForValue(v);
       const txt = yTickFmt(v);
-      ctx.fillStyle = 'rgba(140,148,160,0.55)';
+      ctx.fillStyle = 'rgba(188,195,206,0.92)';
       ctx.fillText(txt, 2, y);
     }
 
@@ -992,8 +1049,17 @@
         }
       }
     }
+    // Spreading can push the stack past the canvas when end values converge; shift the
+    // whole block back so the 9px text stays fully on-canvas (top and bottom).
+    if (termLabels.length) {
+      const labelMargin = 7;
+      const topOver = labelMargin - termLabels[0].y;
+      if (topOver > 0) for (const t of termLabels) t.y += topOver;
+      const botOver = termLabels[termLabels.length - 1].y - (h - labelMargin);
+      if (botOver > 0) for (const t of termLabels) t.y -= botOver;
+    }
     const marginCenterX = w - plotRight / 2;
-    ctx.font = '600 8px "DM Sans", system-ui';
+    ctx.font = '600 9px "DM Sans", system-ui';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     for (const t of termLabels) {
@@ -1036,7 +1102,7 @@
         const leadStr = formatLeadFromToday(ui.model, hlFc, Math.round(hlFc));
         const label = `${leadStr} · ${fc.value.toFixed(2)}${u}`;
         ctx.save();
-        ctx.font = '600 11px "DM Sans", system-ui';
+        ctx.font = '600 12px "DM Sans", system-ui';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         const tw = ctx.measureText(label).width;
@@ -1081,6 +1147,8 @@
   });
 </script>
 
+<svelte:window onclick={handleModelMenuWindow} onkeydown={handleModelMenuWindow} />
+
 {#if ui.selectedRegion}
   <div class="panel" class:entering={panelEntering}>
     {#if loading}
@@ -1090,6 +1158,9 @@
       </div>
     {:else if leadData.length > 0}
       <div class="panel-body">
+        <button class="close-btn" type="button" title="Close panel" aria-label="Close panel" onclick={closePanel}>
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphPanelClose}</svg>
+        </button>
         <div class="panel-content">
           <div class="chart-col">
             <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1105,14 +1176,14 @@
               role="presentation"
             >
               <div class="chart-section">
-                <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Ensemble Forecast — <span style:color={palette[ui.model]?.border || '#6eb5ff'}>{palette[ui.model]?.ident ?? ''}</span></div>
+                <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Ensemble Forecast — <span style:color={FORECAST_VAR_COLOR[ui.forecastVariable] || '#6eb5ff'}>{FORECAST_VAR_LABEL[ui.forecastVariable] || ui.forecastVariable}</span></div>
                 <div class="lead-chart">
                   <canvas bind:this={ensembleForecastCanvasEl}></canvas>
                 </div>
               </div>
 
               <div class="chart-section">
-                <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Accuracy vs time — <span style:color={statColor(activeStat)}>{statLabel(activeStat) || activeStat}</span></div>
+                <div class="section-label chart-label" style:padding-left="{50 / nLeadCols}%">Accuracy vs time — <span style:color={palette[ui.model]?.text || '#6eb5ff'}>{modelLabel(ui.model)}</span></div>
                 <div class="lead-chart">
                   <canvas bind:this={canvasEl}></canvas>
                 </div>
@@ -1180,41 +1251,85 @@
           </div>
 
           <div class="side-strip">
-            <button class="close-btn" type="button" title="Close panel" aria-label="Close panel" onclick={closePanel}>
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">{@html glyphPanelClose}</svg>
-            </button>
-            <div class="stat-grid">
-              {#each chartStats as stat}
-                {@const s = statAtHoverLead(stat)}
-                <!-- svelte-ignore a11y_click_events_have_key_events -->
-                <!-- svelte-ignore a11y_no_static_element_interactions -->
-                <div
-                  class="stat-card"
-                  class:highlighted={activeStat === stat}
-                  style="--stat-color: {statColor(stat)}"
-                  title={statisticTooltip(stat)}
-                  onclick={() => { activeStat = stat; ui.statistic = stat; ui.activeWindow = null; onstatchange?.({ target: { value: stat } }); }}
-                >
-                  <div class="stat-label">{statLabel(stat)}</div>
-                  <div class="stat-val {s ? colorClass(stat, s.value) : ''}">{s ? s.value.toFixed(2) : '\u2014'}</div>
-                  <div class="stat-unit">{s?.units || ''}</div>
-                </div>
-              {/each}
+            <!-- Selector blocks sit at the same vertical layer as the charts:
+                 forecast variables anchored to the top (Ensemble) chart, accuracy
+                 stats anchored to the bottom (Accuracy) chart. -->
+            <div class="selector-stack">
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="selector-block">
+                {#each forecastVars as v}
+                  {@const fc = forecastVarAtHoverLead(v)}
+                  <!-- svelte-ignore a11y_click_events_have_key_events -->
+                  <!-- svelte-ignore a11y_no_static_element_interactions -->
+                  <div
+                    class="stat-card"
+                    class:highlighted={ui.forecastVariable === v}
+                    style="--stat-color: {FORECAST_VAR_COLOR[v] || '#6eb5ff'}"
+                    title={`Show ${FORECAST_VAR_LABEL[v] || v} forecast`}
+                    onclick={() => selectForecastVariable(v)}
+                  >
+                    <div class="stat-label">{FORECAST_VAR_LABEL[v] || v}</div>
+                    <div class="stat-val">{fc ? fc.value.toFixed(1) : '—'}</div>
+                    <div class="stat-unit">{fc?.units || ''}</div>
+                  </div>
+                {/each}
+              </div>
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="selector-block">
+                {#each chartStats as stat}
+                  {@const s = statAtHoverLead(stat)}
+                  <!-- svelte-ignore a11y_click_events_have_key_events -->
+                  <!-- svelte-ignore a11y_no_static_element_interactions -->
+                  <div
+                    class="stat-card"
+                    class:highlighted={activeStat === stat}
+                    style="--stat-color: {statColor(stat)}"
+                    title={statisticTooltip(stat)}
+                    onclick={() => { activeStat = stat; ui.statistic = stat; ui.activeWindow = null; onstatchange?.({ target: { value: stat } }); }}
+                  >
+                    <div class="stat-label">{statLabel(stat)}</div>
+                    <div class="stat-val {s ? colorClass(stat, s.value) : ''}">{s ? s.value.toFixed(2) : '—'}</div>
+                    <div class="stat-unit">{s?.units || ''}</div>
+                  </div>
+                {/each}
+              </div>
             </div>
             <div class="strip-controls">
-              <select
-                class="panel-model-select"
-                value={ui.model}
-                onchange={onmodelchange}
-                aria-label="Forecast model"
-                title={`Model driving the map overlay and lead slider. Leads ${leadMin}–${leadMax}.`}
-              >
-                {#each appConfig.models as m}
-                  {@const dateRange = forecastDateRange(m.key)}
-                  {@const lb = getModelLeadBounds(appConfig.models, m.key)}
-                  <option value={m.key}>{m.label} ({dateRange ?? `leads ${lb.min}–${lb.max}`})</option>
-                {/each}
-              </select>
+              <div class="model-select" bind:this={modelSelectEl}>
+                <button
+                  type="button"
+                  class="model-select-trigger"
+                  class:open={modelMenuOpen}
+                  aria-haspopup="listbox"
+                  aria-expanded={modelMenuOpen}
+                  aria-label="Forecast model"
+                  title={`Model driving the map overlay and lead slider. Leads ${leadMin}–${leadMax}.`}
+                  onclick={() => (modelMenuOpen = !modelMenuOpen)}
+                >
+                  <span class="model-name" style:color={palette[ui.model]?.text || 'var(--text-primary)'}>{modelLabel(ui.model)}</span>
+                  <span class="model-range">{forecastDateRange(ui.model) ?? `leads ${leadMin}–${leadMax}`}</span>
+                  <svg class="model-caret" width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 4.5L6 7.5L9 4.5"/></svg>
+                </button>
+                {#if modelMenuOpen}
+                  <div class="model-menu" role="listbox" aria-label="Forecast model">
+                    {#each appConfig.models as m}
+                      {@const dateRange = forecastDateRange(m.key)}
+                      {@const lb = getModelLeadBounds(appConfig.models, m.key)}
+                      <button
+                        type="button"
+                        class="model-option"
+                        class:active={m.key === ui.model}
+                        role="option"
+                        aria-selected={m.key === ui.model}
+                        onclick={() => selectModel(m.key)}
+                      >
+                        <span class="model-name" style:color={palette[m.key]?.text || 'var(--text-primary)'}>{m.label}</span>
+                        <span class="model-range">{dateRange ?? `leads ${lb.min}–${lb.max}`}</span>
+                      </button>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
               <div class="period-seg">
                 {#each periodOptions as opt}
                   <button
@@ -1243,6 +1358,14 @@
 <style>
   /* ── Panel shell ── */
   .panel {
+    /* Shared chart height: each lead-chart and each selector block use this so the
+       two 2×2 selector blocks line up exactly with the two stacked charts. Bump it
+       to make both the graphs and the anchored cards larger / easier to read. */
+    --chart-h: 150px;
+    /* Height of each chart's title row. The canvas shrinks by this much so the
+       section (title + canvas) still equals --chart-h and stays aligned with the
+       selector blocks; the title therefore never overlaps the chart or its pill. */
+    --chart-title-h: 16px;
     position: absolute;
     bottom: 0;
     left: 0;
@@ -1253,7 +1376,7 @@
     -webkit-backdrop-filter: blur(24px) saturate(1.4);
     border-top: 1px solid rgba(255,255,255,0.06);
     border-radius: 14px 14px 0 0;
-    max-height: min(52vh, 100dvh - 20%);
+    max-height: min(62vh, 100dvh - 12%);
     overflow-y: auto;
     z-index: 20;
     -webkit-overflow-scrolling: touch;
@@ -1279,6 +1402,7 @@
   }
   /* ── Body layout ── */
   .panel-body {
+    position: relative;
     display: flex;
     flex-direction: column;
     gap: 0;
@@ -1315,14 +1439,20 @@
     min-width: 0;
     position: relative;
   }
+  /* Dedicated header row above the canvas (no longer floated over it), so the
+     persistent hover-value pill can never sit on top of the title text. */
   .chart-label {
-    position: absolute;
-    top: 6px;
+    height: var(--chart-title-h);
+    line-height: var(--chart-title-h);
+    margin-bottom: 0;
     pointer-events: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .lead-chart {
     width: 100%;
-    height: 100px;
+    height: calc(var(--chart-h) - var(--chart-title-h));
     position: relative;
     cursor: crosshair;
     touch-action: none;
@@ -1341,31 +1471,71 @@
     flex-direction: column;
     gap: 6px;
   }
+  /* Sits flush in the panel's top-left corner and shares its 14px radius so the two
+     curves melt together (the panel clips content to that same corner). The top/left
+     borders are dropped so the button's outer edges blend into the panel edge — only
+     the inner (right/bottom) edges are drawn, reading as a corner tab. */
   .close-btn {
-    align-self: flex-end;
-    width: 24px;
-    height: 24px;
+    position: absolute;
+    top: 0;
+    left: 0;
+    z-index: 30;
+    width: 26px;
+    height: 26px;
     display: flex;
     align-items: center;
     justify-content: center;
     border: 1px solid var(--panel-border);
-    border-radius: 5px;
+    border-top-color: transparent;
+    border-left-color: transparent;
+    border-radius: 14px 0 9px 0;
     background: var(--surface);
     color: var(--text-secondary);
     cursor: pointer;
     transition: all 0.15s;
     flex-shrink: 0;
-    margin-bottom: 2px;
   }
   .close-btn:hover {
     color: #ff8a8a;
-    background: rgba(255, 107, 107, 0.1);
-    border-color: rgba(255, 107, 107, 0.28);
+    background: rgba(255, 107, 107, 0.12);
+    border-right-color: rgba(255, 107, 107, 0.28);
+    border-bottom-color: rgba(255, 107, 107, 0.28);
   }
   .stat-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 5px;
+  }
+  /* Selector blocks anchored beside the charts at the same vertical layer:
+     forecast variables next to the top (Ensemble) chart, accuracy stats next to
+     the bottom (Accuracy) chart. The stack mirrors the charts-track-region height
+     (two 100px chart-sections + a 4px gap) so each 2×2 block lines up with its
+     graph. Both blocks share .stat-card styling so they look/behave identically. */
+  .selector-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .selector-block {
+    height: var(--chart-h);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 6px;
+  }
+  .selector-block .stat-card {
+    min-width: 0;
+    padding: 6px 6px;
+    gap: 4px;
+  }
+  .selector-block .stat-label {
+    font-size: 11px;
+  }
+  .selector-block .stat-val {
+    font-size: 23px;
+  }
+  .selector-block .stat-unit {
+    font-size: 11px;
   }
   .strip-controls {
     display: flex;
@@ -1374,35 +1544,96 @@
   }
 
   /* ── Model selector ── */
-  .panel-model-select {
+  /* ── Model selector (custom dropdown) ──
+     Native <select> can't color only the model name and leave the date range
+     neutral, so this is a button trigger + popup list. */
+  .model-select {
+    position: relative;
     width: 100%;
-    max-width: 100%;
+  }
+  .model-select-trigger {
+    position: relative;
+    width: 100%;
     box-sizing: border-box;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    text-align: left;
     background: var(--surface);
-    color: var(--text-primary);
     border: 1px solid color-mix(in srgb, var(--panel-border) 85%, transparent);
     border-radius: 6px;
-    font-size: 12px;
     font-family: inherit;
-    font-weight: 400;
-    padding: 5px 22px 5px 8px;
+    padding: 6px 26px 6px 8px;
     cursor: pointer;
     outline: none;
-    -webkit-appearance: none;
-    appearance: none;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'%3E%3Cpath fill='%237a818c' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 7px center;
     transition: border-color 0.15s, background-color 0.15s;
   }
-  .panel-model-select:hover {
+  .model-select-trigger:hover {
     border-color: var(--panel-border);
     background-color: color-mix(in srgb, var(--surface) 92%, #fff 8%);
   }
-  .panel-model-select:focus { border-color: var(--accent); }
-  .panel-model-select option {
+  .model-select-trigger.open { border-color: var(--accent); }
+  .model-caret {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-secondary);
+    transition: transform 0.15s;
+    pointer-events: none;
+  }
+  .model-select-trigger.open .model-caret { transform: translateY(-50%) rotate(180deg); }
+  .model-name {
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .model-range {
+    font-size: 11px;
+    font-weight: 400;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* Opens upward: the panel is pinned to the screen bottom, so a downward menu
+     would fall outside the panel's scroll area. */
+  .model-menu {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(100% + 4px);
+    z-index: 40;
     background: var(--panel-solid);
-    color: var(--text-primary);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    box-shadow: 0 10px 28px rgba(0,0,0,0.5);
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  .model-option {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    width: 100%;
+    text-align: left;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 6px 8px;
+    cursor: pointer;
+    font-family: inherit;
+    transition: background-color 0.12s, border-color 0.12s;
+  }
+  .model-option:hover { background: var(--hover-bg); }
+  .model-option.active {
+    background: var(--accent-glow);
+    border-color: color-mix(in srgb, var(--accent) 30%, transparent);
   }
 
   /* ── Period segmented control ── */
@@ -1529,7 +1760,7 @@
   }
   .stat-unit {
     font-size: 9px;
-    color: rgba(255,255,255,0.22);
+    color: rgba(255,255,255,0.55);
     margin: 0;
     line-height: 1.2;
   }
@@ -1538,15 +1769,26 @@
   .c-bad  { color: #f87171; }
 
   /* ── Model comparison table (inside chart column) ── */
+  /* Grows to absorb the chart column's leftover height so the left column matches
+     the side strip exactly (no empty gap under either). The selector stack and the
+     charts-track-region are the same height, so this fills the same remainder as
+     .strip-controls does on the right. */
   .compare-section {
     min-width: 0;
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
   }
   .section-label {
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: var(--text-secondary);
+    /* Brighter than --text-secondary: these name what each chart/table shows, so
+       the neutral lead-in ("Ensemble Forecast —", "Best model by day —") should
+       read clearly even though the colored variable/model word carries the accent. */
+    color: rgba(206, 213, 224, 0.92);
     margin-bottom: 5px;
   }
   .compare-section-label {
@@ -1561,22 +1803,27 @@
     padding: 4px 0;
   }
   .winners-table-wrap {
+    flex: 1 1 auto;
     overflow-x: auto;
+    overflow-y: hidden;
     border-radius: 6px;
     border: 1px solid var(--panel-border);
   }
+  /* Fill the wrap's full height (rather than centering with gaps) so the cells —
+     and the current-day column highlight on them — span the entire box. */
   .compare-table {
     width: 100%;
+    height: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: 13px;
   }
   .compare-table th {
     text-align: center;
     vertical-align: middle;
-    padding: 5px 4px;
+    padding: 7px 4px;
     color: var(--text-secondary);
     font-weight: 600;
-    font-size: 10px;
+    font-size: 11px;
     letter-spacing: 0.2px;
     border-bottom: 1px solid var(--panel-border);
     min-width: 3rem;
@@ -1584,21 +1831,34 @@
   .compare-table td {
     text-align: center;
     vertical-align: middle;
-    padding: 5px 4px;
+    padding: 8px 4px;
     min-width: 3rem;
   }
   .compare-table tr:last-child td { border-bottom: none; }
-  .compare-nodata { color: rgba(255,255,255,0.12); }
+  .compare-nodata { color: rgba(255,255,255,0.32); }
+  /* Highlight the current-day column as one continuous box spanning the header and
+     body cells (top edge on the th, bottom edge on the td, sides on both, and the
+     header divider dropped within the column) instead of outlining each separately. */
   .winners-table-cols th.winners-col-current,
   .winners-table-cols td.winners-col-current {
-    background: rgba(110, 181, 255, 0.08);
-    box-shadow: inset 0 0 0 1px rgba(110, 181, 255, 0.15);
+    background: rgba(110, 181, 255, 0.1);
+  }
+  .winners-table-cols th.winners-col-current {
+    box-shadow: inset 1px 0 0 0 rgba(110, 181, 255, 0.4),
+                inset -1px 0 0 0 rgba(110, 181, 255, 0.4),
+                inset 0 1px 0 0 rgba(110, 181, 255, 0.4);
+    border-bottom-color: transparent;
+  }
+  .winners-table-cols td.winners-col-current {
+    box-shadow: inset 1px 0 0 0 rgba(110, 181, 255, 0.4),
+                inset -1px 0 0 0 rgba(110, 181, 255, 0.4),
+                inset 0 -1px 0 0 rgba(110, 181, 255, 0.4);
   }
   .winner-pill {
     display: inline-block;
-    padding: 2px 6px;
+    padding: 3px 7px;
     border-radius: 4px;
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
     border: 1px solid transparent;
     white-space: nowrap;
@@ -1607,10 +1867,10 @@
     text-overflow: ellipsis;
   }
   .winner-pill-compact {
-    padding: 2px 4px;
-    font-size: 11px;
+    padding: 3px 4px;
+    font-size: 12px;
     border-radius: 4px;
-    width: 3.5rem;
+    width: 3.75rem;
     box-sizing: border-box;
     text-align: center;
     overflow: hidden;
@@ -1655,7 +1915,7 @@
   /* ── Mobile ── */
   @media (max-width: 720px) {
     .panel {
-      max-height: min(62dvh, 100dvh - 15%);
+      max-height: min(72dvh, 100dvh - 10%);
     }
     .panel-body {
       padding: 4px 12px calc(12px + env(safe-area-inset-bottom, 0px));
@@ -1671,6 +1931,9 @@
     .side-strip {
       width: auto;
       order: -1;
+      /* The strip stacks first on mobile, so reserve room for the larger
+         (44px) floated close button instead of letting it cover a card. */
+      padding-top: 52px;
     }
     .stat-grid {
       grid-template-columns: 1fr 1fr;
@@ -1681,13 +1944,13 @@
       flex-wrap: wrap;
       gap: 6px;
     }
-    .panel-model-select {
+    .model-select {
       flex: 1 1 auto;
       min-width: 0;
       max-width: min(220px, 100%);
-      width: 100%;
-      min-height: 36px;
-      font-size: 12px;
+    }
+    .model-select-trigger {
+      min-height: 40px;
       padding-top: 6px;
       padding-bottom: 6px;
     }
@@ -1705,7 +1968,15 @@
       padding: 8px 12px;
       flex: 1;
     }
-    .lead-chart { height: 90px; }
+    .lead-chart { height: 130px; }
+    /* Columns stack on mobile, so the blocks no longer need to mirror chart height;
+       let the cards size to their content with a comfortable tap target. */
+    .selector-block {
+      height: auto;
+    }
+    .selector-block .stat-card {
+      min-height: 58px;
+    }
     .close-btn {
       min-width: 44px;
       min-height: 44px;

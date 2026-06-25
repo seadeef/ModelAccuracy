@@ -217,4 +217,5 @@ def query_forecast_all_models_payload(
         store=resolved_store,
         forecast_store=forecast_store,
         region=payload.region.model_dump(),
+        variable=payload.variable,
     )

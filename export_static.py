@@ -107,6 +107,7 @@ from wbd_core import layer_cache_path as _wbd_layer_cache_path
 from wbd_core import parent_huc as _wbd_parent_huc
 from wbd_core import polygons_bbox as _polygons_bbox
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
+from forecast_variables import FORECAST_VARIABLES
 from stats_grid_metadata import load_model_metadata
 from statistics_plugins.registry import (
     DEFAULT_STATISTIC,
@@ -741,39 +742,82 @@ def _forecast_source(model_key: str) -> tuple[Path, str]:
     return base, variable
 
 
-def export_forecast_data_layers(forecast_root: Path) -> None:
-    """Export a model's forecast precip series → ``forecast/{model}/*.bin``.
+def _forecast_variables_on_disk(model_key: str) -> list[str]:
+    """Forecast variable keys this model has on disk, in FORECAST_VARIABLES order.
 
-    Reads the multi-variable ``forecast/{precip}/lead_*.npz`` (or the legacy flat
-    layout) via ``_forecast_source``. Writes to a separate ``forecast/`` tree (not
-    under ``model_data/``) so forecast data can be uploaded to S3 independently and
-    is never baked into the Fargate image.
+    A variable is present when ``forecast/{var}/`` holds at least one ``lead_*.npz``.
+    Returns ``[]`` for the legacy flat layout (no per-variable subdirs); callers
+    treat that as precip-only.
+    """
+    base = STATS_ROOT / model_key / "forecast"
+    return [
+        var_key
+        for var_key in FORECAST_VARIABLES
+        if (base / var_key).is_dir() and any((base / var_key).glob("lead_*.npz"))
+    ]
+
+
+def export_forecast_data_layers(forecast_root: Path) -> None:
+    """Export each model's forecast variables → ``forecast/{model}/{var}/*.bin``.
+
+    The multi-variable downloaders write ``stats_output/{model}/forecast/{var}/
+    lead_*.npz`` (single key ``"value"``) for every variable a model exposes
+    (precip/temp/wind/humidity, plus the lead-window aggregates). We mirror that
+    into a per-variable ``.bin`` tree (``forecast/{model}/{var}/``) so forecast
+    data can be uploaded to S3 independently and is never baked into the Fargate
+    image. For older single-variable exports (the legacy flat ``forecast/lead_*.npz``
+    keyed ``"precip"``) we still emit ``forecast/{model}/precip/`` so the backend
+    has one uniform path layout to read.
     """
     total = 0
     for model_key in MODEL_REGISTRY:
-        src_dir, npz_key = _forecast_source(model_key)
-        if not src_dir.is_dir():
+        base = STATS_ROOT / model_key / "forecast"
+        if not base.is_dir():
             continue
-        for npz_path in sorted(src_dir.glob("lead_*.npz")):
-            total += _export_layer(npz_path, npz_key, forecast_root / model_key)
-    print(f"  {total} forecast .bin files (forecast/{{model}}/)")
+        variables = _forecast_variables_on_disk(model_key)
+        if variables:
+            for var_key in variables:
+                var_dir = base / var_key
+                out_dir = forecast_root / model_key / var_key
+                for npz_path in sorted(var_dir.glob("lead_*.npz")):
+                    total += _export_layer(npz_path, "value", out_dir)
+        else:
+            # Legacy flat layout (precip only) → forecast/{model}/precip/.
+            _, npz_key = _forecast_source(model_key)
+            out_dir = forecast_root / model_key / "precip"
+            for npz_path in sorted(base.glob("lead_*.npz")):
+                total += _export_layer(npz_path, npz_key, out_dir)
+    print(f"  {total} forecast .bin files (forecast/{{model}}/{{var}}/)")
 
 
 def export_forecast_calendar(forecast_root: Path) -> None:
-    """Write ``forecast/forecast_calendar.json`` with per-model init dates."""
+    """Write ``forecast/forecast_calendar.json`` with per-model init dates + variables.
+
+    Each model lists the forecast ``variables`` it has on disk (in
+    FORECAST_VARIABLES order; ``["precip"]`` for the legacy flat layout). A
+    top-level ``variables`` catalog carries display metadata (label/units/colormap)
+    so the SPA can build a variable selector and legend without hardcoding it.
+    """
     per_model: dict[str, dict] = {}
     for key, config in sorted(MODEL_REGISTRY.items()):
         init_date = _get_forecast_init_date(key)
         if init_date is None:
             continue
+        variables = _forecast_variables_on_disk(key) or ["precip"]
         per_model[key] = {
             "initDate": init_date,
             "leadDaysMin": config.lead_days_min,
             "leadDaysMax": config.lead_days_max,
+            "variables": variables,
         }
 
+    catalog = [
+        {"key": v.key, "label": v.label, "units": v.units, "colormap": v.colormap}
+        for v in FORECAST_VARIABLES.values()
+    ]
+    payload = {"per_model": per_model, "variables": catalog}
     out = forecast_root / "forecast_calendar.json"
-    _write_text_if_changed(out, json.dumps({"per_model": per_model}, indent=2))
+    _write_text_if_changed(out, json.dumps(payload, indent=2))
     print(f"  {out}")
 
 

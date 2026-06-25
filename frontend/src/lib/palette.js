@@ -55,6 +55,9 @@ export function modelPalette(models) {
       bg:     `hsl(${hue} 52% 32%)`,
       fg:     `hsl(${hue} 30% 96%)`,
       border: `hsl(${hue} 45% 48%)`,
+      // Bright, saturated variant for colored text on the dark panel/dropdown
+      // (the 48% `border` reads too dark as small text on near-black).
+      text:   `hsl(${hue} 70% 70%)`,
       ident:  m.ident || modelIdent(m.label || m.key),
     };
   }

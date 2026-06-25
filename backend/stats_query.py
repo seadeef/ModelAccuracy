@@ -11,6 +11,7 @@ import numpy as np
 from backend import admin_boundaries, wbd_boundaries
 from backend.static_store import LocalStaticStore, StaticStore, default_static_site_root
 from model_registry import MODEL_REGISTRY
+from forecast_variables import FORECAST_VARIABLES
 from statistics_plugins.registry import STATISTICS_BY_NAME
 
 # ---------------------------------------------------------------------------
@@ -34,24 +35,26 @@ _forecast_bin_cache: dict[tuple, tuple[np.ndarray, float]] = {}
 # directly from the static asset (/stats/forecast/forecast_calendar.json).
 
 
-def _get_forecast_bin(store: StaticStore, model: str, lead_key: str) -> np.ndarray:
-    cache_key = (store.cache_key, model, lead_key)
+def _get_forecast_bin(
+    store: StaticStore, model: str, variable: str, lead_key: str,
+) -> np.ndarray:
+    cache_key = (store.cache_key, model, variable, lead_key)
     cached = _forecast_bin_cache.get(cache_key)
     if cached is not None:
         arr, ts = cached
         if time.monotonic() - ts < _FORECAST_TTL:
             return arr
-    raw_bytes = store.read_bytes(f"{model}/lead_{lead_key}.bin")
+    raw_bytes = store.read_bytes(f"{model}/{variable}/lead_{lead_key}.bin")
     arr = np.frombuffer(raw_bytes, dtype=np.float32)
     _forecast_bin_cache[cache_key] = (arr, time.monotonic())
     return arr
 
 
 def _read_forecast_bin_or_none(
-    store: StaticStore, model: str, lead_key: str,
+    store: StaticStore, model: str, variable: str, lead_key: str,
 ) -> np.ndarray | None:
     try:
-        return _get_forecast_bin(store, model, lead_key)
+        return _get_forecast_bin(store, model, variable, lead_key)
     except (FileNotFoundError, OSError):
         return None
 
@@ -718,16 +721,21 @@ def forecast_all_models(
     store: StaticStore,
     forecast_store: StaticStore,
     region: dict,
+    variable: str = "precip",
 ) -> dict[str, object]:
     """Forecast values for all models × all leads for a region (yearly only).
 
     *store* provides grids (``model_data/{model}/grid.json``).  *forecast_store* is
-    the separate forecast tree (``{model}/lead_{n}.bin``) that can be updated on S3
-    daily without redeploying the container.  ``forecast_calendar.json`` is fetched
-    by the SPA directly from the static asset, not echoed here.
+    the separate forecast tree (``{model}/{variable}/lead_{n}.bin``) that can be
+    updated on S3 daily without redeploying the container.  *variable* selects the
+    forecast quantity (precip/temp/wind/humidity); unknown values fall back to
+    precip.  ``forecast_calendar.json`` is fetched by the SPA directly from the
+    static asset, not echoed here.
     """
     model_order = tuple(sorted(MODEL_REGISTRY.keys()))
-    units = STATISTICS_BY_NAME["forecast"].spec.units
+    if variable not in FORECAST_VARIABLES:
+        variable = "precip"
+    units = FORECAST_VARIABLES[variable].units
 
     # Prefetch grids (from the stats store).
     for mk in model_order:
@@ -746,7 +754,7 @@ def forecast_all_models(
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         future_to_key = {
             ex.submit(
-                _read_forecast_bin_or_none, forecast_store, mk, lead_key,
+                _read_forecast_bin_or_none, forecast_store, mk, variable, lead_key,
             ): (mk, lead_key)
             for mk, lead_key in tasks
         }
@@ -797,7 +805,7 @@ def forecast_all_models(
     # forecast_calendar.json is intentionally NOT included here: the SPA fetches it
     # directly from the static asset (/stats/forecast/forecast_calendar.json) so init
     # dates stay current with new forecast exports without the backend echoing them.
-    return {"models": models_out}
+    return {"variable": variable, "models": models_out}
 
 
 def stats_for_region_all_leads(

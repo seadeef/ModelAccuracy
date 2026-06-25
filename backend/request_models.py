@@ -92,6 +92,9 @@ class ForecastAllModelsRequest(BaseModel):
     """Forecast values for all models across all leads for a given region."""
 
     region: StatsRegion
+    # Which forecast variable to return (precip/temp/wind/humidity). Defaults to
+    # precip so older clients that omit it keep their existing behavior.
+    variable: str = "precip"
 
 
 class ExportImageRequest(BaseModel):

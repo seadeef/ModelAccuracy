@@ -17,6 +17,7 @@
     teardownBoundaryLayer,
     createBoundaryHoverHandlers,
     regionGeometryHoles,
+    SELECTION_COLOR,
   } from '../mapBoundaryLayer.js';
   import {
     loadWbdIndex,
@@ -457,13 +458,21 @@
     boundaryModeLoaded = 'watershed-drill';
   }
 
+  /**
+   * Load `level`-deep children of `huc`, merge them into the accumulator and
+   * render. Returns the loaded child features (so the caller can detect a
+   * single-child pass-through level), or null if the load was aborted/superseded
+   * or failed.
+   */
   async function loadWbdLevel(huc, level, fcLoader) {
     if (wbdLoadAbort) wbdLoadAbort.abort();
     wbdLoadAbort = new AbortController();
     const signal = wbdLoadAbort.signal;
     try {
       const fc = await fcLoader(signal);
-      if (signal.aborted || !map || ui.activeTool !== 'watershed' || ui.selectedRegion) return;
+      if (signal.aborted || !map || ui.activeTool !== 'watershed' || ui.selectedRegion) {
+        return null;
+      }
       wbdGeoLevel = { huc, level };
       // Merge the freshly loaded level into the accumulator and render the union,
       // so prior levels' boundaries persist beneath the newly revealed children.
@@ -491,10 +500,12 @@
           map.fitBounds([[bounds[0], bounds[1]], [bounds[2], bounds[3]]], { padding: 40, maxZoom: 10 });
         }
       }
+      return fc.features ?? [];
     } catch (err) {
       if (err?.name !== 'AbortError') {
         console.warn('[status] Failed to load WBD boundaries', err);
       }
+      return null;
     } finally {
       wbdLoadAbort = null;
     }
@@ -528,11 +539,34 @@
     // (matches the state/county tools, which clear it on their first click).
     ui.hasUsedAreaDrawTool = true;
     const index = await ensureWbdIndex();
-    if (hasChildren(index, pending.huc)) {
-      const childLevel = nextHucLevel(pending.level);
-      await loadWbdLevel(pending.huc, childLevel, (signal) => loadHucChildren(pending.huc, childLevel, signal));
-    } else {
+    if (!hasChildren(index, pending.huc)) {
       finalizeWbd(pending);
+      return;
+    }
+    // Drill, descending through "pass-through" levels. Over half of WBD units
+    // have a single child that fills the same area (e.g. HUC4 1805 → lone HUC6
+    // 180500 → six HUC8s), so a single drill would redraw the same outline and
+    // look like nothing happened. Keep descending while a level has exactly one
+    // child until it actually subdivides — so one click always reveals real
+    // sub-regions. (`wbdPending`/breadcrumb stay on the clicked unit; the skipped
+    // children are coextensive with it.)
+    let curHuc = pending.huc;
+    let curLevel = pending.level;
+    while (true) {
+      const childLevel = nextHucLevel(curLevel);
+      const children = await loadWbdLevel(curHuc, childLevel, (signal) =>
+        loadHucChildren(curHuc, childLevel, signal),
+      );
+      if (!children || children.length !== 1) break; // load failed/superseded, or a real split
+      const only = children[0];
+      const onlyHuc = String(only.properties?.huc ?? only.id ?? '');
+      if (!hasChildren(index, onlyHuc)) {
+        // Sole descendant is a leaf with the clicked unit's extent — just select it.
+        finalizeWbd(pending);
+        return;
+      }
+      curHuc = onlyHuc;
+      curLevel = only.properties?.level ?? onlyHuc.length;
     }
   }
 
@@ -775,7 +809,7 @@
     map.addLayer({
       id: drawFillLayerId, type: 'fill', source: drawSourceId,
       filter: ['any', ['==', '$type', 'Polygon']],
-      paint: { 'fill-color': '#26d9e8', 'fill-opacity': 0.22 },
+      paint: { 'fill-color': SELECTION_COLOR, 'fill-opacity': 0.22 },
     });
     map.addLayer(
       {
@@ -793,14 +827,14 @@
     map.addLayer({
       id: drawLineLayerId, type: 'line', source: drawSourceId,
       filter: lineFilter,
-      paint: { 'line-color': '#26d9e8', 'line-width': DEFAULT_LINE_WIDTH },
+      paint: { 'line-color': SELECTION_COLOR, 'line-width': DEFAULT_LINE_WIDTH },
     });
     map.addLayer({
       id: drawPointLayerId, type: 'circle', source: drawSourceId,
       filter: ['==', '$type', 'Point'],
       paint: {
         'circle-radius': DEFAULT_POINT_RADIUS,
-        'circle-color': '#26d9e8',
+        'circle-color': SELECTION_COLOR,
         'circle-stroke-color': '#fff',
         'circle-stroke-width': 2,
       },

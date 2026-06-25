@@ -1,7 +1,11 @@
 /** Shared MapLibre boundary selection layers (admin + watershed). */
 
-export const BOUNDARY_FILL_COLOR = '#26d9e8';
-export const BOUNDARY_OUTLINE_COLOR = '#26d9e8';
+/** Amber selection accent — shared by every area-selection visual (admin/watershed
+ *  boundaries here, plus the point/rectangle/polygon draw layers in MapView) so a
+ *  picked region reads clearly against the blue weather overlay and basemap. */
+export const SELECTION_COLOR = '#ffb020';
+export const BOUNDARY_FILL_COLOR = SELECTION_COLOR;
+export const BOUNDARY_OUTLINE_COLOR = SELECTION_COLOR;
 
 /** [west, south, east, north] from a GeoJSON Polygon / MultiPolygon. */
 export function geomBbox(geom) {

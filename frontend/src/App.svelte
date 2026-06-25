@@ -170,7 +170,7 @@
     --panel-solid: #0e1117;
     --panel-border: rgba(255,255,255,0.08);
     --text-primary: #e2e5ea;
-    --text-secondary: #7a818c;
+    --text-secondary: #a3aab6;
     --accent: #6eb5ff;
     --accent-glow: rgba(110, 181, 255, 0.12);
     --hover-bg: rgba(255,255,255,0.05);

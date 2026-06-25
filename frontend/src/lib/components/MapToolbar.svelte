@@ -56,7 +56,10 @@
     transform: translateX(-50%);
     z-index: 11;
     display: flex;
-    align-items: center;
+    /* Stretch so the download button, the two label+control stacks, and the
+       dividers all share one height — the button becomes a full-height pill whose
+       top aligns with the labels and bottom with the controls (symmetric boxes). */
+    align-items: stretch;
     flex-wrap: wrap;
     justify-content: center;
     gap: 10px 12px;
@@ -69,28 +72,30 @@
     border-radius: 14px;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
   }
+  /* Subtle, neutral styling that matches the area-selector tool buttons — surface
+     fill and a faint border rather than the accent gradient, so it doesn't compete
+     with the controls beside it. Accent only shows up on hover. */
   .btn-download {
     display: inline-flex;
     align-items: center;
+    justify-content: center;
     gap: 8px;
-    padding: 8px 14px;
-    border: none;
-    border-radius: 10px;
-    background: linear-gradient(180deg, rgba(110, 181, 255, 0.22), rgba(110, 181, 255, 0.1));
-    color: #b8d9ff;
+    padding: 0 16px;
+    border-radius: 9px;
+    background: var(--surface);
+    color: var(--text-secondary);
     font-size: 13px;
     font-weight: 600;
     font-family: inherit;
     cursor: pointer;
-    border: 1px solid rgba(110, 181, 255, 0.35);
-    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--panel-border);
     white-space: nowrap;
     transition: background 0.15s, color 0.15s, border-color 0.15s;
   }
   .btn-download:hover {
-    background: linear-gradient(180deg, rgba(110, 181, 255, 0.32), rgba(110, 181, 255, 0.16));
-    color: #e8f3ff;
-    border-color: rgba(110, 181, 255, 0.5);
+    background: var(--hover-bg);
+    color: var(--text-primary);
+    border-color: rgba(110, 181, 255, 0.3);
   }
   @media (max-width: 640px) {
     .map-toolbar {
@@ -99,6 +104,9 @@
       right: max(8px, env(safe-area-inset-right, 0px));
       transform: none;
       max-width: none;
+      /* Controls wrap and use fixed heights on mobile — center them per row rather
+         than stretching to the tallest item in that row. */
+      align-items: center;
       justify-content: flex-start;
       row-gap: 8px;
     }
@@ -124,32 +132,34 @@
   }
   .toolbar-sep {
     width: 1px;
-    height: var(--toolbar-control-height);
+    /* Full-height divider so it spans the label+control stacks, not just the control row. */
+    align-self: stretch;
     background: var(--panel-border);
     flex-shrink: 0;
   }
   .opacity-block {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    /* Label pinned to the top, control to the bottom, so every section shares the
+       same top and bottom edges as the full-height download button. */
+    justify-content: space-between;
+    gap: 4px;
   }
   .search-block {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    justify-content: space-between;
+    gap: 4px;
     align-items: stretch;
     min-width: 240px;
   }
-  .search-block .ctrl-label {
-    text-align: left;
-  }
   .ctrl-label {
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
-    letter-spacing: 0.45px;
-    color: var(--text-secondary);
-    text-align: center;
+    letter-spacing: 0.5px;
+    color: rgba(202, 210, 222, 0.9);
+    text-align: left;
   }
   .opacity-row {
     display: flex;

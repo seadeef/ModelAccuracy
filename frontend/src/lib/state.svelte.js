@@ -18,6 +18,9 @@ export const ui = $state({
   leadFractional: 1.0,
   activeWindow: null,
 
+  /** Forecast variable shown on the Ensemble Forecast chart: precip|temp|wind|humidity. */
+  forecastVariable: 'precip',
+
   // Draw tools: 'point' | 'rectangle' | 'polygon' | 'state' | 'county' | 'watershed' | null
   activeTool: 'point',
 
