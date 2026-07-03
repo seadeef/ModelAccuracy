@@ -65,6 +65,9 @@ function modelDisplayName(models, key) {
  */
 function forecastColumnsFromPayload(forecastPayload, models) {
   if (!forecastPayload?.models) return { columns: [], valueAt: () => null };
+  // The forecast panel is multi-variable now — name the variable in the header
+  // so a CSV of e.g. temp isn't ambiguous with precip.
+  const variable = forecastPayload.variable || 'precip';
   const columns = [];
   const leadsByModel = new Map();
   for (const [modelKey, entry] of Object.entries(forecastPayload.models)) {
@@ -87,7 +90,7 @@ function forecastColumnsFromPayload(forecastPayload, models) {
       : init
       ? ` (init ${init})`
       : '';
-    columns.push({ modelKey, header: `Forecast ${label}${suffix}` });
+    columns.push({ modelKey, header: `Forecast ${variable} ${label}${suffix}` });
     leadsByModel.set(modelKey, leadsObj);
   }
   return {

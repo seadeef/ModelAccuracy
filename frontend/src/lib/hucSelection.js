@@ -57,8 +57,9 @@ export async function loadWbdIndex() {
  * The top-level index only carries HUC2 units; a region's deeper metadata
  * (HUC4..HUC12, needed to know which units are drillable) lives in
  * `/wbd/index/{huc2}.json` and is fetched only on the first drill into that
- * region. A missing file (a HUC2 with no descendants) caches as empty, so
- * callers never refetch or throw. Returns the resident units map.
+ * region. A 404 (a HUC2 with no descendants) caches as empty; a transient
+ * network / 5xx error is NOT cached, so a later drill retries (mirrors
+ * loadWbdIndex). Returns the resident units map (empty on a failed attempt).
  */
 export async function ensureHucSubtree(huc) {
   const key = String(huc).slice(0, 2);
@@ -66,14 +67,21 @@ export async function ensureHucSubtree(huc) {
   if (cached?.units) return cached.units;
   if (cached?.promise) return cached.promise;
   const promise = fetch(`${STATIC_BASE}/wbd/index/${key}.json`)
-    .then((resp) => (resp.ok ? resp.json() : { units: {} }))
+    .then((resp) => {
+      // 404 is legitimate (childless HUC2) → cache empty; other failures throw.
+      if (resp.status === 404) return { units: {} };
+      if (!resp.ok) throw new Error(`WBD subtree fetch failed (${resp.status})`);
+      return resp.json();
+    })
     .then((data) => {
       const units = data?.units ?? {};
       subindexCache.set(key, { units, promise: null });
       return units;
     })
     .catch(() => {
-      subindexCache.set(key, { units: {}, promise: null });
+      // Transient error: drop the entry so the next drill refetches; degrade
+      // gracefully (empty) for this attempt instead of throwing mid-drill.
+      subindexCache.delete(key);
       return {};
     });
   subindexCache.set(key, { units: null, promise });

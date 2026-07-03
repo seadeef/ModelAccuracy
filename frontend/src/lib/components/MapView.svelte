@@ -540,9 +540,15 @@
     // (matches the state/county tools, which clear it on their first click).
     ui.hasUsedAreaDrawTool = true;
     await ensureWbdIndex();
-    // Pull this HUC2's descendant metadata before drilling — the pass-through
-    // loop below inspects hasChildren on HUC4+ children even for a HUC2 click.
-    await ensureHucSubtree(pending.huc);
+    // Pull this HUC2's descendant metadata AND prefetch its immediate children in
+    // parallel: the pass-through loop needs hasChildren (from the subtree) and, for
+    // almost every click, the child topojson too — so overlap the two fetches
+    // instead of doing them back-to-back. A failed prefetch is harmless; the loop
+    // refetches through loadWbdLevel's superseding path (topoCache dedups the hit).
+    await Promise.all([
+      ensureHucSubtree(pending.huc),
+      loadHucChildren(pending.huc, nextHucLevel(pending.level)).catch(() => null),
+    ]);
     if (!hasChildren(pending.huc)) {
       finalizeWbd(pending);
       return;
