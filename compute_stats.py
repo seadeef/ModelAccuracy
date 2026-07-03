@@ -59,7 +59,17 @@ def _configure_for_model(model_key: str) -> None:
     _active_lead_windows = list(config.lead_windows)
 
 # Task discovery: downloaders produce .npy files (CONUS-cropped float32 arrays).
+# The (?P<level>...) group is the variable suffix; only precipitation
+# ("surface", the historical precip suffix per downloaders/base.py) is verified
+# against PRISM — see _build_tasks_for_inits.
 LEAD_NPY_RE = re.compile(r"f(?P<fhour>\d{3})_(?P<level>[^.]+)\.npy$")
+
+# manifest.json schema. v2 records processed work per (init, lead) pair so a
+# late-arriving PRISM day is picked up for an init that was only partially
+# ingested, and a failed task simply retries (it is absent from the map). A v1
+# manifest triggers a full recompute (which the statistics-correctness changes
+# require anyway).
+MANIFEST_SCHEMA_VERSION = 2
 
 THREADS_PER_PROCESS = 4
 CACHE_MAX_ITEMS = 32
@@ -307,12 +317,25 @@ def _grid_meta_from_saved_metadata(stats_root: Path) -> GridMeta:
     )
 
 
-def _build_tasks_for_inits(init_dirs: list[Path]) -> Tuple[list[StatsTask], int]:
+def _build_tasks_for_inits(
+    init_dirs: list[Path],
+    processed_pairs: dict[str, set[int]] | None = None,
+) -> Tuple[list[StatsTask], int]:
+    """Build the (init, lead) tasks to process from these init dirs.
+
+    A task is emitted only when the file is the precipitation field, the lead is
+    in range, its PRISM day is on disk, and the (init, lead) pair has not already
+    been folded into the accumulators (``processed_pairs``: {init_name: {leads}}).
+    Passing PRISM existence here means a day whose PRISM arrives late becomes a
+    task on the next run without touching the init that referenced it.
+    """
     tasks: list[StatsTask] = []
     skipped_partial_files = 0
+    processed_pairs = processed_pairs or {}
 
     for init_dir in init_dirs:
         init_date = _parse_init_date(init_dir.name)
+        done_leads = processed_pairs.get(init_dir.name, ())
 
         for path in sorted(init_dir.iterdir()):
             if not path.is_file():
@@ -323,10 +346,19 @@ def _build_tasks_for_inits(init_dirs: list[Path]) -> Tuple[list[StatsTask], int]
             m = LEAD_NPY_RE.match(path.name)
             if not m:
                 continue
+            # Precipitation only. Since 2026-05-21 every init also carries
+            # f{hh}_temp/_wind/_humidity .npy files; folding °C / m/s into the
+            # precip accumulators would permanently corrupt them. Temp/wind/
+            # humidity verification is future work with a different reference
+            # dataset (PRISM ppt is precip-only).
+            if m.group("level") != "surface":
+                continue
             fhour = int(m.group("fhour"))
             lead_days = fhour // 24
             if lead_days < LEAD_DAYS_MIN or lead_days > LEAD_DAYS_MAX:
                 continue
+            if lead_days in done_leads:
+                continue  # already ingested; skip to avoid double-counting
 
             valid_date = init_date + timedelta(days=lead_days)
             prism_tif = _get_prism_tif_path(valid_date)
@@ -411,12 +443,14 @@ def _merge_task_result(
 def _compute_years_chunk(
     model_key: str,
     year_init_dirs: list[tuple[int, list[Path]]],
+    processed_pairs: dict[str, set[int]] | None = None,
 ) -> Tuple[
     MonthAccumulators,
     Tuple[float, float, float, float, float, float] | None,
     Tuple[int, int] | None,
     int,
     int,
+    dict[str, set[int]],
 ]:
     """Process a chunk of years. Runs in a child process.
 
@@ -428,8 +462,13 @@ def _compute_years_chunk(
     ``GFS_DIR`` match *model_key* (required when the process start method is
     ``spawn``, which re-imports this module and resets globals to defaults).
 
-    Returns (accumulators, transform_tuple, grid_shape, task_count, skipped).
-    accumulators is month-keyed: {month: {lead: {stat: {key: array}}}}.
+    ``processed_pairs`` ({init_name: {leads}}) is forwarded to the task builder
+    to skip already-ingested pairs.
+
+    Returns (accumulators, transform_tuple, grid_shape, task_count, skipped,
+    ingested_pairs). ``ingested_pairs`` ({init_name: {leads}}) is exactly the
+    (init, lead) pairs successfully folded in — failed tasks are absent so they
+    retry. accumulators is month-keyed: {month: {lead: {stat: {key: array}}}}.
     """
     _configure_for_model(model_key)
     cache = _ReprojectionCache()
@@ -438,16 +477,17 @@ def _compute_years_chunk(
     grid_shape: Tuple[int, int] | None = None
     total_tasks = 0
     total_skipped = 0
+    ingested_pairs: dict[str, set[int]] = defaultdict(set)
 
     # Collect all tasks across years in this chunk, preserving date order.
     all_tasks: list[StatsTask] = []
     for _year, init_dirs in year_init_dirs:
-        tasks, skipped = _build_tasks_for_inits(init_dirs)
+        tasks, skipped = _build_tasks_for_inits(init_dirs, processed_pairs)
         all_tasks.extend(tasks)
         total_skipped += skipped
 
     if not all_tasks:
-        return accumulators, grid_transform_tuple, grid_shape, 0, total_skipped
+        return accumulators, grid_transform_tuple, grid_shape, 0, total_skipped, {}
 
     def process_task(task: StatsTask):
         return task, _process_single_task(task, cache)
@@ -474,9 +514,13 @@ def _compute_years_chunk(
 
             month = task.valid_date.month
             _merge_task_result(accumulators, month, lead_days, stat_accs)
+            ingested_pairs[task.npy_path.parent.name].add(task.lead_days)
             total_tasks += 1
 
-    return accumulators, grid_transform_tuple, grid_shape, total_tasks, total_skipped
+    return (
+        accumulators, grid_transform_tuple, grid_shape,
+        total_tasks, total_skipped, dict(ingested_pairs),
+    )
 
 
 def _merge_lead_accumulators(
@@ -542,17 +586,39 @@ def _load_manifest(output_root: Path) -> dict | None:
         return json.load(f)
 
 
+def _manifest_processed_pairs(manifest: dict | None) -> dict[str, set[int]]:
+    """Extract the {init_name: {leads}} map from a v2 manifest.
+
+    Returns {} for a missing manifest or one predating schema v2, so callers can
+    treat 'nothing processed yet' uniformly (a full recompute then re-populates
+    it from scratch).
+    """
+    if not manifest or manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        return {}
+    return {init: set(leads) for init, leads in manifest.get("processed", {}).items()}
+
+
+def _merge_pairs(dst: dict[str, set[int]], src: dict[str, set[int]]) -> None:
+    """Union the (init, lead) pairs of *src* into *dst* in place."""
+    for init, leads in src.items():
+        dst.setdefault(init, set()).update(leads)
+
+
 def _save_manifest(
-    output_root: Path, processed_inits: list[str],
+    output_root: Path, processed_pairs: dict[str, set[int]],
     lead_min: int, lead_max: int,
 ) -> None:
-    """Write manifest.json tracking which init dates have been processed."""
+    """Write manifest.json (schema v2) recording the exact (init, lead) pairs
+    folded into the accumulators."""
     output_root.mkdir(parents=True, exist_ok=True)
     manifest = {
-        "processed_inits": sorted(processed_inits),
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "storage": "monthly",
         "lead_days_min": lead_min,
         "lead_days_max": lead_max,
-        "storage": "monthly",
+        "processed": {
+            init: sorted(leads) for init, leads in sorted(processed_pairs.items())
+        },
     }
     with open(output_root / "manifest.json", "w") as f:
         json.dump(manifest, f, indent=2)
@@ -601,7 +667,7 @@ def _load_existing_accumulators(
 
 
 def _compute_lead_stats(model_key: str) -> Tuple[
-    MonthAccumulators, GridMeta, int, list[str]
+    MonthAccumulators, GridMeta, int, dict[str, set[int]]
 ]:
     init_dirs = _list_gfs_inits()
     if not init_dirs:
@@ -624,6 +690,7 @@ def _compute_lead_stats(model_key: str) -> Tuple[
     total_tasks = 0
     total_skipped = 0
     chunk_accumulators: list[MonthAccumulators] = []
+    ingested_pairs: dict[str, set[int]] = {}
     grid_transform_tuple: Tuple[float, float, float, float, float, float] | None = None
     grid_shape: Tuple[int, int] | None = None
 
@@ -634,9 +701,10 @@ def _compute_lead_stats(model_key: str) -> Tuple[
         }
         for future in as_completed(futures):
             chunk_idx = futures[future]
-            acc, t_tuple, shape, task_count, skipped = future.result()
+            acc, t_tuple, shape, task_count, skipped, chunk_pairs = future.result()
             total_tasks += task_count
             total_skipped += skipped
+            _merge_pairs(ingested_pairs, chunk_pairs)
 
             if task_count > 0:
                 chunk_accumulators.append(acc)
@@ -663,13 +731,18 @@ def _compute_lead_stats(model_key: str) -> Tuple[
         None, grid_transform_tuple, "EPSG:4326", grid_shape
     )
 
-    return merged, grid_meta, total_skipped, [d.name for d in init_dirs]
+    return merged, grid_meta, total_skipped, ingested_pairs
 
 
 def _compute_lead_stats_incremental(model_key: str) -> Tuple[
-    MonthAccumulators, GridMeta, int, list[str]
+    MonthAccumulators | None, GridMeta | None, int, dict[str, set[int]] | None
 ]:
-    """Incremental version: load existing accumulators and only process new init dirs."""
+    """Incremental update: load existing accumulators and fold in every
+    (init, lead) pair whose PRISM is now on disk but that the manifest has not
+    yet recorded. Unlike the old whole-init scan, this picks up late-arriving
+    PRISM for *old* inits — an init that contributed zero tasks because its
+    PRISM days were missing is revisited once they land, instead of being
+    permanently marked done."""
     manifest = _load_manifest(OUTPUT_ROOT)
     if manifest is None:
         raise RuntimeError(
@@ -677,9 +750,9 @@ def _compute_lead_stats_incremental(model_key: str) -> Tuple[
             "Run without --incremental first to create one."
         )
 
-    if manifest.get("storage") != "monthly":
+    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         raise RuntimeError(
-            "Existing manifest uses old storage format. "
+            "Manifest predates per-(init, lead) tracking (schema v2). "
             "Run without --incremental to recompute from scratch."
         )
 
@@ -698,19 +771,23 @@ def _compute_lead_stats_incremental(model_key: str) -> Tuple[
             "Run without --incremental to recompute from scratch."
         )
 
-    processed = set(manifest["processed_inits"])
+    processed_pairs = _manifest_processed_pairs(manifest)
     all_init_dirs = _list_gfs_inits()
-    new_init_dirs = [d for d in all_init_dirs if d.name not in processed]
-    all_init_names = [d.name for d in all_init_dirs]
 
-    if not new_init_dirs:
-        print("No new init dates to process. Statistics are up to date.")
-        return None, None, 0, all_init_names
+    # Cheap pre-scan (globs + stat only, no array loads) to see whether any
+    # unprocessed (init, lead) with PRISM now on disk remains. Also tells us
+    # which years actually have work, so we don't spawn idle processes.
+    pending, _ = _build_tasks_for_inits(all_init_dirs, processed_pairs)
+    if not pending:
+        print("No new (init, lead) tasks to process. Statistics are up to date.")
+        return None, None, 0, None
 
-    print(f"Found {len(new_init_dirs)} new init date(s) to process "
-          f"(out of {len(all_init_dirs)} total).")
+    pending_years = {int(t.npy_path.parent.parent.name) for t in pending}
+    relevant_init_dirs = [d for d in all_init_dirs if int(d.parent.name) in pending_years]
+    print(f"Found {len(pending)} new (init, lead) task(s) across "
+          f"{len(pending_years)} year(s) to process.")
 
-    by_year = _group_inits_by_year(new_init_dirs)
+    by_year = _group_inits_by_year(relevant_init_dirs)
     year_items = list(by_year.items())
     num_workers = min(len(year_items), max(1, os.cpu_count() or 1))
     chunks = _distribute_years(year_items, num_workers)
@@ -723,19 +800,21 @@ def _compute_lead_stats_incremental(model_key: str) -> Tuple[
     total_tasks = 0
     total_skipped = 0
     chunk_accumulators: list[MonthAccumulators] = []
+    ingested_pairs: dict[str, set[int]] = {}
     grid_transform_tuple: Tuple[float, float, float, float, float, float] | None = None
     grid_shape: Tuple[int, int] | None = None
 
     with ProcessPoolExecutor(max_workers=len(chunks)) as pool:
         futures = {
-            pool.submit(_compute_years_chunk, model_key, chunk): i
+            pool.submit(_compute_years_chunk, model_key, chunk, processed_pairs): i
             for i, chunk in enumerate(chunks)
         }
         for future in as_completed(futures):
             chunk_idx = futures[future]
-            acc, t_tuple, shape, task_count, skipped = future.result()
+            acc, t_tuple, shape, task_count, skipped, chunk_pairs = future.result()
             total_tasks += task_count
             total_skipped += skipped
+            _merge_pairs(ingested_pairs, chunk_pairs)
 
             if task_count > 0:
                 chunk_accumulators.append(acc)
@@ -764,7 +843,11 @@ def _compute_lead_stats_incremental(model_key: str) -> Tuple[
         # No new tasks produced grid info; load model-level metadata from disk.
         grid_meta = _grid_meta_from_saved_metadata(OUTPUT_ROOT)
 
-    return merged, grid_meta, total_skipped, all_init_names
+    # New manifest state = everything previously recorded ∪ what we just folded in.
+    combined_pairs = {init: set(leads) for init, leads in processed_pairs.items()}
+    _merge_pairs(combined_pairs, ingested_pairs)
+
+    return merged, grid_meta, total_skipped, combined_pairs
 
 
 def _sum_lead_accumulators(
@@ -918,6 +1001,10 @@ def _can_do_incremental() -> bool:
     manifest = _load_manifest(OUTPUT_ROOT)
     if manifest is None:
         return False
+    if manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        print("  Manifest predates per-(init, lead) tracking (schema v2). "
+              "Full recompute required.")
+        return False
     if manifest.get("storage") != "monthly":
         print("  Old manifest without monthly storage. Full recompute required.")
         return False
@@ -938,18 +1025,18 @@ def main(model_key: str = DEFAULT_MODEL) -> None:
 
     if _can_do_incremental():
         print("Existing stats complete, checking for new data...")
-        accumulators, grid_meta, skipped_partial_files, all_inits = (
+        accumulators, grid_meta, skipped_partial_files, processed_pairs = (
             _compute_lead_stats_incremental(model_key)
         )
         if accumulators is None:
             return
     else:
         print("Full recompute required.")
-        accumulators, grid_meta, skipped_partial_files, all_inits = (
+        accumulators, grid_meta, skipped_partial_files, processed_pairs = (
             _compute_lead_stats(model_key)
         )
     _write_stats(accumulators, grid_meta)
-    _save_manifest(OUTPUT_ROOT, all_inits, LEAD_DAYS_MIN, LEAD_DAYS_MAX)
+    _save_manifest(OUTPUT_ROOT, processed_pairs, LEAD_DAYS_MIN, LEAD_DAYS_MAX)
     if skipped_partial_files:
         print(f"Skipped {skipped_partial_files} partial files (*.part).")
     print(f"Wrote statistics to {OUTPUT_ROOT.resolve()}")
