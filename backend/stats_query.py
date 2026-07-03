@@ -21,6 +21,39 @@ from statistics_plugins.registry import STATISTICS_BY_NAME
 # cache hits.  Dict reads/writes for simple keys are atomic under CPython's
 # GIL, which is sufficient for the ThreadPoolExecutor concurrency used below.
 # ---------------------------------------------------------------------------
+
+
+class _BoundedLRU:
+    """Thread-safe bounded LRU (OrderedDict + Lock). Values must be non-None."""
+
+    def __init__(self, maxsize: int):
+        self._max = maxsize
+        self._lock = Lock()
+        self._d: "OrderedDict" = OrderedDict()
+
+    def get(self, key):
+        with self._lock:
+            value = self._d.get(key)
+            if value is not None:
+                self._d.move_to_end(key)
+            return value
+
+    def put(self, key, value) -> None:
+        with self._lock:
+            self._d[key] = value
+            self._d.move_to_end(key)
+            while len(self._d) > self._max:
+                self._d.popitem(last=False)  # evict least-recently used
+
+
+# Shared thread pool for every I/O fan-out (bin reads, per-(model, lead)
+# losses). One module-level pool bounds total worker threads across concurrent
+# requests instead of each request building its own — an unauthenticated caller
+# can no longer multiply Fargate's thread count by fanning out. Sized to overlap
+# S3 latency and to match the S3 client's connection pool (see static_store).
+_EXECUTOR_WORKERS = 16
+_EXECUTOR = ThreadPoolExecutor(max_workers=_EXECUTOR_WORKERS, thread_name_prefix="stats")
+
 _grid_cache: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, int, int]] = {}
 # Verification stat bins (~156 KB each).  Bounded LRU so a long-lived Fargate
 # worker that serves many (model, stat, lead, accumulator) combinations can't
@@ -30,11 +63,14 @@ _grid_cache: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, int, int]] = {}
 _BIN_CACHE_MAX = 512
 _bin_cache_lock = Lock()
 _bin_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
-# Keyed by (id(lats), id(lons), level, fips); the grid arrays are themselves
-# cached above, so their ``id()`` is stable for the life of the process and
-# different (store, model) pairs produce distinct arrays.
-_admin_mask_cache: dict[tuple[int, int, str, str], np.ndarray] = {}
-_huc_mask_cache: dict[tuple[int, int, str], np.ndarray] = {}
+# Region masks (bool arrays, ~40 KB each). Admin/HUC masks are keyed by the
+# resident grid arrays' id() + boundary id; ad-hoc polygon/rectangle masks by
+# grid id + geometry signature, so lead_winners reuses one mask across every
+# lead. All bounded so a long-lived worker can't accumulate masks without limit.
+_MASK_CACHE_MAX = 2048
+_admin_mask_cache = _BoundedLRU(_MASK_CACHE_MAX)
+_huc_mask_cache = _BoundedLRU(_MASK_CACHE_MAX)
+_geom_mask_cache = _BoundedLRU(_MASK_CACHE_MAX)
 
 # Forecast data lives in a separate store (S3 prefix) updated daily without
 # redeploying the container.  TTL caches ensure new data is picked up.
@@ -82,29 +118,19 @@ def _get_forecast_cell(
 ) -> float | None:
     """Single grid-cell forecast value for point regions.
 
-    Reuses a resident full array when one is already cached; otherwise reads only
-    the 4 bytes at *flat_idx* via a byte-range request instead of pulling the whole
-    ~156 KB grid.  Returns the raw float (may be NaN — callers test ``isfinite``).
+    Fetches the full bin through the TTL cache and indexes it, rather than an
+    uncached per-cell byte-range GET. A point click reads one cell per
+    (model, variable, lead); caching the whole bin means repeated clicks (within
+    the 5-min TTL) hit RAM instead of re-issuing ~200 S3 GETs each time, and a
+    416 InvalidRange can't happen. Returns the raw float (may be NaN — callers
+    test ``isfinite``).
     """
-    cache_key = (store.cache_key, model, variable, lead_key)
-    with _forecast_bin_cache_lock:
-        cached = _forecast_bin_cache.get(cache_key)
-        if cached is not None:
-            arr, ts = cached
-            if time.monotonic() - ts < _FORECAST_TTL:
-                _forecast_bin_cache.move_to_end(cache_key)
-                return float(arr[flat_idx]) if 0 <= flat_idx < arr.size else None
     if flat_idx < 0:
         return None
-    try:
-        raw = store.read_range(
-            f"{model}/{variable}/lead_{lead_key}.bin", flat_idx * 4, 4
-        )
-    except (FileNotFoundError, OSError):
+    arr = _read_forecast_bin_or_none(store, model, variable, lead_key)
+    if arr is None or flat_idx >= arr.size:
         return None
-    if len(raw) < 4:
-        return None
-    return float(np.frombuffer(raw, dtype=np.float32)[0])
+    return float(arr[flat_idx])
 
 
 def _data_bin_relative_path(
@@ -191,7 +217,7 @@ def _read_bin_or_none(
             month=month,
             season=season,
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return None
 
 
@@ -206,29 +232,21 @@ def _get_bin_cell(
     month: str | None,
     season: str | None,
 ) -> float | None:
-    """Single grid-cell verification value for point regions (byte-range read).
+    """Single grid-cell verification value for point regions.
 
-    Reuses a resident full array when cached; otherwise reads only the one float32
-    instead of the whole ~156 KB grid.  Returns the raw float (may be NaN).
+    Fetches the full bin through the bounded LRU cache and indexes it, rather than
+    an uncached per-cell byte-range GET — repeated point queries then hit RAM
+    instead of re-reading from S3, and a 416 InvalidRange can't happen (mirrors
+    _get_forecast_cell). Returns the raw float (may be NaN).
     """
-    cache_key = (store.cache_key, model, stat_name, lead_key, period, month, season)
-    with _bin_cache_lock:
-        cached = _bin_cache.get(cache_key)
-        if cached is not None:
-            _bin_cache.move_to_end(cache_key)
-            return float(cached[flat_idx]) if 0 <= flat_idx < cached.size else None
     if flat_idx < 0:
         return None
-    relative_path = str(_data_bin_relative_path(
-        model, stat_name, lead_key, period=period, month=month, season=season
-    ))
-    try:
-        raw = store.read_range(relative_path, flat_idx * 4, 4)
-    except (FileNotFoundError, OSError):
+    arr = _read_bin_or_none(
+        store, model, stat_name, lead_key, period=period, month=month, season=season
+    )
+    if arr is None or flat_idx >= arr.size:
         return None
-    if len(raw) < 4:
-        return None
-    return float(np.frombuffer(raw, dtype=np.float32)[0])
+    return float(arr[flat_idx])
 
 
 def _cells_for_stats_parallel(
@@ -252,17 +270,16 @@ def _cells_for_stats_parallel(
             store, model, sn, lead_key, flat_idx, period=period, month=month, season=season
         )}
     out: dict[str, float | None] = {}
-    with ThreadPoolExecutor(max_workers=len(stat_names)) as ex:
-        future_to_stat = {
-            ex.submit(
-                _get_bin_cell,
-                store, model, sn, lead_key, flat_idx,
-                period=period, month=month, season=season,
-            ): sn
-            for sn in stat_names
-        }
-        for fut in as_completed(future_to_stat):
-            out[future_to_stat[fut]] = fut.result()
+    future_to_stat = {
+        _EXECUTOR.submit(
+            _get_bin_cell,
+            store, model, sn, lead_key, flat_idx,
+            period=period, month=month, season=season,
+        ): sn
+        for sn in stat_names
+    }
+    for fut in as_completed(future_to_stat):
+        out[future_to_stat[fut]] = fut.result()
     return out
 
 
@@ -282,24 +299,22 @@ def _bins_for_stats_parallel(
     if len(stat_names) == 1:
         sn = stat_names[0]
         return {sn: _read_bin_or_none(store, model, sn, lead_key, period=period, month=month, season=season)}
-    max_workers = len(stat_names)
     out: dict[str, np.ndarray | None] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_to_stat = {
-            ex.submit(
-                _read_bin_or_none,
-                store,
-                model,
-                sn,
-                lead_key,
-                period=period,
-                month=month,
-                season=season,
-            ): sn
-            for sn in stat_names
-        }
-        for fut in as_completed(future_to_stat):
-            out[future_to_stat[fut]] = fut.result()
+    future_to_stat = {
+        _EXECUTOR.submit(
+            _read_bin_or_none,
+            store,
+            model,
+            sn,
+            lead_key,
+            period=period,
+            month=month,
+            season=season,
+        ): sn
+        for sn in stat_names
+    }
+    for fut in as_completed(future_to_stat):
+        out[future_to_stat[fut]] = fut.result()
     return out
 
 
@@ -421,21 +436,6 @@ def _polygon_mask_centers_or_corners(
     return mask
 
 
-def _mask_nearest_cell(
-    lats: np.ndarray,
-    lons: np.ndarray,
-    n_lat: int,
-    n_lon: int,
-    lon: float,
-    lat: float,
-) -> np.ndarray:
-    mask = np.zeros(n_lat * n_lon, dtype=bool)
-    r = int(np.argmin(np.abs(lats - lat)))
-    c = int(np.argmin(np.abs(lons - lon)))
-    mask[r * n_lon + c] = True
-    return mask
-
-
 def _multi_polygon_mask(
     lats: np.ndarray,
     lons: np.ndarray,
@@ -485,18 +485,16 @@ def _admin_region_mask(
         entry = admin_boundaries.get_entry(level, fips)
     except (KeyError, admin_boundaries.AdminBoundariesUnavailable):
         empty = np.zeros(n_lat * n_lon, dtype=bool)
-        _admin_mask_cache[cache_key] = empty
+        _admin_mask_cache.put(cache_key, empty)
         return empty
     polygons = entry.get("polygons") or []
     mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
     if not np.any(mask):
         mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
-    if not np.any(mask):
-        west, south, east, north = entry["bbox"]
-        cx = (west + east) / 2
-        cy = (south + north) / 2
-        mask = _mask_nearest_cell(lats, lons, n_lat, n_lon, cx, cy)
-    _admin_mask_cache[cache_key] = mask
+    # No centroid fallback: a region that covers no grid cell (too small, or off
+    # the grid) is honest no_data — not the nearest edge cell dressed up as the
+    # region's value.
+    _admin_mask_cache.put(cache_key, mask)
     return mask
 
 
@@ -515,18 +513,14 @@ def _huc_region_mask(
         entry = wbd_boundaries.get_entry(huc)
     except (KeyError, ValueError, wbd_boundaries.WbdBoundariesUnavailable):
         empty = np.zeros(n_lat * n_lon, dtype=bool)
-        _huc_mask_cache[cache_key] = empty
+        _huc_mask_cache.put(cache_key, empty)
         return empty
     polygons = entry.get("polygons") or []
     mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
     if not np.any(mask):
         mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
-    if not np.any(mask):
-        west, south, east, north = entry["bbox"]
-        cx = (west + east) / 2
-        cy = (south + north) / 2
-        mask = _mask_nearest_cell(lats, lons, n_lat, n_lon, cx, cy)
-    _huc_mask_cache[cache_key] = mask
+    # No centroid fallback (see _admin_region_mask): no covered cell → no_data.
+    _huc_mask_cache.put(cache_key, mask)
     return mask
 
 
@@ -542,24 +536,28 @@ def _build_region_mask(
 
     if region_type == "rectangle":
         west, south, east, north = region["bounds"]
+        geom_key = (id(lats), id(lons), "rect", west, south, east, north)
+        cached = _geom_mask_cache.get(geom_key)
+        if cached is not None:
+            return cached
+        # No nearest-cell fabrication: a rectangle covering no grid cell is no_data.
         mask = _mask_rectangle_overlap(lats, lons, west, south, east, north)
-        if not np.any(mask):
-            cx = (west + east) / 2
-            cy = (south + north) / 2
-            mask = _mask_nearest_cell(lats, lons, n_lat, n_lon, cx, cy)
+        _geom_mask_cache.put(geom_key, mask)
         return mask
 
     if region_type == "polygon":
         ring = [[float(p[0]), float(p[1])] for p in region.get("coordinates", [])]
         if len(ring) < 3:
             return mask
+        geom_key = (id(lats), id(lons), "poly", tuple((p[0], p[1]) for p in ring))
+        cached = _geom_mask_cache.get(geom_key)
+        if cached is not None:
+            return cached
         mask = _polygon_mask_centers(lats, lons, n_lat, n_lon, ring)
         if not np.any(mask):
             mask = _polygon_mask_centers_or_corners(lats, lons, n_lat, n_lon, ring)
-        if not np.any(mask):
-            cx = sum(p[0] for p in ring) / len(ring)
-            cy = sum(p[1] for p in ring) / len(ring)
-            mask = _mask_nearest_cell(lats, lons, n_lat, n_lon, cx, cy)
+        # No nearest-cell fabrication: a polygon covering no grid cell is no_data.
+        _geom_mask_cache.put(geom_key, mask)
         return mask
 
     if region_type == "admin":
@@ -615,8 +613,16 @@ def stats_for_region(
         lat = float(region["coordinates"][1])
         lat_idx = int(np.argmin(np.abs(lats - lat)))
         lon_idx = int(np.argmin(np.abs(lons - lon)))
+        # Honest no-data for an off-grid click: if the nearest cell center is more
+        # than ~one grid step away on either axis, the point isn't inside any cell,
+        # so don't report that edge cell as though it were the point's value.
+        lat_step = float(abs(lats[1] - lats[0])) if lats.size > 1 else float("inf")
+        lon_step = float(abs(lons[1] - lons[0])) if lons.size > 1 else float("inf")
+        if (abs(float(lats[lat_idx]) - lat) > lat_step
+                or abs(float(lons[lon_idx]) - lon) > lon_step):
+            return {stat_name: _no_data_entry(stat_name) for stat_name in stat_names}
         flat_idx = lat_idx * n_lon + lon_idx
-        # Only one cell is needed — read 4 bytes per stat, not the whole grid.
+        # One cell needed — the cached full bin is indexed, not the whole grid re-read.
         cells = _cells_for_stats_parallel(
             resolved_store,
             model,
@@ -674,9 +680,11 @@ def stats_for_region(
 
 
 def _winner_metric_label(stat_name: str) -> str:
-    """Same comparison semantics as ``export_static`` domain winners; values are region-aggregated."""
+    """Human-readable description of how models are ranked for this statistic."""
     if stat_name == "bias":
-        return "region_mean_abs_value_lower_better"
+        # O5: rank by |regional signed-mean bias| so the ranking matches the
+        # signed mean shown in the panel (not the mean of per-cell |bias|).
+        return "region_abs_mean_value_lower_better"
     if stat_name == "cc":
         return "region_mean_value_higher_better"
     return "region_mean_value_lower_better"
@@ -701,8 +709,10 @@ def _region_loss_scalar(
     flat_idx: int | None = None,
 ) -> float | None:
     """
-    Scalar loss for winner selection; **lower is better** (CC uses negated mean).
-    Matches ``export_static._scalar_loss_from_npz`` but over a mask or single grid cell.
+    Scalar loss for winner selection; **lower is better**. Bias ranks by the
+    magnitude of the region's signed-mean bias (|mean|, O5), so the winner
+    matches the signed number shown in the panel; CC negates the mean (higher
+    correlation → lower loss); every other stat uses the plain region mean.
     """
     if flat_idx is not None:
         return _loss_from_value(values[flat_idx], stat_name)
@@ -714,7 +724,7 @@ def _region_loss_scalar(
     if finite.size == 0:
         return None
     if stat_name == "bias":
-        return float(np.mean(np.abs(finite)))
+        return float(abs(np.mean(finite)))
     if stat_name == "cc":
         return float(-np.mean(finite))
     return float(np.mean(finite))
@@ -780,8 +790,9 @@ def lead_winners_for_region(
     max_lead: int,
 ) -> dict[str, object]:
     """
-    For each lead day, pick the model with best (lowest) loss over ``region``,
-    using the same formulas as static ``lead_winners.json`` (mean / mean abs / negated CC).
+    For each lead day, pick the model with the lowest loss over ``region`` (see
+    ``_region_loss_scalar``: |signed mean| for bias, negated mean for CC, plain
+    mean otherwise). Computed live — there is no static lead_winners.json.
     """
     model_order = tuple(sorted(MODEL_REGISTRY.keys()))
 
@@ -794,19 +805,17 @@ def lead_winners_for_region(
     tasks: list[tuple[str, str]] = [
         (mk, str(lead)) for lead in lead_range for mk in model_order
     ]
-    max_workers = min(len(tasks), 20)
     loss_results: dict[tuple[str, str], float | None] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_to_key = {
-            ex.submit(
-                _region_loss_for_model_lead,
-                store, mk, stat_name, lead_key, region,
-                period=period, month=month, season=season,
-            ): (mk, lead_key)
-            for mk, lead_key in tasks
-        }
-        for fut in as_completed(future_to_key):
-            loss_results[future_to_key[fut]] = fut.result()
+    future_to_key = {
+        _EXECUTOR.submit(
+            _region_loss_for_model_lead,
+            store, mk, stat_name, lead_key, region,
+            period=period, month=month, season=season,
+        ): (mk, lead_key)
+        for mk, lead_key in tasks
+    }
+    for fut in as_completed(future_to_key):
+        loss_results[future_to_key[fut]] = fut.result()
 
     leads_out: dict[str, str] = {}
     for lead in lead_range:
@@ -884,7 +893,6 @@ def forecast_all_models(
 
     # value_by_task[(model, lead_key)] = finite region value, or None for no_data.
     value_by_task: dict[tuple[str, str], float | None] = {}
-    max_workers = min(len(tasks), 20)
 
     if is_point:
         # Each model has its own grid, so resolve the cell index per model, then
@@ -897,31 +905,29 @@ def forecast_all_models(
             lat_idx = int(np.argmin(np.abs(lats - lat)))
             lon_idx = int(np.argmin(np.abs(lons - lon)))
             flat_by_model[mk] = lat_idx * n_lon + lon_idx
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            future_to_key = {
-                ex.submit(
-                    _get_forecast_cell, forecast_store, mk, variable, lead_key,
-                    flat_by_model[mk],
-                ): (mk, lead_key)
-                for mk, lead_key in tasks
-            }
-            for fut in as_completed(future_to_key):
-                v = fut.result()
-                value_by_task[future_to_key[fut]] = (
-                    v if v is not None and np.isfinite(v) else None
-                )
+        future_to_key = {
+            _EXECUTOR.submit(
+                _get_forecast_cell, forecast_store, mk, variable, lead_key,
+                flat_by_model[mk],
+            ): (mk, lead_key)
+            for mk, lead_key in tasks
+        }
+        for fut in as_completed(future_to_key):
+            v = fut.result()
+            value_by_task[future_to_key[fut]] = (
+                v if v is not None and np.isfinite(v) else None
+            )
     else:
         # Region masks need the full grid, so read whole bins and take the mean.
         bin_results: dict[tuple[str, str], np.ndarray | None] = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            future_to_key = {
-                ex.submit(
-                    _read_forecast_bin_or_none, forecast_store, mk, variable, lead_key,
-                ): (mk, lead_key)
-                for mk, lead_key in tasks
-            }
-            for fut in as_completed(future_to_key):
-                bin_results[future_to_key[fut]] = fut.result()
+        future_to_key = {
+            _EXECUTOR.submit(
+                _read_forecast_bin_or_none, forecast_store, mk, variable, lead_key,
+            ): (mk, lead_key)
+            for mk, lead_key in tasks
+        }
+        for fut in as_completed(future_to_key):
+            bin_results[future_to_key[fut]] = fut.result()
         for mk in model_order:
             lats, lons, n_lat, n_lon = _get_grid(store, mk)
             mask = _build_region_mask(lats, lons, n_lat, n_lon, region)
@@ -990,24 +996,22 @@ def stats_for_region_all_leads(
             }
             for lead in lead_range
         ]
-    max_workers = min(len(lead_range), 20)
     by_lead: dict[int, dict[str, dict[str, float | None | str | bool]]] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        future_to_lead = {
-            ex.submit(
-                stats_for_region,
-                store=resolved_store,
-                model=model,
-                lead=lead,
-                region=region,
-                stat_names=stat_names,
-                period=period,
-                month=month,
-                season=season,
-            ): lead
-            for lead in lead_range
-        }
-        for fut in as_completed(future_to_lead):
-            lead = future_to_lead[fut]
-            by_lead[lead] = fut.result()
+    future_to_lead = {
+        _EXECUTOR.submit(
+            stats_for_region,
+            store=resolved_store,
+            model=model,
+            lead=lead,
+            region=region,
+            stat_names=stat_names,
+            period=period,
+            month=month,
+            season=season,
+        ): lead
+        for lead in lead_range
+    }
+    for fut in as_completed(future_to_lead):
+        lead = future_to_lead[fut]
+        by_lead[lead] = fut.result()
     return [{"lead": lead, "stats": by_lead[lead]} for lead in lead_range]

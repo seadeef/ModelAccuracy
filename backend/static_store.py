@@ -71,7 +71,10 @@ class S3StaticStore:
         if client is None:
             if boto3 is None or _aws_client is None:
                 raise RuntimeError("boto3 is required for S3StaticStore")
-            client = _aws_client("s3")
+            from botocore.config import Config
+            # Match the stats-query thread pool (16) plus headroom so concurrent
+            # bin reads aren't serialized by botocore's default 10-connection pool.
+            client = _aws_client("s3", config=Config(max_pool_connections=32))
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self.client = client

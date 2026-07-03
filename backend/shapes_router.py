@@ -39,7 +39,7 @@ def create_shapes_router(
     router = APIRouter(prefix="/api/shapes", tags=["shapes"])
 
     @router.post("", status_code=201, response_model=SavedShapeResponse)
-    async def create_shape(
+    def create_shape(
         body: SavedShapeCreate,
         user_id: str = Depends(get_current_user),
     ):
@@ -54,19 +54,19 @@ def create_shapes_router(
         )
 
     @router.get("", response_model=SavedShapeListResponse)
-    async def list_shapes(user_id: str = Depends(get_current_user)):
+    def list_shapes(user_id: str = Depends(get_current_user)):
         shapes = store.list_shapes(user_id)
         return SavedShapeListResponse(shapes=shapes)
 
     @router.get("/{shape_id}", response_model=SavedShapeResponse)
-    async def get_shape(shape_id: str, user_id: str = Depends(get_current_user)):
+    def get_shape(shape_id: str, user_id: str = Depends(get_current_user)):
         shape = store.get_shape(user_id, shape_id)
         if shape is None:
             raise HTTPException(status_code=404, detail="Shape not found")
         return shape
 
     @router.put("/{shape_id}", response_model=SavedShapeResponse)
-    async def update_shape(
+    def update_shape(
         shape_id: str,
         body: SavedShapeUpdate,
         user_id: str = Depends(get_current_user),
@@ -82,7 +82,7 @@ def create_shapes_router(
         return result
 
     @router.delete("/{shape_id}", status_code=204, response_class=Response)
-    async def delete_shape(shape_id: str, user_id: str = Depends(get_current_user)):
+    def delete_shape(shape_id: str, user_id: str = Depends(get_current_user)):
         deleted = store.delete_shape(user_id, shape_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Shape not found")

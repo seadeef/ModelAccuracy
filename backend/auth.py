@@ -161,7 +161,10 @@ def build_get_current_user(
     When *verifier* is ``None`` (Cognito env vars missing), returns 503.
     """
 
-    async def get_current_user(
+    # Sync def: Starlette runs a sync dependency in its threadpool, so the
+    # blocking JWKS fetch (urllib) on first call / key rotation never stalls the
+    # event loop — matching the sync stats handlers.
+    def get_current_user(
         authorization: str | None = Header(None),
     ) -> str:
         if verifier is None:
@@ -170,13 +173,7 @@ def build_get_current_user(
                 detail="Authentication is not configured on this server",
             )
         if not authorization:
-            print(f"[AUTH DEBUG] No Authorization header received")
             raise HTTPException(status_code=401, detail="Missing Authorization header")
-        print(f"[AUTH DEBUG] Authorization header present, length={len(authorization)}")
-        try:
-            return verifier.get_user_id(authorization)
-        except HTTPException as exc:
-            print(f"[AUTH DEBUG] Verification failed: {exc.detail}")
-            raise
+        return verifier.get_user_id(authorization)
 
     return get_current_user
