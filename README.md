@@ -121,7 +121,7 @@ python export_static.py --static          # S3: zip + topos + config/tiles/range
 Verification statistics (computed from model + PRISM pairs):
 
 - **bias** — mean precipitation bias (mm)
-- **sacc** — spatial anomaly correlation coefficient (%)
+- **cc** — correlation coefficient (Pearson on raw values, unitless −1..1)
 - **nrmse** — normalized root mean square error (%)
 - **nmad** — normalized mean absolute difference (%)
 

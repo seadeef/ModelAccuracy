@@ -5,7 +5,7 @@ const STATISTIC_HELP = {
   bias: 'Bias (mean model minus observation). Near zero is best.',
   nrmse: 'Normalized root mean square error. Lower is better.',
   nmad: 'Normalized mean absolute deviation. Lower is better.',
-  sacc: 'Structured anomaly correlation. Higher is better.',
+  cc: 'Correlation coefficient (Pearson, raw values). Higher is better.',
   forecast: 'Forecast metric. See documentation for interpretation.',
 };
 

@@ -2,20 +2,17 @@ from __future__ import annotations
 
 import numpy as np
 
-from statistics_plugins.base import StatisticSpec
-
-EPSILON = 1e-10
+from statistics_plugins.base import StatisticSpec, MIN_MEAN_OBS_MM
 
 
 class NMADPlugin:
     # Diverging colormap with a fixed 0–200 % range.  100% NMAD (error
     # magnitude equals mean obs) lands at the white midpoint, which is a
     # meaningful threshold; cells stay blue while error < mean and shift
-    # toward red as error grows past it.  The fixed range matters because
-    # localized arid pixels can produce 4000%+ NMAD (mean_obs ≈ 0); without
-    # the cap, percentile-driven vmin/vmax got pulled outward and the rest
-    # of the map collapsed to extremes.  Arid pixels still render — they
-    # just clamp to saturated red.
+    # toward red as error grows past it.  Arid pixels (period-mean obs <
+    # MIN_MEAN_OBS_MM) are NaN-masked in finalize rather than producing
+    # 4000%+ ratios, so the fixed range is just a display clamp for
+    # legitimately large error.
     spec = StatisticSpec(
         name="nmad",
         label="NMAD",
@@ -58,7 +55,12 @@ class NMADPlugin:
             count_f = count[valid].astype(np.float32)
             mad = accumulator["sum_abs_error"][valid] / count_f
             average = accumulator["sum_obs"][valid] / count_f
-            value[valid] = (mad / (average + EPSILON)) * 100.0
+            # Leave arid cells (period-mean obs below the floor) as NaN — the
+            # ratio there is dominated by division noise, not skill.
+            ratio = np.full(average.shape, np.nan, dtype=np.float32)
+            wet = average >= MIN_MEAN_OBS_MM
+            ratio[wet] = (mad[wet] / average[wet]) * 100.0
+            value[valid] = ratio
 
         return {
             "value": value,

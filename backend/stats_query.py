@@ -677,18 +677,18 @@ def _winner_metric_label(stat_name: str) -> str:
     """Same comparison semantics as ``export_static`` domain winners; values are region-aggregated."""
     if stat_name == "bias":
         return "region_mean_abs_value_lower_better"
-    if stat_name == "sacc":
+    if stat_name == "cc":
         return "region_mean_value_higher_better"
     return "region_mean_value_lower_better"
 
 
 def _loss_from_value(v: float, stat_name: str) -> float | None:
-    """Per-cell loss (lower is better): abs for bias, negated for SACC, else identity."""
+    """Per-cell loss (lower is better): abs for bias, negated for CC, else identity."""
     if not np.isfinite(v):
         return None
     if stat_name == "bias":
         return float(abs(v))
-    if stat_name == "sacc":
+    if stat_name == "cc":
         return float(-v)
     return float(v)
 
@@ -701,7 +701,7 @@ def _region_loss_scalar(
     flat_idx: int | None = None,
 ) -> float | None:
     """
-    Scalar loss for winner selection; **lower is better** (SACC uses negated mean).
+    Scalar loss for winner selection; **lower is better** (CC uses negated mean).
     Matches ``export_static._scalar_loss_from_npz`` but over a mask or single grid cell.
     """
     if flat_idx is not None:
@@ -715,7 +715,7 @@ def _region_loss_scalar(
         return None
     if stat_name == "bias":
         return float(np.mean(np.abs(finite)))
-    if stat_name == "sacc":
+    if stat_name == "cc":
         return float(-np.mean(finite))
     return float(np.mean(finite))
 
@@ -781,7 +781,7 @@ def lead_winners_for_region(
 ) -> dict[str, object]:
     """
     For each lead day, pick the model with best (lowest) loss over ``region``,
-    using the same formulas as static ``lead_winners.json`` (mean / mean abs / negated SACC).
+    using the same formulas as static ``lead_winners.json`` (mean / mean abs / negated CC).
     """
     model_order = tuple(sorted(MODEL_REGISTRY.keys()))
 

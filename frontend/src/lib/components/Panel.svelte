@@ -641,13 +641,14 @@
   }
 
   /**
-   * Good / ok / bad tiers for panel values (same units as API: % for SACC/NRMSE/NMAD, mm for bias).
+   * Good / ok / bad tiers for panel values (same units as API: % for NRMSE/NMAD,
+   * unitless -1..1 for CC, mm for bias).
    * Cutoffs rounded from a one-off analysis of static_export/ranges (legend vmin/vmax per
    * model/stat/period) so tiers sit near the scale of real outputs instead of mistaken 0–1 bounds.
    */
   function colorClass(statName, value) {
     if (value == null) return '';
-    if (statName === 'sacc') return value > 42 ? 'c-good' : value > 20 ? 'c-ok' : 'c-bad';
+    if (statName === 'cc') return value > 0.42 ? 'c-good' : value > 0.20 ? 'c-ok' : 'c-bad';
     if (statName === 'nmad') return value < 100 ? 'c-good' : value < 125 ? 'c-ok' : 'c-bad';
     if (statName === 'nrmse') return value < 350 ? 'c-good' : value < 510 ? 'c-ok' : 'c-bad';
     if (statName === 'bias') {

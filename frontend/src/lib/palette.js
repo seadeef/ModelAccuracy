@@ -12,7 +12,7 @@
 export const STAT_COLORS = {
   nrmse: '#6eb5ff',   // blue
   bias:  '#e0a4ff',   // lavender
-  sacc:  '#5ce0d6',   // teal
+  cc:    '#5ce0d6',   // teal
   nmad:  '#f0a07a',   // peach
 };
 

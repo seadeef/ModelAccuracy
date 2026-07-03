@@ -253,14 +253,21 @@ def _reproject_prism_to_gfs(
             message=r".*[Nn]o geotransform.*|.*identity matrix will be returned.*",
             category=UserWarning,
         )
+        # Downsampling PRISM (~4 km) onto the model grid (~25 km): area-average,
+        # not nearest. The forecast cell is an areal mean, so verifying it against
+        # a single 4 km PRISM pixel (nearest) inflated RMSE/MAD; averaging the
+        # ~40 fine pixels into each coarse cell compares like with like.
+        # src_nodata=NaN so PRISM's ocean/off-CONUS NaNs are excluded from the
+        # mean rather than poisoning coastal cells.
         reproject(
             source=prism_data,
             destination=dst,
             src_transform=prism_transform,
             src_crs=prism_crs,
+            src_nodata=np.nan,
             dst_transform=gfs_transform,
             dst_crs="EPSG:4326",
-            resampling=Resampling.nearest,
+            resampling=Resampling.average,
             dst_nodata=np.nan,
         )
     return dst

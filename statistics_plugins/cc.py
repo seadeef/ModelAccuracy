@@ -7,34 +7,25 @@ from statistics_plugins.base import StatisticSpec
 EPSILON = 1e-10
 
 
-class SACCPlugin:
-    """Per-pixel temporal Pearson correlation between model and obs time series.
+class CCPlugin:
+    """Per-pixel Pearson correlation coefficient (CC) between the model and
+    observed daily-precip time series, pooled over all valid days.
 
-    Naming caveat: this is mathematically TCORR (temporal correlation), not a
-    strict SACC.  True SACC is a *spatial* correlation that produces one scalar
-    per forecast time, which can't be rendered as a per-pixel map; the metric
-    here is the closest per-pixel relative we can show.  Pearson correlation is
-    shift-invariant, so subtracting a per-pixel time-mean (a degenerate
-    "climatology") would give an identical answer — promoting this to true ACC
-    would require a *time-varying* climatology (e.g., per-pixel monthly mean
-    subtracted from each day's values), which is a bigger refactor.
-
-    Renders with ``diverging_reversed`` (red→white→blue) and a fixed 0–100 %
-    range so we share the colormap family with bias and so the convention
-    "blue = good skill" matches NMAD / NRMSE's "blue = low error".  A typical
-    CONUS day-1 cluster (SACC 60–90 %) lands in the upper blue half with
-    visible gradient; the white midpoint at 50 % is well below the cluster,
-    so the map doesn't wash out the way it did with percentile-driven
-    auto-ranging.
+    This is the lab-standard CC — plain Pearson on raw values, no anomaly or
+    climatology subtraction. Stored unitless in [-1, 1]; rendered with
+    ``diverging_reversed`` (blue = high correlation, matching NMAD / NRMSE's
+    "blue = good") over a fixed [0, 1] display range, so a negative correlation
+    clamps to red (no skill) on the map while point queries still read the true
+    signed value.
     """
 
     spec = StatisticSpec(
-        name="sacc",
-        label="SACC",
-        units="%",
+        name="cc",
+        label="CC",
+        units="",
         render_field="value",
         colormap="diverging_reversed",
-        fixed_range=(0.0, 100.0),
+        fixed_range=(0.0, 1.0),
     )
 
     def init_accumulator(self, shape: tuple[int, int]) -> dict[str, np.ndarray]:
@@ -81,8 +72,9 @@ class SACCPlugin:
         valid = (n > 1.0) & (denominator > EPSILON)
         if np.any(valid):
             corr = numerator[valid] / denominator[valid]
-            value[valid] = (corr * 100.0).astype(np.float32)
-        value = np.clip(value, -100.0, 100.0)
+            value[valid] = corr.astype(np.float32)
+        # Store the true signed correlation in [-1, 1]; the [0, 1] clamp is
+        # display-only (applied via spec.fixed_range at render time).
 
         return {
             "value": value,

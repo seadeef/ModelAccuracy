@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from statistics_plugins.base import StatisticSpec
-
-EPSILON = 1e-10
+from statistics_plugins.base import StatisticSpec, MIN_MEAN_OBS_MM
 
 
 class NRMSEPlugin:
@@ -12,10 +10,9 @@ class NRMSEPlugin:
     # is routinely 100–500 %  (RMSE > mean is the norm given the variance of
     # rainfall), so the natural midpoint is well above 100 %; 400 % puts the
     # white center near the cross-lead median and lets the gradient span the
-    # bulk of the data.  The fixed cap keeps localized arid-pixel outliers
-    # (mean_obs ≈ 0 → values in the thousands) from pulling the percentile
-    # range outward — they clamp to saturated red instead of poisoning the
-    # rest of the map.
+    # bulk of the data.  Arid pixels (period-mean obs < MIN_MEAN_OBS_MM) are now
+    # NaN-masked in finalize rather than producing thousands-of-percent values,
+    # so the fixed cap is just a display clamp for legitimately large ratios.
     spec = StatisticSpec(
         name="nrmse",
         label="NRMSE",
@@ -57,7 +54,12 @@ class NRMSEPlugin:
             count_f = count[valid].astype(np.float32)
             rmse = np.sqrt(accumulator["sum_squared_error"][valid] / count_f)
             average = accumulator["sum_obs"][valid] / count_f
-            value[valid] = (rmse / (average + EPSILON)) * 100.0
+            # Leave arid cells (period-mean obs below the floor) as NaN — the
+            # ratio there is dominated by division noise, not skill.
+            ratio = np.full(average.shape, np.nan, dtype=np.float32)
+            wet = average >= MIN_MEAN_OBS_MM
+            ratio[wet] = (rmse[wet] / average[wet]) * 100.0
+            value[valid] = ratio
 
         return {
             "value": value,

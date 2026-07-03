@@ -139,9 +139,11 @@ def _assemble_one(item: tuple) -> None:
     Reads four 6h GRIB2 files, sums precipitation, reprojects from Lambert
     Conformal to a regular lat/lon grid, and saves as ``.npy``.
 
-    Reprojection uses nearest-neighbor resampling: bilinear smooths accumulated
-    precip, does not preserve cell totals, and can smear fronts/coasts when
-    moving from projected grids to lat/lon.
+    Reprojection uses area-average resampling: NBM's ~2.5 km grid is downsampled
+    to 0.25° (~28 km), so each coarse cell should hold the areal mean of the fine
+    cells it covers. Nearest samples a single fine cell (not a total, despite the
+    old "preserves totals" rationale) and adds sampling noise that inflates the
+    verification error against averaged PRISM.
     """
     import numpy as np
     import rasterio
@@ -166,11 +168,11 @@ def _assemble_one(item: tuple) -> None:
             else:
                 total += data
 
-    # Reproject from Lambert Conformal to regular lat/lon.
-    # Nearest avoids bilinear smoothing of QPF totals and boundary artifacts;
-    # geometry still depends on rasterio/GRIB georeferencing being correct.
+    # Reproject from Lambert Conformal to regular lat/lon with area-average
+    # resampling (downsampling ~2.5 km → 0.25°); geometry still depends on
+    # rasterio/GRIB georeferencing being correct.
     dst = _reproject_to_target(
-        total, src_transform, src_crs, target_transform, target_w, target_h, Resampling.nearest,
+        total, src_transform, src_crs, target_transform, target_w, target_h, Resampling.average,
     )
 
     npy_out.parent.mkdir(parents=True, exist_ok=True)
