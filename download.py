@@ -13,6 +13,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,8 +22,23 @@ from model_registry import MODEL_REGISTRY, DEFAULT_MODEL, ModelConfig
 from downloaders.prism_downloader import PRISMDownloaderParallel
 
 
+def _dir_has_no_regular_files(d: Path) -> bool:
+    """True if *d* exists but contains no regular file anywhere below it.
+
+    A failed day can leave an init dir holding only empty ``_apcp``/``_inst``/
+    ``_6h`` subdirs; ``rglob`` walks past those so we can tell 'nothing was
+    written' from 'a subdir exists'.
+    """
+    return d.exists() and not any(p.is_file() for p in d.rglob("*"))
+
+
 def _find_latest_model_date(config: ModelConfig) -> datetime | None:
-    """Find the most recent init date on disk for a model."""
+    """Most recent init date on disk that actually holds assembled data.
+
+    Requires ≥1 ``f*_surface.npy`` — a bare init dir (mkdir'd before any byte
+    landed, or left behind by a failed day) does not count, so a failed day
+    can't poison catchup's start-date detection into skipping it permanently.
+    """
     data_dir = Path(config.data_dir)
     if not data_dir.exists():
         return None
@@ -30,14 +46,21 @@ def _find_latest_model_date(config: ModelConfig) -> datetime | None:
         if not year_dir.is_dir() or not year_dir.name.isdigit():
             continue
         for init_dir in sorted(year_dir.iterdir(), reverse=True):
-            if init_dir.is_dir() and init_dir.name.endswith(f"_{config.cycle_hour:02d}z"):
+            if (init_dir.is_dir()
+                    and init_dir.name.endswith(f"_{config.cycle_hour:02d}z")
+                    and next(init_dir.glob("f*_surface.npy"), None) is not None):
                 date_str = init_dir.name.split("_")[0]
                 return datetime.strptime(date_str, "%Y%m%d")
     return None
 
 
 def _find_latest_prism_date() -> datetime | None:
-    """Find the most recent PRISM date on disk."""
+    """Most recent PRISM date on disk with an extracted ``data.tif``.
+
+    An empty day directory (mkdir'd before download, or left by a failed
+    extraction) is ignored so it can't push catchup's start date past a day
+    that was never actually downloaded.
+    """
     prism_dir = Path("prism_data")
     if not prism_dir.exists():
         return None
@@ -45,7 +68,8 @@ def _find_latest_prism_date() -> datetime | None:
         if not year_dir.is_dir() or not year_dir.name.isdigit():
             continue
         for day_dir in sorted(year_dir.iterdir(), reverse=True):
-            if day_dir.is_dir() and len(day_dir.name) == 8 and day_dir.name.isdigit():
+            if (day_dir.is_dir() and len(day_dir.name) == 8 and day_dir.name.isdigit()
+                    and (day_dir / "data.tif").exists()):
                 return datetime.strptime(day_dir.name, "%Y%m%d")
     return None
 
@@ -138,17 +162,6 @@ def _run_catchup(models: list[ModelConfig]) -> None:
             print(f"Model '{config.key}' is up to date (latest: {latest.date()})")
 
 
-def _forecast_dir_has_data(config: ModelConfig, date: datetime, cycle: int | None = None) -> bool:
-    """Check whether the init directory has converted .npy lead files ready for extraction."""
-    if cycle is None:
-        cycle = config.cycle_hour
-    date_str = date.strftime("%Y%m%d")
-    init_dir = Path(config.data_dir) / str(date.year) / f"{date_str}_{cycle:02d}z"
-    if not init_dir.exists():
-        return False
-    return any(init_dir.glob("f*_*.npy"))
-
-
 def _run_weathernext2_forecast(config: ModelConfig) -> None:
     """Forecast download for WeatherNext 2. Google publishes 00/06/12/18z inits
     on GCS; probe for whatever is available and pick the freshest complete cycle
@@ -172,7 +185,7 @@ def _run_weathernext2_forecast(config: ModelConfig) -> None:
     init_date, cycle = target
     print(f"\n--- WeatherNext 2 latest available init: {init_date.date()} {cycle:02d}z ---")
 
-    if _forecast_dir_has_data(config, init_date, cycle):
+    if downloader.forecast_init_complete(config, init_date, cycle):
         print(f"Already downloaded ({init_date.date()} {cycle:02d}z).")
     else:
         if not downloader.download_forecast_init(init_date, cycle):
@@ -206,11 +219,13 @@ def _run_forecast(config: ModelConfig) -> None:
     defaults = dict(config.downloader_defaults)
     downloader = cls(**defaults)
 
+    # "Has data" now means the init is *complete* (every variable × every lead),
+    # so an interrupted download resumes instead of publishing partial leads.
     resolved_date = None
-    if _forecast_dir_has_data(config, today):
+    if downloader.forecast_init_complete(config, today):
         print(f"\nForecast data for model '{config.key}' already downloaded ({today.date()}).")
         resolved_date = today
-    elif _forecast_dir_has_data(config, yesterday):
+    elif downloader.forecast_init_complete(config, yesterday):
         print(f"\nForecast data for model '{config.key}' already downloaded ({yesterday.date()}).")
         resolved_date = yesterday
     else:
@@ -222,13 +237,14 @@ def _run_forecast(config: ModelConfig) -> None:
                 end_date=date_str,
                 forecast_hours=forecast_hours,
             )
-            if _forecast_dir_has_data(config, attempt_date):
+            if downloader.forecast_init_complete(config, attempt_date):
                 resolved_date = attempt_date
                 break
-            date_str_compact = attempt_date.strftime("%Y%m%d")
-            empty_dir = Path(config.data_dir) / str(attempt_date.year) / f"{date_str_compact}_{config.cycle_hour:02d}z"
-            if empty_dir.exists() and not any(empty_dir.iterdir()):
-                empty_dir.rmdir()
+            # Drop an init dir that never got a file (only empty _apcp/_inst/_6h
+            # subdirs), which would otherwise be a permanent archive hole.
+            empty_dir = downloader.init_dir_for(config, attempt_date)
+            if _dir_has_no_regular_files(empty_dir):
+                shutil.rmtree(empty_dir, ignore_errors=True)
             print(f"No forecast data available for {date_str}, trying previous day...")
 
     if resolved_date is None:

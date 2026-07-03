@@ -56,9 +56,10 @@ class PRISMDownloaderParallel(BaseDownloader):
         return f"{self.base_url}/{PRISM_VARIABLE}/daily/{date.year}/{self._daily_filename(date)}"
 
     def _output_path(self, date: datetime) -> Path:
-        date_dir = self.output_dir / str(date.year) / f"{date:%Y%m%d}"
-        date_dir.mkdir(parents=True, exist_ok=True)
-        return date_dir / "data.zip"
+        """Zip target path. Deliberately does not create the day directory — that
+        is deferred to the first successful write so a 404 / failed day leaves no
+        empty dir behind (an empty PRISM dir poisons catchup's latest-date probe)."""
+        return self.output_dir / str(date.year) / f"{date:%Y%m%d}" / "data.zip"
 
     def _day_download_complete(self, date: datetime, *, want_extract: bool) -> bool:
         """True if we already have this day on disk in the form the caller wants.
@@ -129,6 +130,7 @@ class PRISMDownloaderParallel(BaseDownloader):
                         return task, "404"
                     r.raise_for_status()
                     tmp = out.with_suffix(out.suffix + ".part")
+                    out.parent.mkdir(parents=True, exist_ok=True)  # defer dir creation to first byte
                     total_size = int(r.headers.get("content-length", 0))
                     downloaded = 0
                     with open(tmp, "wb") as f:

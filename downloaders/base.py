@@ -188,6 +188,42 @@ class BaseDownloader:
         from forecast_variables import FORECAST_VARIABLES
         return [FORECAST_VARIABLES[k] for k in model_config.variables]
 
+    @staticmethod
+    def _forecast_var_suffix(var) -> str:
+        """Daily .npy filename suffix for a forecast variable: precip keeps the
+        historical 'surface' suffix; instant vars use their key."""
+        return "surface" if var.key == "precip" else var.key
+
+    def init_dir_for(
+        self, model_config: "ModelConfig", init_date: datetime, cycle: int | None = None
+    ) -> Path:
+        """Path to a model init dir (…/{YYYY}/{YYYYMMDD}_{HH}z). Does not create it."""
+        if cycle is None:
+            cycle = model_config.cycle_hour
+        return self.output_dir / str(init_date.year) / f"{init_date:%Y%m%d}_{cycle:02d}z"
+
+    def forecast_init_complete(
+        self, model_config: "ModelConfig", init_date: datetime, cycle: int | None = None
+    ) -> bool:
+        """True iff every forecast variable has an assembled daily .npy for every
+        lead in the model's range.
+
+        This is the shared 'is this init fully downloaded?' check (the per-model
+        downloaders each had their own ``_init_complete`` / ``_all_vars_present``
+        variant). It distinguishes a complete init from the partial tree an
+        interrupted download leaves behind, so forecast mode resumes instead of
+        publishing whatever leads happen to exist.
+        """
+        init_dir = self.init_dir_for(model_config, init_date, cycle)
+        if not init_dir.is_dir():
+            return False
+        for var in self.forecast_variables(model_config):
+            suffix = self._forecast_var_suffix(var)
+            for fhour in model_config.forecast_hours:
+                if not (init_dir / f"f{fhour:03d}_{suffix}.npy").exists():
+                    return False
+        return True
+
     def extract_forecast(
         self,
         model_config: "ModelConfig",
@@ -200,17 +236,19 @@ class BaseDownloader:
 
         Discovers the latest init dir for ``cycle`` (defaulting to
         ``model_config.cycle_hour``), loads each daily-lead .npy, applies the
-        CONUS land mask, writes per-lead ``lead_{N}.npz`` files, and writes
-        per-window averages for ``model_config.lead_windows``.
+        CONUS land mask, and writes per-variable ``forecast/{var}/lead_{N}.npz``
+        (+ ``metadata.npz``). Each variable folder is rebuilt atomically — the
+        new leads are written to a temp sibling dir which then replaces the old
+        folder wholesale — so an init with fewer leads than the last one never
+        leaves stale ``lead_{N}.npz`` files mixed under this init's metadata.
         """
+        import os
+        import shutil
         import rasterio.transform
-        from model_registry import window_to_key
-        from stats_io import write_lead_windows
 
         if cycle is None:
             cycle = model_config.cycle_hour
         forecast_hours = model_config.forecast_hours
-        lead_windows = list(model_config.lead_windows)
 
         model_dir = self.output_dir
         if output_root is None:
@@ -255,9 +293,7 @@ class BaseDownloader:
         variables = self.forecast_variables(model_config)
         vars_written = 0
         for var in variables:
-            suffix = "surface" if var.key == "precip" else var.key
-            var_dir = forecast_root / var.key
-            var_dir.mkdir(parents=True, exist_ok=True)
+            suffix = self._forecast_var_suffix(var)
 
             lead_data: dict[int, np.ndarray] = {}
             for fhour in forecast_hours:
@@ -272,29 +308,33 @@ class BaseDownloader:
                 print(f"  [{var.key}] No data found; skipping variable.")
                 continue
 
+            # Rebuild the variable folder atomically: write into a temp sibling
+            # dir, then swap it in wholesale. This drops any stale lead_{N}.npz
+            # left by a previous (deeper) init and guarantees metadata.npz and
+            # the lead files always describe the same init — a crash can leave the
+            # temp dir or a missing folder, but never a mixed tree.
+            var_dir = forecast_root / var.key
+            tmp_dir = forecast_root / f".{var.key}.tmp"
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            tmp_dir.mkdir(parents=True)
+
             np.savez_compressed(
-                var_dir / "metadata.npz",
+                tmp_dir / "metadata.npz",
                 lats=lats,
                 lons=lons,
                 transform=np.array(transform),
                 crs="EPSG:4326",
                 init_date=init_date.strftime("%Y-%m-%d"),
             )
-
             for lead_days, data in sorted(lead_data.items()):
-                np.savez_compressed(var_dir / f"lead_{lead_days}.npz", value=data)
+                np.savez_compressed(tmp_dir / f"lead_{lead_days}.npz", value=data)
 
-            def _write_window(start: int, end: int, arr: np.ndarray, _dir=var_dir) -> None:
-                wkey = window_to_key(start, end)
-                np.savez_compressed(_dir / f"lead_{wkey}.npz", value=arr)
+            if var_dir.exists():
+                shutil.rmtree(var_dir)
+            os.replace(tmp_dir, var_dir)
 
-            n_windows = write_lead_windows(
-                lead_data,
-                lead_windows,
-                write_fn=_write_window,
-                combine_fn=lambda arrs: np.mean(arrs, axis=0),
-            )
-            print(f"  [{var.key}] Wrote {len(lead_data)} leads + {n_windows} windows -> {var_dir}")
+            print(f"  [{var.key}] Wrote {len(lead_data)} leads -> {var_dir}")
             vars_written += 1
 
         if vars_written == 0:
