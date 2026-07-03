@@ -6,6 +6,9 @@ const STATISTIC_HELP = {
   nrmse: 'Normalized root mean square error. Lower is better.',
   nmad: 'Normalized mean absolute deviation. Lower is better.',
   cc: 'Correlation coefficient (Pearson, raw values). Higher is better.',
+  rb: 'Relative bias (sum of errors / sum of obs). Near zero is best.',
+  rmse: 'Root mean square error (mm). Lower is better.',
+  nmse: 'Normalized mean square error (MSE / mean obs²). Lower is better.',
   forecast: 'Forecast metric. See documentation for interpretation.',
 };
 

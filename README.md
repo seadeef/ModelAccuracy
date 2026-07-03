@@ -124,6 +124,9 @@ Verification statistics (computed from model + PRISM pairs):
 - **cc** — correlation coefficient (Pearson on raw values, unitless −1..1)
 - **nrmse** — normalized root mean square error (%)
 - **nmad** — normalized mean absolute difference (%)
+- **rb** — relative bias, Σ(model−obs) / Σobs (%)
+- **rmse** — root mean square error (mm)
+- **nmse** — normalized mean square error, MSE / mean(obs)² (unitless)
 
 Display statistics:
 

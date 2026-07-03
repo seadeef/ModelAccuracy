@@ -5,7 +5,10 @@ from statistics_plugins.bias import BiasPlugin
 from statistics_plugins.cc import CCPlugin
 from statistics_plugins.forecast import ForecastPlugin
 from statistics_plugins.nmad import NMADPlugin
+from statistics_plugins.nmse import NMSEPlugin
 from statistics_plugins.nrmse import NRMSEPlugin
+from statistics_plugins.rb import RBPlugin
+from statistics_plugins.rmse import RMSEPlugin
 
 
 # Verification statistics used by compute_stats.py (require GFS+PRISM pairs).
@@ -14,6 +17,9 @@ VERIFICATION_STATISTICS: list[StatisticPlugin] = [
     CCPlugin(),
     NRMSEPlugin(),
     NMADPlugin(),
+    RBPlugin(),
+    RMSEPlugin(),
+    NMSEPlugin(),
 ]
 
 # Display-only statistics (not computed by compute_stats.py).

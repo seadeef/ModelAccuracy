@@ -14,6 +14,9 @@ export const STAT_COLORS = {
   bias:  '#e0a4ff',   // lavender
   cc:    '#5ce0d6',   // teal
   nmad:  '#f0a07a',   // peach
+  rb:    '#c0a8ff',   // periwinkle
+  rmse:  '#88bce8',   // steel blue
+  nmse:  '#d0a0e0',   // orchid
 };
 
 export function statColor(key) {
