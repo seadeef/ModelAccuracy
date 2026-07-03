@@ -51,17 +51,15 @@ function formatLegendValue(v) {
 
 function drawColorBar(ctx, x, y, w, h, colormap) {
   const g = ctx.createLinearGradient(x, 0, x + w, 0);
-  if (colormap === 'diverging') {
-    g.addColorStop(0, 'rgb(44,123,182)');
-    g.addColorStop(0.5, 'rgb(255,255,255)');
-    g.addColorStop(1, 'rgb(215,25,28)');
-  } else if (colormap === 'diverging_reversed') {
+  if (colormap === 'diverging_reversed') {
     g.addColorStop(0, 'rgb(215,25,28)');
     g.addColorStop(0.5, 'rgb(255,255,255)');
     g.addColorStop(1, 'rgb(44,123,182)');
   } else {
-    g.addColorStop(0, 'rgb(255,255,255)');
-    g.addColorStop(1, 'rgb(44,123,182)');
+    // diverging (default): blue (low) → white → red (high)
+    g.addColorStop(0, 'rgb(44,123,182)');
+    g.addColorStop(0.5, 'rgb(255,255,255)');
+    g.addColorStop(1, 'rgb(215,25,28)');
   }
   ctx.fillStyle = g;
   ctx.fillRect(x, y, w, h);

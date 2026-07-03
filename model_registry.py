@@ -10,10 +10,6 @@ from dataclasses import dataclass, field
 US_CROP_BOUNDS = (-130.0, 20.0, -60.0, 55.0)
 
 
-def window_to_key(start: int, end: int) -> str:
-    return f"{start}_{end}"
-
-
 @dataclass(frozen=True)
 class ModelConfig:
     key: str
@@ -23,7 +19,6 @@ class ModelConfig:
     downloader_defaults: dict = field(default_factory=dict)
     lead_days_min: int = 1
     lead_days_max: int = 14
-    lead_windows: tuple[tuple[int, int], ...] = ((1, 7), (7, 14), (1, 10))
     # Forecast variables this model exposes (keys into FORECAST_VARIABLES).
     # The base resolves these in extract_forecast to emit forecast/{key}/ folders.
     variables: tuple[str, ...] = ("precip",)
@@ -58,7 +53,6 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         },
         lead_days_min=1,
         lead_days_max=14,
-        lead_windows=((1, 7), (7, 14), (1, 10)),
         variables=("precip", "temp", "wind", "humidity"),
         cycle_hour=12,
         data_dir="model_data/gfs",
@@ -77,7 +71,6 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         },
         lead_days_min=1,
         lead_days_max=11,
-        lead_windows=((1, 7), (7, 11), (1, 10)),
         variables=("precip", "temp", "wind", "humidity"),
         cycle_hour=12,
         data_dir="model_data/nbm",
@@ -96,7 +89,6 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         },
         lead_days_min=1,
         lead_days_max=10,
-        lead_windows=((1, 7), (7, 10), (1, 10)),
         variables=("precip", "temp", "wind", "humidity"),
         cycle_hour=12,
         data_dir="model_data/weathernext2",
@@ -116,7 +108,6 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         },
         lead_days_min=1,
         lead_days_max=14,
-        lead_windows=((1, 7), (7, 14), (1, 10)),
         variables=("precip", "temp", "wind", "humidity"),
         cycle_hour=12,
         data_dir="model_data/aifs",

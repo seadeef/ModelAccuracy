@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
-from statistics_plugins.registry import ENABLED_STATISTICS
+from statistics_plugins.registry import VERIFICATION_STATISTICS
 from stats_grid_metadata import load_model_metadata
 from downloaders.base import build_land_mask
 
@@ -62,6 +62,8 @@ def iter_layers(stats_dir: Path, subdir: str | None = None):
         return
     for lead_path in sorted(source_dir.glob("lead_*.npz")):
         key = lead_path.stem.replace("lead_", "", 1)
+        if not key.isdigit():
+            continue  # skip legacy lead-window aggregates (lead_{a}_{b})
         yield key, lead_path
 
 
@@ -171,21 +173,6 @@ def diverging_reversed_colormap(
     return np.dstack([rgb, alpha])
 
 
-def sequential_colormap(data: np.ndarray, vmin: float, vmax: float, mask: np.ndarray) -> np.ndarray:
-    white = np.array([255, 255, 255], dtype=np.float32)
-    blue = np.array([120, 40, 200], dtype=np.float32)  # purple
-    valid = mask & np.isfinite(data)
-    denom = vmax - vmin if vmax != vmin else 1.0
-    t = np.clip((data - vmin) / denom, 0.0, 1.0)
-    rgb = np.zeros((data.shape[0], data.shape[1], 3), dtype=np.float32)
-    if np.any(valid):
-        tv = t[valid].reshape(-1, 1)
-        rgb[valid] = (white + (blue - white) * tv).reshape((-1, 3))
-    alpha_vals = np.clip(t * 255 * 4, 0, 255)
-    alpha = np.where(valid, alpha_vals, 0).astype(np.uint8)
-    return np.dstack([rgb.astype(np.uint8), alpha])
-
-
 def write_rgba_raster(path: Path, rgba: np.ndarray, transform: Affine, crs: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(
@@ -285,7 +272,6 @@ def _process_layer_image(
 
     valid = np.isfinite(values)
     _COLORMAP_FNS = {
-        "sequential": sequential_colormap,
         "diverging": diverging_colormap,
         "diverging_reversed": diverging_reversed_colormap,
     }
@@ -320,7 +306,6 @@ def _collect_tasks_for_period(
     tmp_root: Path,
     source_subdir: str | None,
     output_subdir: str | None,
-    skip_forecast: bool = False,
     land_mask: np.ndarray | None = None,
 ) -> list[dict]:
     """Collect tile-generation tasks for a single period (yearly/monthly/seasonal)."""
@@ -328,8 +313,6 @@ def _collect_tasks_for_period(
 
     for plugin in plugins:
         stat_name = plugin.spec.name
-        if skip_forecast and stat_name == "forecast":
-            continue
         stats_dir = stats_root / stat_name
         if not stats_dir.exists():
             continue
@@ -383,7 +366,8 @@ OUTPUT_DIR = Path("tiles_output")
 
 def _run_for_model(model_key: str) -> None:
     stats_root = Path("stats_output") / model_key
-    plugins = ENABLED_STATISTICS
+    # Verification stats only — forecast is served from .bin panel data, never tiled.
+    plugins = VERIFICATION_STATISTICS
     images_root = OUTPUT_DIR / model_key
     tmp_root = OUTPUT_DIR / "tmp"
 
@@ -409,7 +393,6 @@ def _run_for_model(model_key: str) -> None:
             plugins, stats_root, meta, images_root, tmp_root,
             source_subdir=f"monthly/{mm}",
             output_subdir=f"monthly/{mm}",
-            skip_forecast=True,
             land_mask=land_mask,
         ))
 
@@ -419,7 +402,6 @@ def _run_for_model(model_key: str) -> None:
             plugins, stats_root, meta, images_root, tmp_root,
             source_subdir=f"seasonal/{season_name}",
             output_subdir=f"seasonal/{season_name}",
-            skip_forecast=True,
             land_mask=land_mask,
         ))
 

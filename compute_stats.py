@@ -14,10 +14,9 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
-from model_registry import MODEL_REGISTRY, DEFAULT_MODEL, window_to_key
+from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from statistics_plugins.registry import VERIFICATION_STATISTICS
 from stats_grid_metadata import load_model_metadata, save_model_metadata
-from stats_io import write_lead_windows
 
 try:
     import rasterio
@@ -42,12 +41,11 @@ OUTPUT_ROOT: Path = Path("stats_output")
 LEAD_DAYS_MIN: int = 1
 LEAD_DAYS_MAX: int = 14
 CYCLE_HOUR: int = MODEL_REGISTRY[DEFAULT_MODEL].cycle_hour
-_active_lead_windows: list[tuple[int, int]] = list(MODEL_REGISTRY[DEFAULT_MODEL].lead_windows)
 
 
 def _configure_for_model(model_key: str) -> None:
     global GFS_DIR, GFS_GRID_LATS_PATH, GFS_GRID_LONS_PATH, OUTPUT_ROOT
-    global LEAD_DAYS_MIN, LEAD_DAYS_MAX, CYCLE_HOUR, _active_lead_windows
+    global LEAD_DAYS_MIN, LEAD_DAYS_MAX, CYCLE_HOUR
     config = MODEL_REGISTRY[model_key]
     GFS_DIR = Path(config.data_dir)
     GFS_GRID_LATS_PATH = GFS_DIR / "grid_lats.npy"
@@ -56,7 +54,6 @@ def _configure_for_model(model_key: str) -> None:
     LEAD_DAYS_MIN = config.lead_days_min
     LEAD_DAYS_MAX = config.lead_days_max
     CYCLE_HOUR = config.cycle_hour
-    _active_lead_windows = list(config.lead_windows)
 
 # Task discovery: downloaders produce .npy files (CONUS-cropped float32 arrays).
 # The (?P<level>...) group is the variable suffix; only precipitation
@@ -879,37 +876,15 @@ def _sum_lead_accumulators(
     return combined
 
 
-def _sum_accumulator_dicts(
-    accs: list[Dict[str, np.ndarray]],
-) -> Dict[str, np.ndarray]:
-    """Sum a list of {key: array} accumulators. All inputs share the same keys/shapes."""
-    out = {k: np.zeros_like(v) for k, v in accs[0].items()}
-    for acc in accs:
-        for k, v in acc.items():
-            out[k] += v
-    return out
-
-
 def _write_lead_files(
     stat_dir: Path,
     plugin,
     lead_accs: Dict[int, Dict[str, np.ndarray]],
 ) -> None:
-    """Write per-lead and window .npz files for a single stat directory."""
+    """Write one per-lead .npz file for each integer daily lead."""
     for lead in sorted(lead_accs):
         outputs = plugin.finalize(lead_accs[lead])
         np.savez_compressed(stat_dir / f"lead_{lead}.npz", **outputs)
-
-    def _write_window(start: int, end: int, acc: Dict[str, np.ndarray]) -> None:
-        outputs = plugin.finalize(acc)
-        np.savez_compressed(stat_dir / f"lead_{window_to_key(start, end)}.npz", **outputs)
-
-    write_lead_windows(
-        lead_accs,
-        _active_lead_windows,
-        write_fn=_write_window,
-        combine_fn=_sum_accumulator_dicts,
-    )
 
 
 def _write_stats(

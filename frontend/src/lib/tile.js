@@ -148,11 +148,6 @@ export function buildLeadOptions(modelConfig) {
   for (let i = modelConfig.lead_days_min; i <= modelConfig.lead_days_max; i++) {
     options.push({ key: String(i) });
   }
-  for (const [start, end] of modelConfig.lead_windows || []) {
-    if (start >= modelConfig.lead_days_min && end <= modelConfig.lead_days_max) {
-      options.push({ key: `${start}_${end}` });
-    }
-  }
   return options;
 }
 

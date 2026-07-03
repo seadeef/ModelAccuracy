@@ -138,11 +138,9 @@
   const chartLead = $derived(hoverLead ?? ui.leadFractional);
 
   const winnerLeadKey = $derived.by(() => {
+    // A pinned integer lead overrides the chart's fractional lead.
     if (ui.activeWindow && /^\d+$/.test(String(ui.activeWindow))) {
       return String(ui.activeWindow);
-    }
-    if (ui.activeWindow && /^\d+_\d+$/.test(String(ui.activeWindow))) {
-      return String(ui.activeWindow).split('_')[0];
     }
     const hl = chartLead;
     const r = Math.round(Number(hl));

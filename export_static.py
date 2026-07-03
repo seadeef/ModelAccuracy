@@ -736,7 +736,6 @@ def export_config(export_dir: Path, maptiler_key: str) -> None:
             "label": config.label,
             "lead_days_min": config.lead_days_min,
             "lead_days_max": config.lead_days_max,
-            "lead_windows": [list(w) for w in config.lead_windows],
         }
         if config.ident:
             entry["ident"] = config.ident
@@ -838,6 +837,10 @@ def export_model_grids(data_root: Path) -> None:
 
 def _export_layer(npz_path: Path, field: str, out_dir: Path) -> int:
     """Extract the render field from an .npz and write as flat float32 .bin. Returns 1 on success."""
+    # Only integer daily leads (lead_{N}.npz); skip any legacy lead-window
+    # aggregate (lead_{a}_{b}.npz) that may still linger in stats_output.
+    if not npz_path.stem.removeprefix("lead_").isdigit():
+        return 0
     bin_name = npz_path.stem + ".bin"  # e.g. lead_1.bin
     out_path = out_dir / bin_name
     # Skip the load + byte-compare when the .bin is already newer than its source.
@@ -900,7 +903,7 @@ def export_forecast_data_layers(forecast_root: Path) -> None:
 
     The multi-variable downloaders write ``stats_output/{model}/forecast/{var}/
     lead_*.npz`` (single key ``"value"``) for every variable a model exposes
-    (precip/temp/wind/humidity, plus the lead-window aggregates). We mirror that
+    (precip/temp/wind/humidity). We mirror that
     into a per-variable ``.bin`` tree (``forecast/{model}/{var}/``) so forecast
     data can be uploaded to S3 independently and is never baked into the Fargate
     image. For older single-variable exports (the legacy flat ``forecast/lead_*.npz``
@@ -1081,6 +1084,8 @@ def export_value_ranges(assets_dir: Path) -> None:
 
         for plugin in ENABLED_STATISTICS:
             stat_name = plugin.spec.name
+            if stat_name == "forecast":
+                continue  # forecast is panel-only — no map tiles or legend ranges
             stat_dir = model_stats / stat_name
             if not stat_dir.is_dir():
                 continue
