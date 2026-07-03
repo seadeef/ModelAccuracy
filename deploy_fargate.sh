@@ -6,22 +6,34 @@
 # Environment (optional):
 #   AWS_REGION       default us-west-1
 #   ECR_REPOSITORY   ECR repo name (if unset + interactive push, you are prompted; else default modelaccuracy-api)
-#   IMAGE_TAG        default latest (pushed tag)
+#   IMAGE_TAG        default: an immutable per-build tag derived from git
+#                    (git-<shortsha>, plus -dirty-<timestamp> when the tree has
+#                    uncommitted changes; build-<timestamp> outside a git repo).
+#                    Immutable tags are what make --force-redeploy deterministic:
+#                    the task def is pinned to this exact tag, so the running
+#                    version can't drift the way a mutable :latest does. Override
+#                    to pin a specific tag (e.g. IMAGE_TAG=v1.2.3).
 #   LOCAL_IMAGE      default modelaccuracy-api:build  (local name before tag to ECR)
 #   DOCKER_PLATFORM  default linux/amd64 (Fargate x86). Use linux/arm64 for Graviton Fargate
 #                    or faster local builds on Apple Silicon when SKIP_PUSH=1.
 #   SKIP_EXPORT=1    skip python3 export_static.py --image (use existing static_export/)
 #   SKIP_PUSH=1      build only; do not login/push to ECR
 #   ECR_PUSH_LATEST=1   also tag and push :latest (in addition to IMAGE_TAG), same as --tag-latest
-#   ECS_FORCE_REDEPLOY=1  after push (or alone with SKIP_PUSH), run ECS force-new-deployment; same as --force-redeploy
+#   ECS_FORCE_REDEPLOY=1  after push (or alone with SKIP_PUSH, if the tag already
+#                    exists in ECR), register a new task-definition revision pinned
+#                    to ECR_REPOSITORY:IMAGE_TAG and roll the service onto it;
+#                    same as --force-redeploy.
 #   ECS_CLUSTER / ECS_CLUSTER_ARN   only used with --force-redeploy; prompted before data export if unset
 #   ECS_SERVICE / ECS_SERVICE_ARN   only used with --force-redeploy; prompted before data export if unset
 #
 # ECS Task Definition environment variables (set in AWS, not this script):
 #   DATA_S3_URI                 s3://bucket[/prefix] for stats data. Forecasts are read
 #                               from the same bucket at a `forecast/` folder that is a
-#                               sibling of <prefix> (keys: forecast/{model}/lead_{n}.bin,
-#                               forecast/forecast_calendar.json).
+#                               sibling of <prefix> (keys: forecast/{model}/{variable}/lead_{n}.bin,
+#                               forecast/forecast_calendar.json). NOTE: the backend
+#                               image must match this per-variable layout — a stale
+#                               image reading the old flat forecast/{model}/lead_{n}.bin
+#                               path returns 200 with all no_data.
 #   COGNITO_USER_POOL_ID        Cognito User Pool ID (required for auth)
 #   COGNITO_APP_CLIENT_ID       Cognito App Client ID (required for auth)
 #   COGNITO_REGION              Cognito region (defaults to AWS_REGION / us-west-1)
@@ -31,7 +43,10 @@
 #
 # Flags:
 #   --tag-latest       push IMAGE_TAG and also push the same image as :latest
-#   --force-redeploy   aws ecs update-service --force-new-deployment (needs cluster + service)
+#   --force-redeploy   register a new task-def revision pinned to ECR_REPOSITORY:IMAGE_TAG
+#                      and roll the service onto it (needs cluster + service). Unlike a
+#                      bare force-new-deployment, this pins an immutable image so the
+#                      running version is deterministic and can't silently drift.
 #   -h, --help
 #
 # Usage:
@@ -77,7 +92,21 @@ elif [[ -t 0 ]]; then
 else
   ECR_REPOSITORY="modelaccuracy-api"
 fi
-IMAGE_TAG="${IMAGE_TAG:-latest}"
+# Default to an immutable per-build tag so a redeploy pins an exact image rather
+# than a mutable :latest (whose "pushed" and "running" states can silently
+# diverge). Prefer the git short SHA; mark dirty trees and non-git checkouts with
+# a timestamp so the tag is still unique per build.
+if [[ -z "${IMAGE_TAG:-}" ]]; then
+  if _sha="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"; then
+    IMAGE_TAG="git-${_sha}"
+    if ! git -C "$ROOT" diff --quiet 2>/dev/null || ! git -C "$ROOT" diff --cached --quiet 2>/dev/null; then
+      IMAGE_TAG="${IMAGE_TAG}-dirty-$(date +%Y%m%d%H%M%S)"
+    fi
+  else
+    IMAGE_TAG="build-$(date +%Y%m%d%H%M%S)"
+  fi
+fi
+echo "==> IMAGE_TAG=${IMAGE_TAG}"
 LOCAL_IMAGE="${LOCAL_IMAGE:-modelaccuracy-api:build}"
 # Fargate default CPU is x86_64; plain `docker build` on Apple Silicon is arm64 → ECS CannotPullContainerError.
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
@@ -114,6 +143,82 @@ ecs_service_resolved() {
   if [[ -n "${ECS_SERVICE:-}" ]]; then printf '%s' "$ECS_SERVICE"
   elif [[ -n "${ECS_SERVICE_ARN:-}" ]]; then printf '%s' "$ECS_SERVICE_ARN"
   else printf ''; fi
+}
+
+# Resolve the full ECR image URI (account-qualified). Reused by push and redeploy.
+ensure_ecr_uri() {
+  if [[ -n "${ECR_URI:-}" ]]; then return 0; fi
+  AWS_ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
+  ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+}
+
+# Register a new task-definition revision pinned to ECR_REPOSITORY:IMAGE_TAG and
+# roll the service onto it. Pinning an immutable tag (not :latest) is what makes
+# the deployed version deterministic: `aws ecs update-service --force-new-deployment`
+# against a :latest-pinned task def re-pulls whatever :latest currently resolves
+# to, so "pushed a new image" and "running the new image" can silently diverge.
+deploy_pinned_taskdef() {
+  ensure_ecr_uri
+  local pinned_image="${ECR_URI}:${IMAGE_TAG}"
+
+  # The pinned image must actually exist in ECR (it may not under SKIP_PUSH).
+  if ! aws ecr describe-images --region "$AWS_REGION" \
+        --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$IMAGE_TAG" \
+        >/dev/null 2>&1; then
+    echo "ERROR: ${ECR_REPOSITORY}:${IMAGE_TAG} not found in ECR. Push it first" >&2
+    echo "       (drop SKIP_PUSH) or set IMAGE_TAG to a tag that already exists." >&2
+    exit 1
+  fi
+
+  local current_arn
+  current_arn="$(aws ecs describe-services --region "$AWS_REGION" \
+    --cluster "$ECS_CLUSTER_VAL" --services "$ECS_SERVICE_VAL" \
+    --query 'services[0].taskDefinition' --output text)"
+  if [[ -z "$current_arn" || "$current_arn" == "None" ]]; then
+    echo "ERROR: could not resolve current task definition for service ${ECS_SERVICE_VAL}." >&2
+    exit 1
+  fi
+  echo "==> Current task definition: ${current_arn}"
+
+  # Take the running task def, strip the read-only fields register-task-definition
+  # rejects, and repoint the app container's image at the pinned tag.
+  local new_td_file
+  new_td_file="$(mktemp)"
+  aws ecs describe-task-definition --region "$AWS_REGION" \
+      --task-definition "$current_arn" --query 'taskDefinition' --output json \
+    | IMAGE_URI="$pinned_image" ECR_REPOSITORY="$ECR_REPOSITORY" python3 -c '
+import json, os, sys
+td = json.load(sys.stdin)
+for k in ("taskDefinitionArn", "revision", "status", "requiresAttributes",
+          "compatibilities", "registeredAt", "registeredBy", "deregisteredAt"):
+    td.pop(k, None)
+repo = os.environ["ECR_REPOSITORY"]
+new_image = os.environ["IMAGE_URI"]
+changed = 0
+for c in td.get("containerDefinitions", []):
+    img = c.get("image", "")
+    if ("/" + repo + ":") in img or img.rsplit(":", 1)[0].endswith("/" + repo):
+        c["image"] = new_image
+        changed += 1
+if changed != 1:
+    sys.stderr.write(
+        "ERROR: expected exactly one container image referencing repo %r, found %d\n"
+        % (repo, changed))
+    sys.exit(1)
+json.dump(td, sys.stdout)
+' > "$new_td_file"
+
+  local new_arn
+  new_arn="$(aws ecs register-task-definition --region "$AWS_REGION" \
+    --cli-input-json "file://${new_td_file}" \
+    --query 'taskDefinition.taskDefinitionArn' --output text)"
+  rm -f "$new_td_file"
+  echo "==> Registered ${new_arn} (image ${pinned_image})"
+
+  aws ecs update-service --region "$AWS_REGION" \
+    --cluster "$ECS_CLUSTER_VAL" --service "$ECS_SERVICE_VAL" \
+    --task-definition "$new_arn" --no-cli-pager >/dev/null
+  echo "==> ECS update-service → ${new_arn} (tasks will roll to ${IMAGE_TAG})"
 }
 
 # Set when FORCE_ECS_REDEPLOY; collected immediately before export_static.py --image (see below).
@@ -211,8 +316,7 @@ if [[ -n "${SKIP_PUSH:-}" ]]; then
   fi
 else
   echo "==> ECR login and push"
-  AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-  ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+  ensure_ecr_uri
 
   aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" --region "$AWS_REGION" &>/dev/null \
     || { echo "==> Creating ECR repository ${ECR_REPOSITORY}"; aws ecr create-repository --repository-name "$ECR_REPOSITORY" --region "$AWS_REGION" >/dev/null; }
@@ -234,14 +338,8 @@ else
 fi
 
 if [[ "$FORCE_ECS_REDEPLOY" -eq 1 ]]; then
-  echo "==> ECS force new deployment: cluster=${ECS_CLUSTER_VAL} service=${ECS_SERVICE_VAL}"
-  aws ecs update-service \
-    --region "$AWS_REGION" \
-    --cluster "$ECS_CLUSTER_VAL" \
-    --service "$ECS_SERVICE_VAL" \
-    --force-new-deployment \
-    --no-cli-pager >/dev/null
-  echo "==> ECS update-service requested (tasks will roll)"
+  echo "==> ECS redeploy (pinned): cluster=${ECS_CLUSTER_VAL} service=${ECS_SERVICE_VAL}"
+  deploy_pinned_taskdef
 fi
 
 if [[ -n "${SKIP_PUSH:-}" ]]; then

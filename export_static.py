@@ -35,7 +35,8 @@ Reads from stats_output/ and tiles_output/, writes to static_export/:
         wbd/
             chunks/ …
             children/ …
-            index.json
+            index.json          (HUC2 units only)
+            index/{huc2}.json   (per-HUC2 descendant metadata)
             huc2.topojson
 
 URL scheme: every browser-fetched data file is served from the site root mirroring
@@ -59,7 +60,7 @@ Boundary export flags (combinable with each other; not with build modes above):
 
 * ``--zip`` — ``zip/{code}.json`` from ``boundary_data/zip/zip_lookup.csv``.
 * ``--admin`` — ``boundaries.json`` + ``states.topojson`` + ``counties.topojson``.
-* ``--huc`` — WBD map assets (``huc2.topojson``, ``children/``, ``index.json``) + ``chunks/``.
+* ``--huc`` — WBD map assets (``huc2.topojson``, ``children/``, ``index.json`` + ``index/{huc2}.json``) + ``chunks/``.
 
 WBD export depth is capped by ``--max-huc-level`` (default 12) to bound image size /
 S3 object count; ``boundary_data/`` keeps the full HU16 source for re-export.
@@ -69,8 +70,16 @@ Load boundaries first when ``boundary_data/`` is empty::
     python load_boundaries.py            # zip + admin + wbd
     python load_boundaries.py --wbd-sample   # synthetic WBD layers for local dev
 
-``--clean`` deletes the entire output directory first; only allowed for a **full**
-export (no ``--static`` / ``--image`` / ``--data`` / ``--forecast`` / ``--frontend``).
+Every mode is **incremental by default**: a step is skipped when its outputs
+already exist on disk and are at least as new as the source files they derive
+from (WBD layer cache, stats ``.npz``, boundary source TopoJSON, the ZIP CSV).
+This is mtime-based, so rerun with ``--force`` after changing ``--max-huc-level``
+or otherwise altering output shape without touching sources.
+
+``--force`` re-exports every artifact regardless of staleness (outputs are kept).
+``--clean`` deletes the entire output directory first (which also forces a full
+rebuild); only allowed for a **full** export (no ``--static`` / ``--image`` /
+``--data`` / ``--forecast`` / ``--frontend``).
 
 The .bin files are raw float32 arrays (row-major, height × width).
 
@@ -108,7 +117,7 @@ from wbd_core import parent_huc as _wbd_parent_huc
 from wbd_core import polygons_bbox as _polygons_bbox
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
 from forecast_variables import FORECAST_VARIABLES
-from stats_grid_metadata import load_model_metadata
+from stats_grid_metadata import load_model_metadata, model_metadata_path
 from statistics_plugins.registry import (
     DEFAULT_STATISTIC,
     ENABLED_STATISTICS,
@@ -168,6 +177,58 @@ def _write_bytes_if_changed(path: Path, content: bytes) -> bool:
     return True
 
 
+# ── incremental export: skip work when outputs are newer than sources ──
+#
+# The export is already idempotent (``_write_*_if_changed`` preserves mtimes so
+# ``aws s3 sync`` skips unchanged files), but the *work* of regenerating an
+# artifact — building WBD TopoJSON, reading every stats ``.npz`` — still runs on
+# each invocation. The deploy scripts rerun ``--static`` on every forecast
+# refresh, so each step below first checks whether its outputs already exist and
+# are at least as new as the source files they derive from; if so the step is
+# skipped entirely. ``--force`` (and ``--clean``, which wipes the tree) bypasses
+# the check and regenerates everything. Staleness is mtime-based, so after
+# changing ``--max-huc-level`` rerun with ``--force`` to pick up the new depth.
+_FORCE_EXPORT = False
+
+
+def _newest_mtime(sources: list[Path]) -> float:
+    """Newest mtime among existing *sources* (directories scanned recursively).
+
+    Returns 0.0 when none of the paths exist.
+    """
+    newest = 0.0
+    for src in sources:
+        if src.is_dir():
+            for f in src.rglob("*"):
+                if f.is_file():
+                    newest = max(newest, f.stat().st_mtime)
+        elif src.is_file():
+            newest = max(newest, src.stat().st_mtime)
+    return newest
+
+
+def _outputs_fresh(outputs: list[Path], sources: list[Path]) -> bool:
+    """True if regeneration can be skipped for this step.
+
+    Skips only when ``--force`` is off, every *output* file exists, at least one
+    *source* exists, and the oldest output is no older than the newest source. A
+    missing output, or a source newer than the outputs, returns False so the
+    caller rebuilds. *outputs* must be files the step always writes on success
+    (not directories), so their presence proves a prior run completed.
+    """
+    if _FORCE_EXPORT or not outputs:
+        return False
+    out_mtimes: list[float] = []
+    for o in outputs:
+        if not o.is_file():
+            return False
+        out_mtimes.append(o.stat().st_mtime)
+    src_newest = _newest_mtime(sources)
+    if src_newest == 0.0:
+        return False
+    return min(out_mtimes) >= src_newest
+
+
 def _get_forecast_init_date(model_key: str) -> str | None:
     # Read the init date from the same source the bins come from (multi-variable
     # forecast/{precip}/metadata.npz when present, else legacy flat metadata.npz),
@@ -197,6 +258,17 @@ def export_zip_directory(export_dir: Path) -> None:
     """Write ``static/zip/{code}.json`` lookup files (frontend reads these, not the CSV)."""
     csv_path = _resolve_zip_lookup_csv()
     zip_dir = export_dir / "zip"
+    # Skip the 100k-file rewrite when nothing changed: the dir's mtime tracks the
+    # last add/remove (a no-op rerun writes nothing, so it stays older than a
+    # freshly regenerated CSV).
+    if (
+        not _FORCE_EXPORT
+        and zip_dir.is_dir()
+        and next(zip_dir.glob("*.json"), None) is not None
+        and zip_dir.stat().st_mtime >= csv_path.stat().st_mtime
+    ):
+        print(f"  {zip_dir}/ up to date — skipping")
+        return
     zip_dir.mkdir(parents=True, exist_ok=True)
     count = 0
     with open(csv_path, newline="", encoding="utf-8") as f:
@@ -300,6 +372,14 @@ def export_admin_boundaries(
             "admin boundaries missing — run python load_boundaries.py --admin "
             f"({', '.join(str(p) for p in missing)})"
         )
+    expected: list[Path] = []
+    if write_boundaries_json:
+        expected.append(out_dir / "boundaries.json")
+    if write_topojson:
+        expected += [out_dir / "states.topojson", out_dir / "counties.topojson"]
+    if _outputs_fresh(expected, [ADMIN_STATES_TOPOJSON, ADMIN_COUNTIES_TOPOJSON]):
+        print(f"  {out_dir}/ up to date — skipping")
+        return
     states_topo = json.loads(ADMIN_STATES_TOPOJSON.read_text(encoding="utf-8"))
     counties_topo = json.loads(ADMIN_COUNTIES_TOPOJSON.read_text(encoding="utf-8"))
     written: list[Path] = []
@@ -398,6 +478,24 @@ def export_wbd_boundaries(
         raise FileNotFoundError(
             "WBD layers missing — run python load_boundaries.py --wbd"
         )
+    # Skip the (expensive) TopoJSON rebuild when the served tree is already newer
+    # than the WBD layer cache. Representative outputs prove a prior run finished;
+    # a branch filter changes the output shape without touching sources, so only
+    # cache the unfiltered export path.
+    if not branch:
+        expected: list[Path] = []
+        if write_map_assets:
+            expected += [out_dir / "huc2.topojson", out_dir / "index.json"]
+        if write_chunks:
+            expected.append(out_dir / "chunks" / "2" / "_root.json")
+        sources = [
+            _wbd_layer_cache_path(WBD_LAYERS_DIR, lv)
+            for lv in WBD_HU_LEVELS
+            if lv <= max_level
+        ]
+        if _outputs_fresh(expected, sources):
+            print(f"  {out_dir}/ up to date (≤ HU{max_level}) — skipping")
+            return
     units_by_level: dict[int, dict[str, dict]] = {}
     available_levels: list[int] = []
     for level in WBD_HU_LEVELS:
@@ -512,8 +610,21 @@ def export_wbd_boundaries(
             root_path,
             json.dumps({"parent": "", "level": 2, "units": root_units}, separators=(",", ":")),
         )
+    # Index split per HUC2. A small top-level index.json carries only the ~22
+    # HUC2 units, so entering watershed mode no longer pulls metadata for all
+    # ~125k units (~9.5 MB). One index/{huc2}.json per HUC2 holds that region's
+    # descendants (levels 4..cap); the drill loader fetches a region's subtree
+    # only when the user drills into it. HUC codes are strict prefixes, so a
+    # unit's HUC2 root is simply huc[:2].
     index_path = out_dir / "index.json"
+    index_dir = out_dir / "index"
+    written_index: set[Path] = set()
     if write_map_assets:
+        index_huc2 = {huc: meta for huc, meta in index.items() if meta["level"] == 2}
+        subtrees: dict[str, dict[str, dict]] = defaultdict(dict)
+        for huc, meta in index.items():
+            if meta["level"] != 2:
+                subtrees[huc[:2]][huc] = meta
         _write_text_if_changed(
             index_path,
             json.dumps(
@@ -521,11 +632,23 @@ def export_wbd_boundaries(
                     "version": 1,
                     "source": WBD_SOURCE_LABEL,
                     "levels": available_levels,
-                    "units": index,
+                    "units": index_huc2,
                 },
                 separators=(",", ":"),
             ),
         )
+        # One subtree file per HUC2 — including HUC2s with no descendants, so the
+        # loader never 404s on a region the top index reports as childless.
+        for huc2 in sorted(units_by_level[2]):
+            sub_path = index_dir / f"{huc2}.json"
+            written_index.add(sub_path.resolve())
+            _write_text_if_changed(
+                sub_path,
+                json.dumps(
+                    {"version": 1, "parent": huc2, "units": subtrees.get(huc2, {})},
+                    separators=(",", ":"),
+                ),
+            )
     # Prune stale artifacts so the served tree matches the current source + cap.
     # Each mode only prunes what it writes (--image → chunks, --static → children).
     if write_chunks:
@@ -536,9 +659,14 @@ def export_wbd_boundaries(
         stale = _prune_stale(children_dir, written_children, ".topojson")
         if stale:
             print(f"  pruned {stale} stale children topojson(s)")
+        stale = _prune_stale(index_dir, written_index, ".json")
+        if stale:
+            print(f"  pruned {stale} stale index file(s)")
     if write_map_assets:
         for p in (index_path, huc2_path):
             print(f"  {p} ({p.stat().st_size:,} bytes)")
+        n_sub = sum(1 for _ in index_dir.glob("*.json"))
+        print(f"  {n_sub} per-HUC2 index file(s) under {index_dir}/")
     if write_chunks:
         print(f"  {sum(1 for _ in chunks_dir.rglob('*.json'))} chunk files under {chunks_dir}/")
 
@@ -686,6 +814,10 @@ def export_model_grids(data_root: Path) -> None:
     count = 0
     for model_key in MODEL_REGISTRY:
         model_stats = STATS_ROOT / model_key
+        out_path = data_root / model_key / "grid.json"
+        if _outputs_fresh([out_path], [model_metadata_path(model_stats)]):
+            count += 1
+            continue
         try:
             meta = load_model_metadata(model_stats)
         except FileNotFoundError:
@@ -698,7 +830,6 @@ def export_model_grids(data_root: Path) -> None:
             "lats": lats.astype(float).tolist(),
             "lons": lons.astype(float).tolist(),
         }
-        out_path = data_root / model_key / "grid.json"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         _write_text_if_changed(out_path, json.dumps(payload))
         count += 1
@@ -707,6 +838,15 @@ def export_model_grids(data_root: Path) -> None:
 
 def _export_layer(npz_path: Path, field: str, out_dir: Path) -> int:
     """Extract the render field from an .npz and write as flat float32 .bin. Returns 1 on success."""
+    bin_name = npz_path.stem + ".bin"  # e.g. lead_1.bin
+    out_path = out_dir / bin_name
+    # Skip the load + byte-compare when the .bin is already newer than its source.
+    if (
+        not _FORCE_EXPORT
+        and out_path.is_file()
+        and out_path.stat().st_mtime >= npz_path.stat().st_mtime
+    ):
+        return 1
     try:
         with np.load(npz_path) as data:
             if field not in data:
@@ -716,8 +856,6 @@ def _export_layer(npz_path: Path, field: str, out_dir: Path) -> int:
         return 0
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    bin_name = npz_path.stem + ".bin"  # e.g. lead_1.bin
-    out_path = out_dir / bin_name
     _write_bytes_if_changed(out_path, arr.tobytes())
     return 1
 
@@ -798,6 +936,15 @@ def export_forecast_calendar(forecast_root: Path) -> None:
     top-level ``variables`` catalog carries display metadata (label/units/colormap)
     so the SPA can build a variable selector and legend without hardcoding it.
     """
+    out = forecast_root / "forecast_calendar.json"
+    sources: list[Path] = []
+    for key in MODEL_REGISTRY:
+        src_dir, _ = _forecast_source(key)
+        sources += [src_dir / "metadata.npz", STATS_ROOT / key / "forecast" / "metadata.npz"]
+    if _outputs_fresh([out], sources):
+        print(f"  {out} (up to date)")
+        return
+
     per_model: dict[str, dict] = {}
     for key, config in sorted(MODEL_REGISTRY.items()):
         init_date = _get_forecast_init_date(key)
@@ -816,7 +963,6 @@ def export_forecast_calendar(forecast_root: Path) -> None:
         for v in FORECAST_VARIABLES.values()
     ]
     payload = {"per_model": per_model, "variables": catalog}
-    out = forecast_root / "forecast_calendar.json"
     _write_text_if_changed(out, json.dumps(payload, indent=2))
     print(f"  {out}")
 
@@ -830,6 +976,11 @@ def _copy_file_if_changed(src: Path, dst: Path) -> bool:
     re-uploading byte-identical tiles on a rerun. Returns True if a copy occurred.
     """
     try:
+        # copy2 preserves the source mtime, so dst.mtime >= src.mtime means the
+        # tile is current (fast skip). The byte-compare still runs when --force
+        # is set or the source is newer, so identical content never bumps mtime.
+        if not _FORCE_EXPORT and dst.stat().st_mtime >= src.stat().st_mtime:
+            return False
         if dst.stat().st_size == src.stat().st_size and dst.read_bytes() == src.read_bytes():
             return False
     except FileNotFoundError:
@@ -942,8 +1093,10 @@ def export_value_ranges(assets_dir: Path) -> None:
 
             yearly_npz = sorted(stat_dir.glob("lead_*.npz"))
             if yearly_npz:
-                vmin, vmax = _compute_export_value_range(yearly_npz, field, colormap, fixed)
-                _write_range_json(base / "yearly.json", vmin, vmax, colormap)
+                out_path = base / "yearly.json"
+                if not _outputs_fresh([out_path], yearly_npz):
+                    vmin, vmax = _compute_export_value_range(yearly_npz, field, colormap, fixed)
+                    _write_range_json(out_path, vmin, vmax, colormap)
                 written += 1
 
             monthly_root = stat_dir / "monthly"
@@ -954,8 +1107,10 @@ def export_value_ranges(assets_dir: Path) -> None:
                     layer_paths = sorted(month_dir.glob("lead_*.npz"))
                     if not layer_paths:
                         continue
-                    vmin, vmax = _compute_export_value_range(layer_paths, field, colormap, fixed)
-                    _write_range_json(base / "monthly" / f"{month_dir.name}.json", vmin, vmax, colormap)
+                    out_path = base / "monthly" / f"{month_dir.name}.json"
+                    if not _outputs_fresh([out_path], layer_paths):
+                        vmin, vmax = _compute_export_value_range(layer_paths, field, colormap, fixed)
+                        _write_range_json(out_path, vmin, vmax, colormap)
                     written += 1
 
             seasonal_root = stat_dir / "seasonal"
@@ -966,8 +1121,10 @@ def export_value_ranges(assets_dir: Path) -> None:
                     layer_paths = sorted(season_dir.glob("lead_*.npz"))
                     if not layer_paths:
                         continue
-                    vmin, vmax = _compute_export_value_range(layer_paths, field, colormap, fixed)
-                    _write_range_json(base / "seasonal" / f"{season_dir.name}.json", vmin, vmax, colormap)
+                    out_path = base / "seasonal" / f"{season_dir.name}.json"
+                    if not _outputs_fresh([out_path], layer_paths):
+                        vmin, vmax = _compute_export_value_range(layer_paths, field, colormap, fixed)
+                        _write_range_json(out_path, vmin, vmax, colormap)
                     written += 1
 
     if written == 0:
@@ -1036,6 +1193,11 @@ def main() -> None:
         help="Delete output directory before exporting (full export only)",
     )
     parser.add_argument(
+        "--force", action="store_true",
+        help="Re-export every artifact even if it's up to date on disk "
+             "(default skips outputs newer than their sources)",
+    )
+    parser.add_argument(
         "--static", action="store_true",
         help="S3/CloudFront export: zip/, admin/HUC TopoJSON, config, tiles, ranges, forecast/",
     )
@@ -1090,6 +1252,11 @@ def main() -> None:
             "Boundary flags (--zip, --admin, --huc) cannot combine "
             "with --static, --image, --data, --forecast, or --frontend."
         )
+
+    # --clean wipes the tree, so a full rebuild follows naturally; --force keeps
+    # the existing outputs but regenerates them regardless of staleness.
+    global _FORCE_EXPORT
+    _FORCE_EXPORT = args.force or args.clean
 
     site_root = Path(args.output)
 

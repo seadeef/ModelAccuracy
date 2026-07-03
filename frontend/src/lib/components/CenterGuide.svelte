@@ -41,7 +41,7 @@
     gap: 4px;
     padding: 12px 28px;
     text-align: center;
-    max-width: min(560px, calc(100vw - 40px));
+    max-width: min(820px, calc(100vw - 40px));
     white-space: nowrap;
 
     /* Smoked glass: deeper tint for legibility on light map areas,

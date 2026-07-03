@@ -21,6 +21,7 @@
   } from '../mapBoundaryLayer.js';
   import {
     loadWbdIndex,
+    ensureHucSubtree,
     loadHuc2Geo,
     loadHucChildren,
     hasChildren,
@@ -538,8 +539,11 @@
     // The user has engaged the watershed tool — drop the center guide hint
     // (matches the state/county tools, which clear it on their first click).
     ui.hasUsedAreaDrawTool = true;
-    const index = await ensureWbdIndex();
-    if (!hasChildren(index, pending.huc)) {
+    await ensureWbdIndex();
+    // Pull this HUC2's descendant metadata before drilling — the pass-through
+    // loop below inspects hasChildren on HUC4+ children even for a HUC2 click.
+    await ensureHucSubtree(pending.huc);
+    if (!hasChildren(pending.huc)) {
       finalizeWbd(pending);
       return;
     }
@@ -560,7 +564,7 @@
       if (!children || children.length !== 1) break; // load failed/superseded, or a real split
       const only = children[0];
       const onlyHuc = String(only.properties?.huc ?? only.id ?? '');
-      if (!hasChildren(index, onlyHuc)) {
+      if (!hasChildren(onlyHuc)) {
         // Sole descendant is a leaf with the clicked unit's extent — just select it.
         finalizeWbd(pending);
         return;
