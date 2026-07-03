@@ -493,7 +493,17 @@ def export_wbd_boundaries(
             for lv in WBD_HU_LEVELS
             if lv <= max_level
         ]
-        if _outputs_fresh(expected, sources):
+        # The per-HUC2 index subtrees (index/{huc2}.json) are written alongside
+        # index.json but their names depend on the source, so they aren't in
+        # `expected`. A pre-split tree can hold index.json + huc2.topojson yet no
+        # index/ subtrees — skipping then would 404 the frontend drill — so never
+        # skip unless that directory is actually populated. (Fail toward
+        # re-export, never toward a sync --delete of a gutted tree.)
+        subtrees_ok = (not write_map_assets) or (
+            (out_dir / "index").is_dir()
+            and next((out_dir / "index").glob("*.json"), None) is not None
+        )
+        if subtrees_ok and _outputs_fresh(expected, sources):
             print(f"  {out_dir}/ up to date (≤ HU{max_level}) — skipping")
             return
     units_by_level: dict[int, dict[str, dict]] = {}

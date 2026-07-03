@@ -1,0 +1,17 @@
+# API image dependencies ONLY (Fargate backend). The full requirements.txt —
+# rasterio / xarray / cfgrib / eccodes / s3fs / GDAL / Pillow / … — is for the
+# local data-pipeline venv; the backend (backend/, statistics_plugins/,
+# model_registry, forecast_variables) imports none of it. Keeping this list
+# lean is what keeps the image (and every ECR push/pull) small.
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+starlette>=0.40.0
+python-dotenv>=1.0.0
+numpy>=2.0.0
+pydantic>=2.0.0
+# s3fs isn't in this image, so botocore isn't capped by aiobotocore — but pin to
+# the working set anyway (keep in lockstep with requirements.txt).
+boto3==1.43.0
+botocore==1.43.0
+python-jose[cryptography]>=3.3.0
+python-ulid>=2.0.0

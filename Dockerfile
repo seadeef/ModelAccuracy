@@ -7,10 +7,13 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Slim API deps only (no GDAL/rasterio/xarray/eccodes/s3fs); see requirements.api.txt.
+COPY requirements.api.txt .
+RUN pip install --no-cache-dir -r requirements.api.txt
 
-COPY model_registry.py stats_grid_metadata.py ./
+# forecast_variables is imported by backend.stats_query at module load — it must
+# be in the image or `import backend.api` fails.
+COPY model_registry.py stats_grid_metadata.py forecast_variables.py ./
 COPY backend ./backend
 COPY statistics_plugins ./statistics_plugins
 # Only bake in what the backend reads from disk:

@@ -13,4 +13,21 @@ archive
 .venv
 venv
 *.md
+
+# Pipeline data — never COPYed into the image. Excluding it keeps the build
+# context from ballooning to tens of GB uploaded to the Docker daemon.
+model_data
+stats_output
+tiles_output
+boundary_data
+prism_data
+
+# static_export: the image bakes in only model_data bins, admin/boundaries.json,
+# and wbd/chunks/ (see Dockerfile). Everything else is browser-served from S3.
+static_export/zip
+static_export/tiles
+static_export/ranges
+static_export/frontend
 static_export/forecast
+static_export/wbd/children
+static_export/wbd/index

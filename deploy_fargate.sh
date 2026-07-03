@@ -92,15 +92,37 @@ elif [[ -t 0 ]]; then
 else
   ECR_REPOSITORY="modelaccuracy-api"
 fi
+# 8-char digest of the model_data bins baked into the image (paths + sizes +
+# mtimes), so refreshed stats produce a distinct immutable tag even at the same
+# git SHA (a stats-only redeploy). Portable across BSD (macOS) and GNU stat.
+_model_data_digest() {
+  local dir="$ROOT/static_export/model_data"
+  [[ -d "$dir" ]] || { printf 'nodata'; return; }
+  local statcmd
+  if stat -f '%z' "$dir" >/dev/null 2>&1; then
+    statcmd=(stat -f '%N %z %m')   # BSD / macOS
+  else
+    statcmd=(stat -c '%n %s %Y')   # GNU
+  fi
+  { find "$dir" -type f 2>/dev/null | LC_ALL=C sort | tr '\n' '\0' \
+      | xargs -0 "${statcmd[@]}" 2>/dev/null; } \
+    | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-8
+}
+
 # Default to an immutable per-build tag so a redeploy pins an exact image rather
 # than a mutable :latest (whose "pushed" and "running" states can silently
-# diverge). Prefer the git short SHA; mark dirty trees and non-git checkouts with
-# a timestamp so the tag is still unique per build.
+# diverge). Clean tree → git-<sha>-data<digest>; dirty tree (incl. untracked) →
+# git-<sha>-dirty-<ts>; non-git checkout → build-<ts>.
 if [[ -z "${IMAGE_TAG:-}" ]]; then
   if _sha="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"; then
-    IMAGE_TAG="git-${_sha}"
-    if ! git -C "$ROOT" diff --quiet 2>/dev/null || ! git -C "$ROOT" diff --cached --quiet 2>/dev/null; then
-      IMAGE_TAG="${IMAGE_TAG}-dirty-$(date +%Y%m%d%H%M%S)"
+    _dirty=0
+    git -C "$ROOT" diff --quiet 2>/dev/null || _dirty=1
+    git -C "$ROOT" diff --cached --quiet 2>/dev/null || _dirty=1
+    [[ -n "$(git -C "$ROOT" ls-files --others --exclude-standard 2>/dev/null)" ]] && _dirty=1
+    if [[ "$_dirty" -eq 1 ]]; then
+      IMAGE_TAG="git-${_sha}-dirty-$(date +%Y%m%d%H%M%S)"
+    else
+      IMAGE_TAG="git-${_sha}-data$(_model_data_digest)"
     fi
   else
     IMAGE_TAG="build-$(date +%Y%m%d%H%M%S)"
@@ -152,6 +174,16 @@ ensure_ecr_uri() {
   ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
 }
 
+# Idempotently keep ECR from filling up with immutable per-build tags: retain the
+# last 10 git-* images, expire untagged after 1 day. put-lifecycle-policy
+# overwrites, so this is safe to run on every push. (Documented in README.)
+ensure_ecr_lifecycle_policy() {
+  aws ecr put-lifecycle-policy --region "$AWS_REGION" \
+    --repository-name "$ECR_REPOSITORY" \
+    --lifecycle-policy-text '{"rules":[{"rulePriority":1,"description":"keep last 10 git-* tags","selection":{"tagStatus":"tagged","tagPrefixList":["git-"],"countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}},{"rulePriority":2,"description":"expire untagged after 1 day","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":1},"action":{"type":"expire"}}]}' \
+    >/dev/null 2>&1 || echo "WARN: could not set ECR lifecycle policy (non-fatal)" >&2
+}
+
 # Register a new task-definition revision pinned to ECR_REPOSITORY:IMAGE_TAG and
 # roll the service onto it. Pinning an immutable tag (not :latest) is what makes
 # the deployed version deterministic: `aws ecs update-service --force-new-deployment`
@@ -179,6 +211,27 @@ deploy_pinned_taskdef() {
     exit 1
   fi
   echo "==> Current task definition: ${current_arn}"
+
+  # Guard against a CPU-arch mismatch: an arm64 image pinned into an X86_64 task
+  # def (or vice-versa) fails at runtime with CannotPullContainerError. Derive the
+  # image arch from DOCKER_PLATFORM and compare to the task def's runtimePlatform
+  # (which defaults to X86_64 when unset). This must pass before any Graviton
+  # cutover — flip DOCKER_PLATFORM=linux/arm64 only after the task def is ARM64.
+  local image_arch=""
+  case "$DOCKER_PLATFORM" in
+    *arm64*) image_arch="ARM64" ;;
+    *amd64*|*x86_64*) image_arch="X86_64" ;;
+  esac
+  local td_arch
+  td_arch="$(aws ecs describe-task-definition --region "$AWS_REGION" \
+    --task-definition "$current_arn" \
+    --query 'taskDefinition.runtimePlatform.cpuArchitecture' --output text 2>/dev/null)"
+  [[ -z "$td_arch" || "$td_arch" == "None" ]] && td_arch="X86_64"
+  if [[ -n "$image_arch" && "$image_arch" != "$td_arch" ]]; then
+    echo "ERROR: image arch ${image_arch} (DOCKER_PLATFORM=${DOCKER_PLATFORM}) != task-def runtimePlatform ${td_arch}." >&2
+    echo "       Set the task def's runtimePlatform.cpuArchitecture to ${image_arch}, or rebuild with a matching DOCKER_PLATFORM." >&2
+    exit 1
+  fi
 
   # Take the running task def, strip the read-only fields register-task-definition
   # rejects, and repoint the app container's image at the pinned tag.
@@ -320,6 +373,7 @@ else
 
   aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" --region "$AWS_REGION" &>/dev/null \
     || { echo "==> Creating ECR repository ${ECR_REPOSITORY}"; aws ecr create-repository --repository-name "$ECR_REPOSITORY" --region "$AWS_REGION" >/dev/null; }
+  ensure_ecr_lifecycle_policy
 
   aws ecr get-login-password --region "$AWS_REGION" \
     | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"

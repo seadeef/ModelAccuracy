@@ -191,10 +191,14 @@ if [[ -z "${SKIP_INVALIDATE:-}" ]]; then
     echo "ERROR: CLOUDFRONT_DISTRIBUTION_ID not set (use SKIP_INVALIDATE=1 to skip)." >&2
     exit 1
   fi
-  echo "==> CloudFront invalidation ($CLOUDFRONT_DISTRIBUTION_ID): data paths at root"
+  # Only invalidate the mutable trees. zip/, admin/, wbd/ are immutable (1yr
+  # Cache-Control) so a bumped URL — not an invalidation — is how they'd change;
+  # invalidating them is wasted paths. Forecast bins are backend-read from S3, so
+  # only the browser-fetched forecast_calendar.json needs invalidating.
+  echo "==> CloudFront invalidation ($CLOUDFRONT_DISTRIBUTION_ID): mutable data paths"
   aws cloudfront create-invalidation \
     --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
-    --paths "/config.json" "/zip/*" "/admin/*" "/wbd/*" "/tiles/*" "/ranges/*" "/forecast/*" \
+    --paths "/config.json" "/tiles/*" "/ranges/*" "/forecast/forecast_calendar.json" \
     --query 'Invalidation.{Id:Id,Status:Status}' --output table
 else
   echo "==> SKIP_INVALIDATE set — not invalidating CloudFront"

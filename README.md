@@ -186,9 +186,13 @@ Common flags:
 - `SKIP_EXPORT=1 ./deploy_fargate.sh` — use existing `static_export/model_data/`
 - `SKIP_PUSH=1 ./deploy_fargate.sh` — build only, no ECR push
 - `./deploy_fargate.sh --tag-latest` (or `ECR_PUSH_LATEST=1`) — also push `:latest`
-- `./deploy_fargate.sh --force-redeploy` (or `ECS_FORCE_REDEPLOY=1`) — `aws ecs update-service --force-new-deployment` after push; needs `ECS_CLUSTER`/`ECS_CLUSTER_ARN` + `ECS_SERVICE`/`ECS_SERVICE_ARN` (or interactive prompt)
+- `./deploy_fargate.sh --force-redeploy` (or `ECS_FORCE_REDEPLOY=1`) — register a new task-def revision pinned to `ECR_REPOSITORY:IMAGE_TAG` and roll the service onto it (deterministic, unlike a bare `--force-new-deployment`); needs `ECS_CLUSTER`/`ECS_CLUSTER_ARN` + `ECS_SERVICE`/`ECS_SERVICE_ARN` (or interactive prompt)
 - `AWS_REGION=us-east-1 ECR_REPOSITORY=my-api ./deploy_fargate.sh`
-- `DOCKER_PLATFORM=linux/arm64 ./deploy_fargate.sh` — only if running ARM/Graviton; default is `linux/amd64`
+- `DOCKER_PLATFORM=linux/arm64 ./deploy_fargate.sh` — build for ARM/Graviton; default is `linux/amd64`
+
+The default `IMAGE_TAG` is `git-<sha>-data<digest>` (digest over the baked-in `static_export/model_data` bins), so a stats-only refresh at the same commit still produces a new immutable tag; a dirty tree (incl. untracked files) uses `git-<sha>-dirty-<ts>`. Each push (re)applies an **ECR lifecycle policy** keeping the last 10 `git-*` images and expiring untagged after 1 day, so per-build tags don't accumulate.
+
+**Graviton (ARM64) cutover:** `--force-redeploy` aborts on an image/task-def CPU-arch mismatch. To switch: set the ECS task def's `runtimePlatform.cpuArchitecture` to `ARM64`, then deploy with `DOCKER_PLATFORM=linux/arm64` (~20% Fargate compute savings; all deps ship aarch64 wheels). Watch the first ARM deploy.
 
 ### Static + forecast (`deploy_static.sh`)
 
