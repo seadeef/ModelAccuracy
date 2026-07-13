@@ -1,8 +1,9 @@
-# API image dependencies ONLY (Fargate backend). The full requirements.txt —
-# rasterio / xarray / cfgrib / eccodes / s3fs / GDAL / Pillow / … — is for the
-# local data-pipeline venv; the backend (backend/, statistics_plugins/,
-# model_registry, forecast_variables) imports none of it. Keeping this list
-# lean is what keeps the image (and every ECR push/pull) small.
+# Local API dev dependencies ONLY (uvicorn backend.api:app). The full
+# requirements.txt — rasterio / xarray / cfgrib / eccodes / s3fs / GDAL /
+# Pillow / … — is for the local data-pipeline venv; the backend (backend/,
+# statistics_plugins/, model_registry, forecast_variables) imports none of it.
+# The production Lambda uses requirements.lambda.txt (no uvicorn/boto3,
+# + mangum) — keep the two in lockstep when bumping pins.
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 starlette>=0.40.0

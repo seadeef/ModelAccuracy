@@ -66,7 +66,7 @@ app = FastAPI(title="Model Statistics Query API", lifespan=_lifespan)
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    """ALB / ECS health checks."""
+    """Deploy smoke tests (deploy_api.sh); exempt from origin verification."""
     return {"status": "ok"}
 
 
@@ -74,6 +74,31 @@ def health() -> dict[str, str]:
 def auth_config() -> dict:
     """Cognito Hosted UI hints for the SPA (safe to expose; no secrets)."""
     return public_auth_config()
+
+
+class OriginVerifyMiddleware(BaseHTTPMiddleware):
+    """Reject requests that didn't come through CloudFront.
+
+    The Lambda Function URL is public (AuthType NONE — CloudFront OAC can't
+    sign POST bodies the browser sends), so CloudFront attaches a shared
+    secret in ``x-origin-verify`` and everything else gets a 403.  Active
+    only when ``ORIGIN_VERIFY_SECRET`` is set (production Lambda);
+    dev/uvicorn never sets it.  ``/health`` stays open for smoke tests.
+    """
+
+    _SECRET = os.getenv("ORIGIN_VERIFY_SECRET", "").strip()
+
+    async def dispatch(self, request: Request, call_next):
+        import hmac
+
+        supplied = request.headers.get("x-origin-verify", "")
+        if request.url.path != "/health" and not hmac.compare_digest(
+            supplied, self._SECRET
+        ):
+            from fastapi.responses import JSONResponse
+
+            return JSONResponse({"error": "Forbidden"}, status_code=403)
+        return await call_next(request)
 
 
 class LongCacheStaticMiddleware(BaseHTTPMiddleware):
@@ -122,6 +147,8 @@ class LongCacheStaticMiddleware(BaseHTTPMiddleware):
         return response
 
 
+if OriginVerifyMiddleware._SECRET:
+    app.add_middleware(OriginVerifyMiddleware)
 app.add_middleware(LongCacheStaticMiddleware)
 # Production CDN gzips for us; this matters in dev (uvicorn behind Vite proxy) where
 # large JSON like /admin/*.topojson would otherwise ship raw.

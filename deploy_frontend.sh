@@ -4,10 +4,9 @@
 # Scope: only the bundled Vite SPA (static_export/frontend/: index.html, assets/,
 # favicon.svg|ico). Its CONTENTS upload to the bucket ROOT so index.html serves at /.
 # Does NOT touch the rest of static_export/:
-#   * root data assets (config, tiles, ranges, zip, admin, wbd) — ./deploy_static.sh
-#   * forecast/ (forecast .bin + calendar)                      — ./deploy_static.sh
-#   * model_data/ (verification .bin + grid.json)              — baked into the API image;
-#                                                                rebuild via ./deploy_fargate.sh
+#   * root data assets (config, tiles, ranges, zip, admin, wbd, military),
+#     forecast/, and model_data/ — all ./deploy_static.sh
+#   * API code — ./deploy_api.sh
 #
 # Invalidation is scoped to non-hashed files. Files under /assets/ are content-hashed
 # by Vite, so their URLs change on every build and don't need invalidation.

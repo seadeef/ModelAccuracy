@@ -39,8 +39,8 @@ Reads from stats_output/ and tiles_output/, writes to static_export/:
             index/{huc2}.json   (per-HUC2 descendant metadata)
             huc2.topojson
         military/
-            boundaries.json     (image: backend region masks)
-            sites.geojson       (S3: frontend map layer)
+            boundaries.json     (backend region masks — S3-read by the Lambda)
+            sites.geojson       (frontend map layer)
 
 URL scheme: every browser-fetched data file is served from the site root mirroring
 this layout (e.g. ``/config.json``, ``/wbd/index.json``, ``/model_data/…``); the SPA
@@ -52,8 +52,8 @@ Boundary source data lives in ``boundary_data/`` (data only), populated by
 
 Build modes (at most one; omit all for a full export):
 
-* ``--image`` — Docker image inputs: admin/HUC/military polygon exports + ``model_data/`` (``.bin`` + ``grid.json``).
-* ``--static`` — S3/CloudFront assets: ``zip/``, admin/HUC TopoJSON, military GeoJSON,
+* ``--static`` — the S3 site tree: ``zip/``, admin/wbd/military (map TopoJSON/GeoJSON
+  **and** the backend polygon chunks / ``boundaries.json`` the Lambda reads from S3),
   ``config.json``, ``tiles/``, ``ranges/``, and ``forecast/`` (bins + ``forecast_calendar.json``).
 * ``--data`` — only ``static_export/model_data/``.
 * ``--forecast`` — only ``static_export/forecast/``.
@@ -64,9 +64,9 @@ Boundary export flags (combinable with each other; not with build modes above):
 * ``--zip`` — ``zip/{code}.json`` from ``boundary_data/zip/zip_lookup.csv``.
 * ``--admin`` — ``boundaries.json`` + ``states.topojson`` + ``counties.topojson``.
 * ``--huc`` — WBD map assets (``huc2.topojson``, ``children/``, ``index.json`` + ``index/{huc2}.json``) + ``chunks/``.
-* ``--military`` — DISDI MIRTA sites: ``military/boundaries.json`` (image) + ``military/sites.geojson`` (S3).
+* ``--military`` — DISDI MIRTA sites: ``military/boundaries.json`` (backend) + ``military/sites.geojson`` (map).
 
-WBD export depth is capped by ``--max-huc-level`` (default 12) to bound image size /
+WBD export depth is capped by ``--max-huc-level`` (default 12) to bound
 S3 object count; ``boundary_data/`` keeps the full HU16 source for re-export.
 
 Load boundaries first when ``boundary_data/`` is empty::
@@ -82,7 +82,7 @@ or otherwise altering output shape without touching sources.
 
 ``--force`` re-exports every artifact regardless of staleness (outputs are kept).
 ``--clean`` deletes the entire output directory first (which also forces a full
-rebuild); only allowed for a **full** export (no ``--static`` / ``--image`` /
+rebuild); only allowed for a **full** export (no ``--static`` /
 ``--data`` / ``--forecast`` / ``--frontend``).
 
 The .bin files are raw float32 arrays (row-major, height × width).
@@ -152,7 +152,7 @@ FRONTEND_ROOT = _PROJECT_ROOT / "frontend"
 DATA_DIR_NAME = "model_data"
 FORECAST_DIR_NAME = "forecast"
 FRONTEND_DIR_NAME = "frontend"
-# Served WBD depth (chunks baked into the image + map assets on S3). Default comes
+# Served WBD depth (backend chunks + map assets, all on S3). Default comes
 # from wbd_core.DEFAULT_MAX_HUC_LEVEL — the one knob shared with the loader.
 # Override per-run with --max-huc-level.
 
@@ -534,7 +534,7 @@ def _prune_stale(root: Path, keep: set[Path], suffix: str) -> int:
 
     Keeps the served WBD tree matching the current source + ``--max-huc-level``:
     units removed from the source (or levels excluded by a lowered cap) leave no
-    orphaned chunk/children files to be baked into the image or synced to S3.
+    orphaned chunk/children files to be synced to S3.
     Files in *keep* are untouched, so ``_write_*_if_changed`` mtimes survive.
     """
     if not root.is_dir():
@@ -551,6 +551,77 @@ def _prune_stale(root: Path, keep: set[Path], suffix: str) -> int:
         except OSError:
             pass
     return removed
+
+
+# Chunk polygons feed ONLY the backend's region-mask rasterization onto the
+# stats grid (0.25° cells ≈ 25 km); map display uses the separate TopoJSON
+# tree. Source rings arrive pre-simplified at 0.005° (wbd_core), but with
+# full-precision floats — most of the ~240 MB chunk tree was noise digits.
+# Rounding to CHUNK_COORD_DECIMALS (~11 m) halves the bytes with ZERO mask
+# changes (verified on a 400-HUC10 sample). Do not raise the tolerance for a
+# deeper shrink: 0.01°/0.02° cut 4×/7.6× but flipped mask cells in 6%/14% of
+# sampled HUC10s (a HUC10 spans only ~1 grid cell, so sub-cell distortion
+# moves its reported mean). At 0.005° the simplify is a near-no-op guard.
+CHUNK_SIMPLIFY_TOLERANCE = 0.005
+CHUNK_COORD_DECIMALS = 4
+
+
+def _chunk_slim_polygons(
+    polygons: list[list[list[list[float]]]],
+) -> list[list[list[list[float]]]]:
+    """Simplify + round mask polygons; fall back to the input on degeneracy."""
+    from shapely.geometry import Polygon
+
+    from wbd_core import geom_to_polygons
+
+    def _round_ring(ring: list[list[float]]) -> list[list[float]] | None:
+        pts = [
+            [round(float(x), CHUNK_COORD_DECIMALS), round(float(y), CHUNK_COORD_DECIMALS)]
+            for x, y in ring
+        ]
+        dedup = [pts[0]]
+        for p in pts[1:]:
+            if p != dedup[-1]:
+                dedup.append(p)
+        if dedup[0] != dedup[-1]:
+            dedup.append(list(dedup[0]))
+        return dedup if len(dedup) >= 4 else None
+
+    out: list[list[list[list[float]]]] = []
+    for poly in polygons:
+        if not poly or len(poly[0]) < 4:
+            continue
+        try:
+            geom = Polygon(poly[0], [h for h in poly[1:] if len(h) >= 4])
+            simplified = geom.simplify(CHUNK_SIMPLIFY_TOLERANCE, preserve_topology=True)
+            if simplified.is_empty:
+                simplified = geom
+            parts = geom_to_polygons(simplified)
+        except Exception:
+            parts = [poly]
+        for part in parts:
+            if not part:
+                continue
+            outer = _round_ring(part[0])
+            if outer is None:
+                continue
+            rings = [outer]
+            for hole in part[1:]:
+                r = _round_ring(hole)
+                if r is not None:
+                    rings.append(r)
+            out.append(rings)
+    # A unit must never vanish from the chunk tree because simplification
+    # collapsed it — the mask code handles tiny polygons; a missing HUC 404s.
+    return out if out else polygons
+
+
+def _chunk_unit(entry: dict) -> dict:
+    return {
+        "name": entry["name"],
+        "bbox": [round(float(v), CHUNK_COORD_DECIMALS) for v in entry["bbox"]],
+        "polygons": _chunk_slim_polygons(entry["polygons"]),
+    }
 
 
 def export_wbd_boundaries(
@@ -666,11 +737,14 @@ def export_wbd_boundaries(
                 if not any(_wbd_in_branch(u, branch) for u in units):
                     continue
             if write_chunks:
+                # Slim at write time only — `units` also feeds the full-detail
+                # map TopoJSON below.
+                chunk_units = {h: _chunk_unit(u) for h, u in units.items()}
                 chunk_path = chunks_dir / str(parent_level) / f"{parent}.json"
                 written_chunks.add(chunk_path.resolve())
                 _write_text_if_changed(
                     chunk_path,
-                    json.dumps({"parent": parent, "level": level, "units": units}, separators=(",", ":")),
+                    json.dumps({"parent": parent, "level": level, "units": chunk_units}, separators=(",", ":")),
                 )
             if write_map_assets:
                 child_features = []
@@ -696,11 +770,8 @@ def export_wbd_boundaries(
                     child_path,
                     json.dumps(child_topo, separators=(",", ":")),
                 )
-    root_units = {
-        huc: {"name": e["name"], "bbox": e["bbox"], "polygons": e["polygons"]}
-        for huc, e in units_by_level[2].items()
-    }
     if write_chunks:
+        root_units = {huc: _chunk_unit(e) for huc, e in units_by_level[2].items()}
         root_path = chunks_dir / "2" / "_root.json"
         written_chunks.add(root_path.resolve())
         _write_text_if_changed(
@@ -747,7 +818,7 @@ def export_wbd_boundaries(
                 ),
             )
     # Prune stale artifacts so the served tree matches the current source + cap.
-    # Each mode only prunes what it writes (--image → chunks, --static → children).
+    # Each half only prunes what it writes (chunks vs. children/index).
     if write_chunks:
         stale = _prune_stale(chunks_dir, written_chunks, ".json")
         if stale:
@@ -765,7 +836,9 @@ def export_wbd_boundaries(
         n_sub = sum(1 for _ in index_dir.glob("*.json"))
         print(f"  {n_sub} per-HUC2 index file(s) under {index_dir}/")
     if write_chunks:
-        print(f"  {sum(1 for _ in chunks_dir.rglob('*.json'))} chunk files under {chunks_dir}/")
+        chunk_files = list(chunks_dir.rglob("*.json"))
+        chunk_mb = sum(p.stat().st_size for p in chunk_files) / (1024 * 1024)
+        print(f"  {len(chunk_files)} chunk files ({chunk_mb:.1f} MB) under {chunks_dir}/")
 
 
 def export_boundary_parts(
@@ -910,8 +983,8 @@ def export_data_layers(data_root: Path) -> None:
         if not model_stats.exists():
             continue
 
-        # Drop artifacts from removed features so they don't linger in the
-        # Docker image / S3: renamed stats (sacc → cc) and lead-window bins.
+        # Drop artifacts from removed features so they don't linger in S3:
+        # renamed stats (sacc → cc) and lead-window bins.
         pruned_dirs += _prune_stale_stat_dirs(data_dir / model_key, valid_stats)
         for stale_bin in (data_dir / model_key).rglob("lead_*_*.bin"):
             stale_bin.unlink()
@@ -1194,8 +1267,8 @@ def export_forecast_data_layers(forecast_root: Path) -> None:
     lead_*.npz`` (single key ``"value"``) for every variable a model exposes
     (precip/temp/wind/humidity). We mirror that
     into a per-variable ``.bin`` tree (``forecast/{model}/{var}/``) so forecast
-    data can be uploaded to S3 independently and is never baked into the Fargate
-    image. For older single-variable exports (the legacy flat ``forecast/lead_*.npz``
+    data uploads to S3 independently of any code deploy.
+    For older single-variable exports (the legacy flat ``forecast/lead_*.npz``
     keyed ``"precip"``) we still emit ``forecast/{model}/precip/`` so the backend
     has one uniform path layout to read.
     """
@@ -1514,11 +1587,9 @@ def main() -> None:
     )
     parser.add_argument(
         "--static", action="store_true",
-        help="S3/CloudFront export: zip/, admin/HUC TopoJSON, config, tiles, ranges, forecast/",
-    )
-    parser.add_argument(
-        "--image", action="store_true",
-        help="Docker image export: admin/HUC polygons + static_export/model_data/",
+        help="S3 site export: zip/, admin/wbd/military (TopoJSON + backend polygon "
+             "chunks), config, tiles, ranges, forecast/ — everything but model_data/ "
+             "(--data) and the SPA (--frontend)",
     )
     parser.add_argument(
         "--data", action="store_true",
@@ -1556,20 +1627,20 @@ def main() -> None:
     args = parser.parse_args()
 
     mode_count = (
-        int(args.static) + int(args.image) + int(args.data)
+        int(args.static) + int(args.data)
         + int(args.forecast) + int(args.frontend)
     )
     if mode_count > 1:
-        parser.error("Use at most one of --static, --image, --data, --forecast, --frontend.")
+        parser.error("Use at most one of --static, --data, --forecast, --frontend.")
     if args.clean and mode_count:
         parser.error(
             "--clean applies only to a full export "
-            "(omit --static, --image, --data, --forecast, and --frontend)."
+            "(omit --static, --data, --forecast, and --frontend)."
         )
     if _has_boundary_flags(args) and mode_count:
         parser.error(
             "Boundary flags (--zip, --admin, --huc, --military) cannot combine "
-            "with --static, --image, --data, --forecast, or --frontend."
+            "with --static, --data, --forecast, or --frontend."
         )
 
     # --clean wipes the tree, so a full rebuild follows naturally; --force keeps
@@ -1605,11 +1676,11 @@ def main() -> None:
     if args.static:
         site_root.mkdir(parents=True, exist_ok=True)
         maptiler_key = _maptiler_key()
-        print("--static: exporting zip/, admin/HUC TopoJSON, military GeoJSON...")
-        export_boundary_parts(
-            site_root, zip=True, admin_topo=True, huc_topo=True, military_geo=True,
-            huc_max_level=args.max_huc_level,
-        )
+        # Both halves of every boundary set: map TopoJSON/GeoJSON for the
+        # browser AND the polygon chunks/boundaries.json the backend reads
+        # (all S3-served now — the Lambda fetches its polygons on demand).
+        print("--static: exporting zip/, admin/, wbd/, military/ (map assets + backend polygons)...")
+        export_boundaries(site_root, huc_max_level=args.max_huc_level)
         print("--static: exporting config, tiles, ranges...")
         export_s3_assets(site_root, maptiler_key)
         forecast_root = site_root / FORECAST_DIR_NAME
@@ -1622,22 +1693,6 @@ def main() -> None:
             f"\nDone (--static). S3 assets under {site_root} "
             f"and {forecast_root}"
         )
-        return
-
-    if args.image:
-        site_root.mkdir(parents=True, exist_ok=True)
-        print("--image: exporting admin/HUC/military polygons...")
-        export_boundary_parts(
-            site_root, admin_polys=True, huc_polys=True, military_polys=True,
-            huc_max_level=args.max_huc_level,
-        )
-        data_root = site_root / DATA_DIR_NAME
-        data_root.mkdir(parents=True, exist_ok=True)
-        print("--image: exporting data layers...")
-        export_data_layers(data_root)
-        print("--image: exporting model grids...")
-        export_model_grids(data_root)
-        print(f"\nDone (--image). Docker inputs under {site_root}")
         return
 
     if args.data:

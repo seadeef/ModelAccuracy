@@ -83,7 +83,7 @@ class _BoundedLRU:
 
 # Shared thread pools for I/O fan-out. Module-level pools bound total worker
 # threads across concurrent requests instead of each request building its own —
-# an unauthenticated caller can no longer multiply Fargate's thread count by
+# an unauthenticated caller can no longer multiply the process's thread count by
 # fanning out. Sized to overlap S3 latency and to match the S3 client's
 # connection pool (see static_store).
 #
@@ -99,7 +99,7 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=_EXECUTOR_WORKERS, thread_name_prefix
 _LEADS_EXECUTOR = ThreadPoolExecutor(max_workers=_EXECUTOR_WORKERS, thread_name_prefix="stats-leads")
 
 _grid_cache: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, int, int]] = {}
-# Verification stat bins (~156 KB each).  Bounded LRU so a long-lived Fargate
+# Verification stat bins (~156 KB each).  Bounded LRU so a long-lived
 # worker that serves many (model, stat, lead, accumulator) combinations can't
 # accumulate the entire dataset (~650 MB+) in RAM.  Same OrderedDict+Lock LRU as
 # wbd_boundaries._chunk_cache: a hit is moved to the end, the least-recently-used

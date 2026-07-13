@@ -113,16 +113,15 @@ Generates tiles for yearly, current month, and current season. Forecast tiles ar
 
 ### `export_static.py`
 
-Builds the flat `static_export/` tree for disk-backed serving: the bundled Vite SPA (`static_export/frontend/`: `index.html`, `assets/`, favicons), the root data assets (`config.json`, `zip/`, `tiles/`, `ranges/`, `admin/`, `wbd/`, `military/`), `static_export/model_data/` (grid metadata and verification `.bin` arrays), and `static_export/forecast/` (forecast `.bin` arrays + `forecast_calendar.json`). `config.json` is the only regular file at the root. Run this before `docker build` or local API use.
+Builds the flat `static_export/` tree for disk-backed serving: the bundled Vite SPA (`static_export/frontend/`: `index.html`, `assets/`, favicons), the root data assets (`config.json`, `zip/`, `tiles/`, `ranges/`, `admin/`, `wbd/`, `military/`), `static_export/model_data/` (grid metadata and verification `.bin` arrays), and `static_export/forecast/` (forecast `.bin` arrays + `forecast_calendar.json`). `config.json` is the only regular file at the root. Run this before local API use or a deploy.
 
 - `python export_static.py` — full export (all of the above).
-- `python export_static.py --image` — Docker image: admin/HUC/military polygons + `static_export/model_data/`.
-- `python export_static.py --static` — S3/CloudFront: `zip/`, admin/HUC TopoJSON, military GeoJSON, `config.json`, `tiles/`, `ranges/`, and `forecast/` (bins + `forecast_calendar.json`).
+- `python export_static.py --static` — the whole S3 site tree except `model_data/` and the SPA: `zip/`, admin/wbd/military map TopoJSON/GeoJSON **and** the backend polygon files (`wbd/chunks/`, `boundaries.json`), `config.json`, `tiles/`, `ranges/`, and `forecast/` (bins + `forecast_calendar.json`).
 - `python export_static.py --data` — only `static_export/model_data/` (verification `.bin` + `grid.json`).
 - `python export_static.py --forecast` — only `static_export/forecast/` (forecast bins + `forecast_calendar.json`).
 - `python export_static.py --frontend` — only the bundled SPA under `static_export/frontend/`.
 
-Boundary flags (combinable with each other, not with build modes): `--zip`, `--admin`, `--huc`, `--military`. Each writes both halves of its output — `--admin`/`--huc`/`--military` produce the TopoJSON/GeoJSON used by S3 *and* the polygon JSON baked into the image.
+Boundary flags (combinable with each other, not with build modes): `--zip`, `--admin`, `--huc`, `--military`. Each writes both halves of its output — `--admin`/`--huc`/`--military` produce the map TopoJSON/GeoJSON *and* the polygon JSON the backend reads for region masks (from disk in dev, from S3 on Lambda). WBD chunk polygons are coordinate-rounded on export (`CHUNK_COORD_DECIMALS`, ~11 m) — half the bytes, bit-identical masks.
 
 Use `python export_static.py --help` for `--output` and `--clean` (full export only).
 
@@ -130,17 +129,14 @@ Use `python export_static.py --help` for `--output` and `--clean` (full export o
 ``admin/``, ``wbd/layers/``, and ``military/`` outputs at the top level, plus a
 ``cache/`` for the large transient raw downloads (WBD GDB, MIRTA zip). It is
 populated by ``load_boundaries.py``.
-Export modes write the deploy tree ``static_export/``; Docker and S3 deploys only copy from there:
+Export modes write the deploy tree ``static_export/``; the S3 deploys only copy from there:
 
 ```bash
 python load_boundaries.py                 # zip + admin + wbd + military (downloads ~2.7 GB GDB for --wbd)
-python export_static.py --image           # Docker: admin/HUC/military polys + data/
-./deploy_fargate.sh                       # COPY static_export/{data,static/...} into image
-python export_static.py --static          # S3: zip + topos + military geojson + config/tiles/ranges + forecast
-./deploy_static.sh                        # download forecast → export --static → sync S3 + invalidate
+./deploy_static.sh                        # download forecast → export --static + --data → sync S3 + invalidate
 ```
 
-`load_boundaries.py` takes additive `--zip` / `--admin` / `--wbd` / `--military` selectors (all run when none are given). For local dev without the big downloads: `python load_boundaries.py --wbd-sample --military-sample` then `python export_static.py --image`.
+`load_boundaries.py` takes additive `--zip` / `--admin` / `--wbd` / `--military` selectors (all run when none are given). For local dev without the big downloads: `python load_boundaries.py --wbd-sample --military-sample` then `python export_static.py --static`.
 
 `--military` loads the DoD **DISDI MIRTA** dataset (Military Installations, Ranges, and Training Areas — the public `installations_ranges.zip` from acq.osd.mil, a yearly FY release, ~4 MB): 820 US installation sites keyed by a `siteName + state` slug, with boundary polygons (simplified to ~100 m), the published site point, service component, and operational status. The acq.osd.mil server sends an incomplete TLS chain, so the loader completes verification with the pinned IdenTrust chain in `certs/identrust_trustid_server_ca_o1.pem` (never disables verification). Frontend: the shield tool in the draw toolbar shows every site as a marker + boundary; clicking one selects it as the analysis region (`region.type = "military"`, masked server-side from `military/boundaries.json`, with a containing-cell fallback for sites smaller than a grid cell).
 
@@ -218,55 +214,62 @@ Models are registered in `model_registry.py`:
 | `weathernext2` | WeatherNext 2 (WNXT) | GCS Zarr ensemble mean | 00/06/12/18z (latest complete) | 1–10 d |
 | `aifs` | AIFS | ECMWF open data S3 | 12z | 1–14 d |
 
-## Production deployment (AWS)
+## Production deployment (AWS, serverless)
 
-Production splits `static_export/` across three deploy paths. Each shell script loads `.env` from the repo root and runs `python3 export_static.py --<mode>` to refresh just its subtree (or use `SKIP_BUILD=1` / `SKIP_EXPORT=1` to reuse what's already on disk).
+Production is a single CloudFormation stack (`infra/stack.yaml`) — **no Docker, no ECR, no ALB, no Fargate, no NAT**:
 
-| Artifact | Refreshes | Notes |
-|----------|-----------|-------|
-| [Dockerfile](Dockerfile) | API image | Bakes `static_export/model_data/`, `static_export/admin/boundaries.json`, `static_export/wbd/chunks/`, and `static_export/military/boundaries.json`; fails if any is missing |
-| [deploy_fargate.sh](deploy_fargate.sh) | API image → ECR (+ optional ECS redeploy) | Runs `export_static.py --image`, verifies data, `docker build`, ECR push (us-west-1 default) |
-| [deploy_static.sh](deploy_static.sh) | `static_export/` root data assets → `s3://$BUCKET/` (root) and `static_export/forecast/` → S3 | No flags: downloads the latest forecast, runs `export_static.py --static`, syncs both subtrees, and invalidates the data paths (`/config.json`, `/zip/*`, `/admin/*`, …) |
-| [deploy_frontend.sh](deploy_frontend.sh) | Bundled SPA (`static_export/frontend/`: `index.html`, `assets/`, favicons) → `s3://$BUCKET/` (root) | Invalidates non-hashed files; `/assets/` URLs are content-hashed |
+- **CloudFront** serves the SPA + data files from **S3** (default behavior, OAC) and routes `/api/*` to a **Lambda Function URL**.
+- **Lambda** (ARM64, zip package, FastAPI via Mangum) reads *everything* from S3 on demand: stats bins under `model_data/`, WBD chunk polygons per-parent on first use, admin/military `boundaries.json`, forecast bins. The package is code-only (~28 MB).
+- The Function URL is public but CloudFront attaches an `x-origin-verify` secret header; the app 403s anything without it (OAC can't sign browser POST bodies, hence the header instead).
+- **DynamoDB** (on-demand) for saved shapes, **Cognito** for auth, an **EventBridge** `rate(5 minutes)` `{"warm": true}` ping to keep one execution environment resident.
 
-Routing in production: CloudFront fronts S3 (the SPA at `/` and data files at the site root: `/config.json`, `/wbd/*`, …) and the ALB-backed Fargate API (`/api/*`). Both the SPA and data share the bucket root; each deploy script uses `--delete` only within its own subdirs so they don't clobber each other. The backend reads forecast `.bin` files directly from S3 (refreshed every ~5 min); verification data is read from disk inside the container.
+Fixed cost is a few dollars a month at light traffic (CloudFront/S3 pennies, Lambda mostly inside the free tier, DynamoDB on-demand pennies, Cognito ESSENTIALS free under 10k MAU).
 
-### Fargate (`deploy_fargate.sh`)
+There are four deploy layers; each script loads `.env` from the repo root and is idempotent:
 
-The Docker image **fails to build** if `static_export/model_data/<model>/grid.json`, `static_export/admin/boundaries.json`, or `static_export/wbd/chunks/` is missing. Fargate deploy refreshes **verification data** only — run `deploy_static.sh` and/or `deploy_frontend.sh` for the other parts.
+| Script | Deploys | Notes |
+|--------|---------|-------|
+| [deploy_infra.sh](deploy_infra.sh) | The whole stack ([infra/stack.yaml](infra/stack.yaml)) | One command per account/region; prints the `.env` block to paste. Re-run any time |
+| [deploy_api.sh](deploy_api.sh) | Lambda code | Builds the zip from manylinux/aarch64 wheels (`requirements.lambda.txt`) + `backend/`, `statistics_plugins/`, registry modules; `update-function-code` + `/health` smoke test |
+| [deploy_static.sh](deploy_static.sh) | ALL data → S3 | Downloads latest forecast, `export_static.py --static` + `--data`, syncs browser assets *and* backend-read data (`model_data/`, `wbd/chunks/`, `boundaries.json`, forecast bins), invalidates mutable paths, recycles Lambda environments so warm caches drop |
+| [deploy_frontend.sh](deploy_frontend.sh) | Bundled SPA → `s3://$BUCKET/` (root) | Invalidates non-hashed files; `/assets/` URLs are content-hashed |
+
+The SPA and data share the bucket root; each sync uses `--delete` only within its own subdirs so they don't clobber each other.
+
+### Infrastructure (`deploy_infra.sh`)
 
 ```bash
-chmod +x deploy_fargate.sh
-./deploy_fargate.sh
+./deploy_infra.sh          # create or update the whole stack (idempotent)
 ```
 
-Common flags:
+Moving to a **different region or account** is: point `AWS_PROFILE`/`AWS_REGION` at the target, run `./deploy_infra.sh`, paste the printed block into `.env`, then run the three other deploy scripts. Details handled for you:
 
-- `IMAGE_TAG=v1.2.3 ./deploy_fargate.sh`
-- `SKIP_EXPORT=1 ./deploy_fargate.sh` — use existing `static_export/model_data/`
-- `SKIP_PUSH=1 ./deploy_fargate.sh` — build only, no ECR push
-- `./deploy_fargate.sh --tag-latest` (or `ECR_PUSH_LATEST=1`) — also push `:latest`
-- `./deploy_fargate.sh --force-redeploy` (or `ECS_FORCE_REDEPLOY=1`) — register a new task-def revision pinned to `ECR_REPOSITORY:IMAGE_TAG` and roll the service onto it (deterministic, unlike a bare `--force-new-deployment`); needs `ECS_CLUSTER`/`ECS_CLUSTER_ARN` + `ECS_SERVICE`/`ECS_SERVICE_ARN` (or interactive prompt)
-- `AWS_REGION=us-east-1 ECR_REPOSITORY=my-api ./deploy_fargate.sh`
-- `DOCKER_PLATFORM=linux/arm64 ./deploy_fargate.sh` — build for ARM/Graviton; default is `linux/amd64`
+- the CloudFront→Lambda origin-verify secret is generated once and kept in SSM Parameter Store (`/<stack>/origin-verify-secret`, free tier);
+- the Cognito OAuth callback URL needs the CloudFront domain, which doesn't exist on the first pass — the script automatically re-deploys with it (fast, client-only update);
+- reuse of existing user data when rebuilding in the same account: `EXISTING_USER_POOL_ID` / `EXISTING_USER_POOL_CLIENT_ID` / `EXISTING_COGNITO_OAUTH_BASE_URL` / `EXISTING_USER_ITEMS_TABLE`;
+- the bucket, DynamoDB table, and user pool are `DeletionPolicy: Retain` — a stack teardown never destroys data.
 
-The default `IMAGE_TAG` is `git-<sha>-data<digest>` (digest over the baked-in `static_export/model_data` bins), so a stats-only refresh at the same commit still produces a new immutable tag; a dirty tree (incl. untracked files) uses `git-<sha>-dirty-<ts>`. Each push (re)applies an **ECR lifecycle policy** keeping the last 10 `git-*` images and expiring untagged after 1 day, so per-build tags don't accumulate.
-
-**Graviton (ARM64) cutover:** `--force-redeploy` aborts on an image/task-def CPU-arch mismatch. To switch: set the ECS task def's `runtimePlatform.cpuArchitecture` to `ARM64`, then deploy with `DOCKER_PLATFORM=linux/arm64` (~20% Fargate compute savings; all deps ship aarch64 wheels). Watch the first ARM deploy.
-
-### Static + forecast (`deploy_static.sh`)
-
-Takes no arguments. It runs `download.py --forecast`, then `export_static.py --static`
-(which builds both the `static_export/` root data assets and `static_export/forecast/`), syncs both
-subtrees to S3 (data at the bucket root, forecast under the forecast prefix), and invalidates the data paths.
+### API code (`deploy_api.sh`)
 
 ```bash
-./deploy_static.sh                       # download forecast → export --static → sync + invalidate
+./deploy_api.sh                   # build zip (no Docker) → update-function-code → smoke test
+SKIP_SMOKE=1 ./deploy_api.sh
+```
+
+Code and data deploy independently: a stats recompute needs no API deploy, and an API deploy ships no data.
+
+### Data (`deploy_static.sh`)
+
+Takes no arguments. Downloads the latest forecast, rebuilds `static_export/` (`--static` + `--data`), syncs every data subtree to S3, invalidates the mutable browser paths, and bumps a Lambda env var (`DATA_DEPLOYED_AT`) so warm execution environments recycle instead of serving pre-deploy cached bins.
+
+```bash
+./deploy_static.sh                       # forecast → export → sync + invalidate + cache flush
 SKIP_BUILD=1 ./deploy_static.sh          # skip download+export, upload existing static_export/
 SKIP_INVALIDATE=1 ./deploy_static.sh     # skip the CloudFront invalidation
+SKIP_FLUSH=1 ./deploy_static.sh          # skip the Lambda cache-flush recycle
 ```
 
-Cache-Control mirrors `LongCacheStaticMiddleware` in `backend/api.py`: `zip/`, `admin/`, `wbd/`, and `military/` are 1 yr immutable; `tiles/`, `ranges/`, and `config.json` are 300 s `must-revalidate`. The forecast S3 prefix is derived from `DATA_S3_URI` (sibling of the stats prefix); see the script header for the parsing rule.
+Cache-Control mirrors `LongCacheStaticMiddleware` in `backend/api.py`: `zip/`, `admin/`, `wbd/`, and `military/` are 1 yr immutable; `tiles/`, `ranges/`, and `config.json` are 300 s `must-revalidate`. Backend-read keys (`model_data/`, `wbd/chunks/`, `boundaries.json`, forecast bins) bypass CloudFront entirely. The forecast S3 prefix is derived from `DATA_S3_URI` (sibling of the stats prefix); see the script header for the parsing rule.
 
 ### Frontend (`deploy_frontend.sh`)
 
@@ -280,35 +283,37 @@ Uploads the SPA contents to the bucket root `s3://$BUCKET/`: `index.html` (no-ca
 
 ### Environment variables
 
-Most ECS task / build-time env vars are read from `.env` at the repo root by all three deploy scripts and propagated to the Docker image via `--build-arg`:
+The production Lambda gets its environment from the stack (`infra/stack.yaml`), not from `.env`. Locally, `.env` at the repo root is read by the deploy scripts and by `backend/api.py`:
 
 | Variable | Description |
 |----------|-------------|
-| `DATA_S3_URI` | `s3://bucket[/prefix]` for stats data. Forecasts are read from a `forecast/` folder that is a sibling of `<prefix>` (keys: `forecast/{model}/lead_{n}.bin`, `forecast/forecast_calendar.json`) |
-| `CLOUDFRONT_DISTRIBUTION_ID` | CloudFront distribution to invalidate (used by `deploy_static.sh` and `deploy_frontend.sh`) |
+| `DATA_S3_URI` | `s3://bucket/model_data` — the stats prefix. Forecasts are read from a `forecast/` folder that is a sibling of the prefix; the site assets (SPA, `wbd/chunks/`, `boundaries.json`, …) live at the bucket root. Printed by `deploy_infra.sh` |
+| `CLOUDFRONT_DISTRIBUTION_ID` | CloudFront distribution to invalidate (`deploy_static.sh`, `deploy_frontend.sh`) |
+| `LAMBDA_FUNCTION_NAME` | API function name (default `<stack>-api`); used by `deploy_api.sh` and the `deploy_static.sh` cache flush |
+| `STACK_NAME` | CloudFormation stack name (default `raincheck`, lowercase) |
 | `AWS_REGION` | Default `us-west-1` |
 | `AWS_PROFILE` | Optional; exported when set |
-| `COGNITO_USER_POOL_ID` | Cognito User Pool ID (required for auth) |
-| `COGNITO_APP_CLIENT_ID` | Cognito App Client ID (required for auth) |
+| `COGNITO_USER_POOL_ID` / `COGNITO_APP_CLIENT_ID` | Cognito pool/client (local dev; the Lambda gets them from the stack) |
 | `COGNITO_REGION` | Defaults to `AWS_REGION` |
-| `COGNITO_DOMAIN_PREFIX` | Hosted UI domain label (`*.auth.<region>.amazoncognito.com`) — one of `COGNITO_DOMAIN_PREFIX` or `COGNITO_OAUTH_BASE_URL` is required |
-| `COGNITO_OAUTH_BASE_URL` | Optional full https origin for Hosted UI (overrides prefix+region) |
-| `DYNAMODB_USER_ITEMS_TABLE` | DynamoDB table for saved shapes (required, no default) |
+| `COGNITO_DOMAIN_PREFIX` / `COGNITO_OAUTH_BASE_URL` | Hosted UI domain label, or the full https origin (one required for auth) |
+| `DYNAMODB_USER_ITEMS_TABLE` | DynamoDB table for saved shapes |
 | `MAPTILER_API_KEY` | Optional MapTiler key; baked into `config.json` by `export_static.py` |
-| `WARM_CACHE` | `1` / `true` / `yes` — preload all models' `grid.json` at backend startup |
-| `PORT` | Listen port (default **8080**) |
+| `WARM_CACHE` | `1` — preload all models' `grid.json` at startup (set on the Lambda by the stack) |
+| `ORIGIN_VERIFY_SECRET` | Set by the stack on the Lambda only — enables the CloudFront origin check. Never set it locally |
 | `DEV` | `1` / `true` — backend skips production cache headers, reaches for disk over S3 |
 
-### Run the container locally
+### Run the API locally
+
+Dev mirrors production through the same store abstraction — the Lambda fetches `model_data/`, `wbd/chunks/`, and `boundaries.json` from S3 on demand; locally the identical paths resolve under `static_export/`:
 
 ```bash
-python export_static.py
-docker build -t modelaccuracy-api:latest .
-docker run --rm -p 8080:8080 modelaccuracy-api:latest
-curl -s http://127.0.0.1:8080/health
+pip install -r requirements.api.txt
+python export_static.py                  # or --static/--data for just the parts you need
+uvicorn backend.api:app --port 8000      # DEV=1 in .env keeps every read local
+curl -s http://127.0.0.1:8000/health
 ```
 
 ### Notes
 
 - **CORS:** The API sends no CORS headers. Use same-origin path routing (Vite proxy in dev; CloudFront in prod) to avoid browser errors.
-- **Caching:** Stats are cached in-process after first read. Scale with more Fargate tasks, not multiple workers per container.
+- **Caching:** Stats are cached in-process (bounded LRUs) after first read. Lambda scales by adding execution environments, each with its own cache; `deploy_static.sh` recycles them after a data deploy so no environment serves stale bins.

@@ -1,0 +1,15 @@
+# Lambda deployment-package dependencies (built by deploy_api.sh with
+# manylinux/aarch64 wheels — see that script). Differences vs requirements.api.txt:
+#   * no uvicorn        — Mangum adapts ASGI to the Lambda Function URL events
+#   * no boto3/botocore — the Lambda Python runtime provides them (~60 MB saved;
+#                         only plain get_object/head/list + DynamoDB Table ops
+#                         are used, all stable for years)
+#   * + mangum          — the ASGI↔Lambda adapter (backend/lambda_handler.py)
+fastapi>=0.115.0
+starlette>=0.40.0
+python-dotenv>=1.0.0
+numpy>=2.0.0
+pydantic>=2.0.0
+python-jose[cryptography]>=3.3.0
+python-ulid>=2.0.0
+mangum>=0.19.0

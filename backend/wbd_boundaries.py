@@ -1,20 +1,19 @@
 """Lookup for US WBD watershed boundaries by HUC code.
 
-Lazy-loads per-parent chunk JSON from ``static_export/wbd/chunks/``
-(baked into the Docker image).  Map display TopoJSON and ``index.json`` are
-frontend-only assets on S3 / ``/wbd/``.
+Lazy-loads per-parent chunk JSON through the static-site store: in local dev
+the chunks live at ``static_export/wbd/chunks/`` on disk; on Lambda the same
+paths are fetched from S3 on first use of each parent (``wbd/chunks/...``
+keys uploaded by deploy_static.sh) and LRU-cached in the process.  Map display
+TopoJSON and ``index.json`` are frontend-only assets on S3 / ``/wbd/``.
 """
 
 from __future__ import annotations
 
 import json
 from collections import OrderedDict
-from pathlib import Path
 from threading import Lock
 
-from backend.static_store import default_static_site_root
-
-_CHUNKS_ROOT = default_static_site_root() / "wbd" / "chunks"
+from backend.static_store import StaticStore, static_site_store_from_env
 
 # Bound the in-memory chunk cache so a process that drills across many parents
 # doesn't accumulate every visited chunk's sibling polygons forever. LRU: a
@@ -23,42 +22,66 @@ _CHUNK_CACHE_MAX = 256
 
 _lock = Lock()
 _chunk_cache: "OrderedDict[str, dict]" = OrderedDict()
+_store: StaticStore | None = None
+# Positive-only cache of the "does wbd/chunks exist at all" probe, so a miss on
+# an unknown HUC doesn't re-LIST S3 once the tree is known to be present.
+_chunks_root_seen = False
 
 
 class WbdBoundariesUnavailable(RuntimeError):
-    """Chunk directory is missing or unparseable."""
+    """Chunk tree is missing or unparseable."""
 
 
-def _chunk_path(parent_level: int, parent_huc: str) -> Path:
+def _get_store() -> StaticStore:
+    global _store
+    if _store is None:
+        _store = static_site_store_from_env()
+    return _store
+
+
+def _chunk_rel_path(parent_level: int, parent_huc: str) -> str:
     parent_file = "_root" if not parent_huc else parent_huc
-    return _CHUNKS_ROOT / str(parent_level) / f"{parent_file}.json"
+    return f"wbd/chunks/{parent_level}/{parent_file}.json"
+
+
+def _chunks_root_exists(store: StaticStore) -> bool:
+    global _chunks_root_seen
+    if _chunks_root_seen:
+        return True
+    if store.exists("wbd/chunks"):
+        _chunks_root_seen = True
+        return True
+    return False
 
 
 def _load_chunk(parent_level: int, parent_huc: str) -> dict:
-    path = _chunk_path(parent_level, parent_huc)
-    key = str(path.resolve())
+    store = _get_store()
+    rel = _chunk_rel_path(parent_level, parent_huc)
+    key = f"{store.cache_key}::{rel}"
     with _lock:
         cached = _chunk_cache.get(key)
         if cached is not None:
             _chunk_cache.move_to_end(key)  # mark most-recently used
             return cached
-        if not _CHUNKS_ROOT.is_dir():
+    # Fetch outside the lock: an S3 read takes tens of ms and distinct chunks
+    # must not serialize each other. A rare duplicate fetch of the same chunk
+    # by two threads is harmless (last write wins with identical content).
+    try:
+        data = json.loads(store.read_text(rel))
+    except FileNotFoundError as exc:
+        if not _chunks_root_exists(store):
             raise WbdBoundariesUnavailable(
-                f"WBD chunks not found at {_CHUNKS_ROOT}; "
-                "run export_static.py --image (after load_boundaries.py --wbd)"
-            )
-        try:
-            data = json.loads(path.read_text())
-        except FileNotFoundError as exc:
-            raise KeyError(f"WBD chunk not found: {path}") from exc
-        except json.JSONDecodeError as exc:
-            raise WbdBoundariesUnavailable(
-                f"WBD chunk at {path} is not valid JSON"
+                f"WBD chunks not found under {store.cache_key}/wbd/chunks; "
+                "run export_static.py --huc, then deploy_static.sh for production"
             ) from exc
+        raise KeyError(f"WBD chunk not found: {rel}") from exc
+    except json.JSONDecodeError as exc:
+        raise WbdBoundariesUnavailable(f"WBD chunk at {rel} is not valid JSON") from exc
+    with _lock:
         _chunk_cache[key] = data
         while len(_chunk_cache) > _CHUNK_CACHE_MAX:
             _chunk_cache.popitem(last=False)  # evict least-recently used
-        return data
+    return data
 
 
 def get_entry(huc: str) -> dict:
@@ -87,5 +110,8 @@ def get_entry(huc: str) -> dict:
 
 def reset_cache() -> None:
     """For tests."""
+    global _store, _chunks_root_seen
     with _lock:
         _chunk_cache.clear()
+        _store = None
+        _chunks_root_seen = False

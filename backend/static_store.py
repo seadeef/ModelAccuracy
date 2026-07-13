@@ -223,11 +223,10 @@ def store_from_env(
 ) -> StaticStore:
     if _running_on_aws_lambda():
         return _lambda_s3_store_or_raise()
-    # Fargate (and dev) read stats from the local filesystem — verification .bin
-    # and grid.json are baked into the image (Dockerfile: COPY static_export …).
-    # Only forecast data lives in S3 (refreshed daily without a redeploy); see
-    # forecast_store_from_env. S3 stats reads remain only for Lambda, whose
-    # deployment package can't carry the data.
+    # Local dev reads stats from the filesystem (static_export/model_data/,
+    # written by export_static.py --data). Production is the Lambda branch
+    # above: the deployment package is code-only, so stats always come from S3
+    # (uploaded by deploy_static.sh to the DATA_S3_URI prefix).
     root = default_local_root or default_static_site_root()
     return LocalStaticStore(root)
 

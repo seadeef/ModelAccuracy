@@ -1,19 +1,19 @@
 """Lookup for US admin (state/county) boundaries by FIPS code.
 
-Reads ``static_export/admin/boundaries.json`` once at first use and
-The file is produced by ``export_static.py --image`` or ``--admin`` from
-``boundary_data/admin/`` (populated by ``load_boundaries.py --admin``).
+Reads ``admin/boundaries.json`` once at first use through the static-site
+store: ``static_export/admin/boundaries.json`` on disk in dev, the same S3 key
+in production Lambda.  The file is produced by ``export_static.py --admin``
+from ``boundary_data/admin/`` (populated by ``load_boundaries.py --admin``).
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from threading import Lock
 
-from backend.static_store import default_static_site_root
+from backend.static_store import static_site_store_from_env
 
-_DEFAULT_PATH = default_static_site_root() / "admin" / "boundaries.json"
+_REL_PATH = "admin/boundaries.json"
 
 _VALID_LEVELS = ("state", "county")
 _BUCKET_BY_LEVEL = {"state": "states", "county": "counties"}
@@ -26,23 +26,24 @@ class AdminBoundariesUnavailable(RuntimeError):
     """Boundaries file is missing or unparseable."""
 
 
-def _load(path: Path = _DEFAULT_PATH) -> dict:
+def _load() -> dict:
     global _cached
     if _cached is not None:
         return _cached
     with _lock:
         if _cached is not None:
             return _cached
+        store = static_site_store_from_env()
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(store.read_text(_REL_PATH))
         except FileNotFoundError as exc:
             raise AdminBoundariesUnavailable(
-                f"admin boundaries not found at {path}; "
-                "run export_static.py --image (after load_boundaries.py)"
+                f"admin boundaries not found at {store.cache_key}/{_REL_PATH}; "
+                "run export_static.py --admin, then deploy_static.sh for production"
             ) from exc
         except json.JSONDecodeError as exc:
             raise AdminBoundariesUnavailable(
-                f"admin boundaries at {path} is not valid JSON"
+                f"admin boundaries at {_REL_PATH} is not valid JSON"
             ) from exc
         _cached = data
     return _cached

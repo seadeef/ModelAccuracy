@@ -1,47 +1,49 @@
 #!/usr/bin/env bash
-# Refresh the S3-served static site: download the latest forecast, rebuild the
-# static export, and sync it to the stats bucket. No command-line options.
+# Refresh ALL data in S3: download the latest forecast, rebuild the static
+# export (browser assets + backend-read data), and sync it to the bucket.
+# No command-line options.
 #
 # Steps:
 #   1. python3 download.py --forecast        # latest forecast → stats_output/{model}/forecast/
-#   2. python3 export_static.py --static      # builds static_export/ root assets AND static_export/forecast/
-#   3. aws s3 sync static_export/{config.json,zip,admin,wbd,military,tiles,ranges} → s3://$BUCKET/… (root)
-#   4. aws s3 sync static_export/forecast/ → s3://$BUCKET/$FORECAST_PREFIX/
-#   5. CloudFront invalidation of the data paths (/config.json, /zip/*, /admin/*, …)
+#   2. python3 export_static.py --static     # site root assets + boundary polygons + forecast/
+#   3. python3 export_static.py --data       # static_export/model_data/ (.bin + grid.json)
+#   4. aws s3 sync each subtree → s3://$BUCKET/…
+#   5. CloudFront invalidation of the mutable browser paths
 #
-# The two synced subtrees:
+# The synced subtrees and who reads them:
 #
-#   static_export/ root      Browser-fetched via CloudFront from the site root
-#                            (config.json, tiles/, ranges/, zip/, admin/, wbd/ map assets),
-#                            uploaded to s3://$BUCKET/… (keys mirror the local layout).
-#                            They share the bucket root with the SPA (./deploy_frontend.sh);
-#                            each sync uses --delete only within its own subdir.
-#                            Cache-Control matches backend/api.py:LongCacheStaticMiddleware:
-#                              zip/, admin/, wbd/ (map assets only),
-#                              military/ (sites.geojson only)        → 1yr immutable
-#                              tiles/, ranges/, config.json          → 300s must-revalidate
+#   Browser (via CloudFront, cache headers set here):
+#     config.json, tiles/, ranges/          mutable  (300s must-revalidate)
+#     zip/, admin/, wbd/ map assets,
+#       military/sites.geojson              immutable (1yr)
+#     forecast/forecast_calendar.json       mutable
 #
-#   static_export/forecast/  Read by the Fargate backend via forecast_store_from_env
-#                            (refreshes every ~5 min), so daily forecast updates ship
-#                            without rebuilding the API image. FORECAST_PREFIX is the
-#                            sibling of the DATA_S3_URI stats prefix:
-#                              s3://bucket            → s3://bucket/forecast/
-#                              s3://bucket/prefix     → s3://bucket/forecast/
-#                              s3://bucket/a/b        → s3://bucket/a/forecast/
-#                            No CloudFront invalidation (backend reads S3 directly).
+#   Backend Lambda (direct S3 GetObject — no CloudFront, no cache headers):
+#     model_data/<model>/…                  stats bins + grid.json (DATA_S3_URI)
+#     wbd/chunks/…                          HUC mask polygons, fetched per-parent
+#     admin/boundaries.json,
+#       military/boundaries.json            region mask polygons
+#     forecast/{model}/{var}/lead_*.bin     re-read every ~5 min, so daily
+#                                           forecast updates ship without an
+#                                           API deploy
 #
 # Not uploaded here:
-#   * SPA shell (frontend/index.html, assets/, favicons) — use ./deploy_frontend.sh.
-#   * static_export/model_data/ (verification .bin + grid.json) — baked into the API
-#     image by Dockerfile COPY; refreshed by rebuilding via ./deploy_fargate.sh.
+#   * SPA shell (index.html, assets/, favicons) — ./deploy_frontend.sh
+#   * API code — ./deploy_api.sh
 #
 # Env (loaded from .env if present):
-#   DATA_S3_URI                  s3://bucket[/prefix]  (required)
+#   DATA_S3_URI                  s3://bucket/model_data  (required; the stats
+#                                prefix — bucket root holds the site, so a
+#                                bare s3://bucket is refused to keep --delete
+#                                syncs away from the SPA files)
 #   CLOUDFRONT_DISTRIBUTION_ID   required unless SKIP_INVALIDATE=1
 #   AWS_REGION                   default us-west-1
 #   AWS_PROFILE                  optional
+#   LAMBDA_FUNCTION_NAME         default <STACK_NAME>-api — recycled after sync so
+#                                warm environments drop pre-deploy caches
 #   SKIP_BUILD=1                 skip download+export; upload existing static_export/
 #   SKIP_INVALIDATE=1            skip the data-paths CloudFront invalidation
+#   SKIP_FLUSH=1                 skip the Lambda cache-flush recycle
 
 set -euo pipefail
 
@@ -61,11 +63,11 @@ if [[ -f "$ROOT/.env" ]]; then
 fi
 
 if [[ -z "${DATA_S3_URI:-}" ]]; then
-  echo "ERROR: DATA_S3_URI not set (expected s3://bucket[/prefix])." >&2
+  echo "ERROR: DATA_S3_URI not set (expected s3://bucket/model_data)." >&2
   exit 1
 fi
 
-# Parse DATA_S3_URI=s3://bucket[/stats_prefix] → (BUCKET, FORECAST_PREFIX).
+# Parse DATA_S3_URI=s3://bucket/stats_prefix → (BUCKET, STATS_PREFIX, FORECAST_PREFIX).
 # Mirror backend/static_store.py:forecast_store_from_env:
 #   parent = stats_prefix.rsplit("/", 1)[0] if "/" in stats_prefix else ""
 #   forecast_prefix = f"{parent}/forecast" if parent else "forecast"
@@ -76,6 +78,11 @@ if [[ "$WITHOUT_SCHEME" == "$BUCKET" ]]; then
 else
   STATS_PREFIX="${WITHOUT_SCHEME#*/}"
   STATS_PREFIX="${STATS_PREFIX%/}"
+fi
+if [[ -z "$STATS_PREFIX" ]]; then
+  echo "ERROR: DATA_S3_URI needs a prefix (s3://bucket/model_data): the bucket root" >&2
+  echo "       holds the SPA + site assets, and the stats sync uses --delete." >&2
+  exit 1
 fi
 if [[ "$STATS_PREFIX" == *"/"* ]]; then
   FORECAST_PREFIX="${STATS_PREFIX%/*}/forecast"
@@ -95,6 +102,7 @@ SITE="$ROOT/static_export"
 # /config.json, /wbd/…). They share the root with the SPA (./deploy_frontend.sh).
 STATIC_SRC="$SITE"
 FORECAST_SRC="$SITE/forecast"
+DATA_SRC="$SITE/model_data"
 
 CC_MUTABLE="public, max-age=300, must-revalidate"
 CC_IMMUTABLE="public, max-age=31536000, immutable"
@@ -105,13 +113,14 @@ build() {
     return
   fi
   # Download the freshest forecast for every model, then export the static tree.
-  # export_static.py --static writes both the root data assets and forecast/ via the
-  # _write_*_if_changed helpers, so unchanged files keep their mtime and the
-  # `aws s3 sync` calls below skip them.
+  # Both export modes write via the _write_*_if_changed helpers, so unchanged
+  # files keep their mtime and the `aws s3 sync` calls below skip them.
   echo "==> Downloading latest forecast (download.py --forecast)"
   python3 download.py --forecast
   echo "==> Rebuilding static export (export_static.py --static)"
   python3 export_static.py --static
+  echo "==> Rebuilding model data (export_static.py --data)"
+  python3 export_static.py --data
 }
 
 sync_static() {
@@ -119,13 +128,16 @@ sync_static() {
     echo "ERROR: $STATIC_SRC does not exist — run without SKIP_BUILD." >&2
     exit 1
   fi
-  # Data files are served from the site root now (no /stats prefix). Each sync
+  # Data files are served from the site root (no /stats prefix). Each sync
   # targets a specific subdir with --delete; config.json + the forecast calendar
   # use cp (no --delete) so they don't disturb the SPA files that share the root.
   local dest="s3://$BUCKET"
 
-  # Immutable (zip + admin boundaries — change yearly at most).
-  for sub in zip admin; do
+  # Immutable browser assets (change yearly at most). wbd/ and military/ also
+  # carry the backend polygon files (chunks/, boundaries.json) — those are read
+  # straight from S3 by the Lambda, so the browser cache header is irrelevant
+  # to them and syncing whole directories keeps --delete pruning correct.
+  for sub in zip admin wbd military; do
     if [[ -d "$STATIC_SRC/$sub" ]]; then
       echo "==> Sync $dest/$sub/ ($CC_IMMUTABLE)"
       aws s3 sync "$STATIC_SRC/$sub" "$dest/$sub" \
@@ -133,27 +145,6 @@ sync_static() {
         --cache-control "$CC_IMMUTABLE"
     fi
   done
-
-  # WBD frontend map assets only (backend chunks/ are baked into the API image).
-  WBD="$STATIC_SRC/wbd"
-  if [[ -d "$WBD" ]]; then
-    echo "==> Sync $dest/wbd/ map assets ($CC_IMMUTABLE; excludes chunks/)"
-    aws s3 sync "$WBD" "$dest/wbd" \
-      --region "$AWS_REGION" --delete \
-      --cache-control "$CC_IMMUTABLE" \
-      --exclude "chunks/*"
-  fi
-
-  # Military frontend map assets only (backend boundaries.json is baked into the
-  # API image). MIRTA is a yearly release, so immutable is safe.
-  MILITARY="$STATIC_SRC/military"
-  if [[ -d "$MILITARY" ]]; then
-    echo "==> Sync $dest/military/ map assets ($CC_IMMUTABLE; excludes boundaries.json)"
-    aws s3 sync "$MILITARY" "$dest/military" \
-      --region "$AWS_REGION" --delete \
-      --cache-control "$CC_IMMUTABLE" \
-      --exclude "boundaries.json"
-  fi
 
   # Mutable (refreshed each stats rerun).
   for sub in tiles ranges; do
@@ -183,6 +174,20 @@ sync_static() {
   fi
 }
 
+sync_model_data() {
+  if [[ ! -d "$DATA_SRC" ]]; then
+    echo "ERROR: $DATA_SRC does not exist — run without SKIP_BUILD (or export_static.py --data)." >&2
+    exit 1
+  fi
+  # Backend-read stats tree (DATA_S3_URI). The Lambda maps model_data/<x> →
+  # <STATS_PREFIX>/<x>, so the uploaded keys must live under the same prefix
+  # the URI names.
+  local dest="s3://$BUCKET/$STATS_PREFIX"
+  echo "==> Sync $dest/ (--delete)"
+  aws s3 sync "$DATA_SRC" "$dest" \
+    --region "$AWS_REGION" --delete
+}
+
 sync_forecast() {
   if [[ ! -d "$FORECAST_SRC" ]]; then
     echo "ERROR: $FORECAST_SRC does not exist — run without SKIP_BUILD." >&2
@@ -194,19 +199,53 @@ sync_forecast() {
     --region "$AWS_REGION" --delete
 }
 
+# The Lambda caches bins/masks/chunks per execution environment (bounded LRUs
+# keyed by S3 path — same key, so a warm environment would serve pre-deploy
+# values). Bumping an env var recycles every environment: the next invocation
+# cold-starts against the fresh data. No-op when the function doesn't exist
+# (dev-only checkout) or SKIP_FLUSH=1.
+flush_lambda_caches() {
+  if [[ -n "${SKIP_FLUSH:-}" ]]; then
+    echo "==> SKIP_FLUSH set — warm Lambda environments keep pre-deploy caches"
+    return
+  fi
+  local fn="${LAMBDA_FUNCTION_NAME:-${STACK_NAME:-raincheck}-api}"
+  if ! aws lambda get-function-configuration --region "$AWS_REGION" \
+        --function-name "$fn" >/dev/null 2>&1; then
+    echo "==> Lambda ${fn} not found — skipping cache flush"
+    return
+  fi
+  echo "==> Recycling ${fn} environments (DATA_DEPLOYED_AT bump → fresh caches)"
+  local env_file
+  env_file="$(mktemp)"
+  aws lambda get-function-configuration --region "$AWS_REGION" \
+      --function-name "$fn" --query 'Environment.Variables' --output json \
+    | python3 -c 'import json, sys, time
+v = json.load(sys.stdin) or {}
+v["DATA_DEPLOYED_AT"] = str(int(time.time()))
+json.dump({"Variables": v}, sys.stdout)' > "$env_file"
+  aws lambda update-function-configuration --region "$AWS_REGION" \
+    --function-name "$fn" --environment "file://${env_file}" \
+    --no-cli-pager --query 'LastUpdateStatus' --output text
+  rm -f "$env_file"
+  aws lambda wait function-updated --region "$AWS_REGION" --function-name "$fn"
+}
+
 build
 sync_static
+sync_model_data
 sync_forecast
+flush_lambda_caches
 
 if [[ -z "${SKIP_INVALIDATE:-}" ]]; then
   if [[ -z "${CLOUDFRONT_DISTRIBUTION_ID:-}" ]]; then
     echo "ERROR: CLOUDFRONT_DISTRIBUTION_ID not set (use SKIP_INVALIDATE=1 to skip)." >&2
     exit 1
   fi
-  # Only invalidate the mutable trees. zip/, admin/, wbd/ are immutable (1yr
-  # Cache-Control) so a bumped URL — not an invalidation — is how they'd change;
-  # invalidating them is wasted paths. Forecast bins are backend-read from S3, so
-  # only the browser-fetched forecast_calendar.json needs invalidating.
+  # Only invalidate the mutable browser trees. zip/, admin/, wbd/ map assets are
+  # immutable (1yr Cache-Control) so a bumped URL — not an invalidation — is how
+  # they'd change. model_data/, wbd/chunks/, boundaries.json and forecast bins
+  # are backend-read straight from S3, so CloudFront never caches them.
   echo "==> CloudFront invalidation ($CLOUDFRONT_DISTRIBUTION_ID): mutable data paths"
   aws cloudfront create-invalidation \
     --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
@@ -216,5 +255,6 @@ else
   echo "==> SKIP_INVALIDATE set — not invalidating CloudFront"
 fi
 
-echo "==> Forecast: backend re-reads S3 within ~5 min."
+echo "==> Forecast + boundaries: the Lambda re-reads S3 (forecast within ~5 min;"
+echo "    boundary/chunk caches refresh on the next cold start)."
 echo "==> Done"
