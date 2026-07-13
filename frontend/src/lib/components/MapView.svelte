@@ -2,7 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import maplibregl from 'maplibre-gl';
   import 'maplibre-gl/dist/maplibre-gl.css';
-  import { appConfig, ui, accuracyStatKeys } from '../state.svelte.js';
+  import { appConfig, ui, accuracyStatKeys, isConsistencyStat } from '../state.svelte.js';
   import { FALLBACK_STYLE_URL, TILE_IMAGE_BOUNDS_WGS84, STATIC_BASE } from '../constants.js';
   import { fetchConfig } from '../api.js';
   import {
@@ -28,6 +28,7 @@
     nextHucLevel,
     buildPendingFromFeature,
   } from '../hucSelection.js';
+  import { loadMilitaryGeo, militaryPointsFc } from '../militarySelection.js';
 
   const [oW, oS, oE, oN] = TILE_IMAGE_BOUNDS_WGS84;
   const overlayCoords = [[oW, oN], [oE, oN], [oE, oS], [oW, oS]];
@@ -131,6 +132,15 @@
 
   export async function loadTilesetInterp(statistic, frac) {
     if (!map) return;
+    // Consistency statistics are panel-only: no tiles exist, so drop the
+    // raster instead of leaving the previous statistic's overlay lingering
+    // under a panel that shows something else.
+    if (isConsistencyStat(statistic)) {
+      ++loadTilesetGen;
+      resetOverlay();
+      removeBiasLayer();
+      return;
+    }
     const gen = ++loadTilesetGen;
     const { min: leadMin, max: leadMax } = getModelLeadBounds(appConfig.models, ui.model);
     let lo = Math.floor(frac);
@@ -192,6 +202,7 @@
   }
 
   export function doPreloadLeads() {
+    if (isConsistencyStat(ui.statistic)) return; // panel-only: no tiles to preload
     const { min, max } = getModelLeadBounds(appConfig.models, ui.model);
     preloadLeads({
       model: ui.model,
@@ -272,10 +283,15 @@
   const boundaryOutlineLayerId = 'admin-outline';
   /** Cache GeoJSON per admin level so toggling tools doesn't re-fetch. */
   const adminGeoCache = new Map(); // level → FeatureCollection
-  let boundaryModeLoaded = null;   // 'state' | 'county' | 'watershed-drill' | null
+  let boundaryModeLoaded = null;   // 'state' | 'county' | 'watershed-drill' | 'military' | null
   const boundaryHoveredRef = { current: null };
   let adminLoadAbort = null;
   let wbdLoadAbort = null;
+  /** Military site markers (circle layer over the shared boundary fill/outline). */
+  const militaryPointsSourceId = 'military-points-source';
+  const militaryPointsLayerId = 'military-points';
+  let militaryGeoCache = null; // FeatureCollection once loaded (module also caches)
+  let militaryLoadAbort = null;
   /** Drill state while watershed tool is active (before finalize). */
   let wbdPending = $state(null);
   let wbdIndex = null;
@@ -369,12 +385,15 @@
 
   function teardownBoundarySelectionLayer() {
     if (!map) return;
+    removeMilitaryPointsLayer();
     teardownBoundaryLayer(map, {
       sourceId: boundarySourceId,
       fillLayerId: boundaryFillLayerId,
       outlineLayerId: boundaryOutlineLayerId,
       hoveredIdRef: boundaryHoveredRef,
-      onClick: boundaryModeLoaded === 'watershed-drill' ? handleWbdClick : handleAdminClick,
+      onClick: boundaryModeLoaded === 'watershed-drill' ? handleWbdClick
+        : boundaryModeLoaded === 'military' ? handleMilitaryClick
+        : handleAdminClick,
       onHoverEnter: boundaryHover.onHoverEnter,
       onHoverLeave: boundaryHover.onHoverLeave,
     });
@@ -410,6 +429,108 @@
     ui.activeTool = level;
     ui.hasUsedAreaDrawTool = true;
     teardownBoundarySelectionLayer();
+  }
+
+  // ── Military installation selection ─────────────────────────────────
+
+  function addMilitaryPointsLayer(fc) {
+    if (map.getSource(militaryPointsSourceId)) {
+      map.getSource(militaryPointsSourceId).setData(militaryPointsFc(fc));
+      return;
+    }
+    const before = map.getLayer(drawFillLayerId) ? drawFillLayerId : undefined;
+    map.addSource(militaryPointsSourceId, { type: 'geojson', data: militaryPointsFc(fc) });
+    map.addLayer({
+      id: militaryPointsLayerId,
+      type: 'circle',
+      source: militaryPointsSourceId,
+      paint: {
+        'circle-radius': 3.5,
+        'circle-color': SELECTION_COLOR,
+        'circle-opacity': 0.85,
+        'circle-stroke-color': '#fff',
+        'circle-stroke-width': 1,
+      },
+    }, before);
+    map.on('click', militaryPointsLayerId, handleMilitaryClick);
+    map.on('mousemove', militaryPointsLayerId, boundaryHover.onHoverEnter);
+    map.on('mouseleave', militaryPointsLayerId, boundaryHover.onHoverLeave);
+  }
+
+  function removeMilitaryPointsLayer() {
+    if (!map) return;
+    if (map.getLayer(militaryPointsLayerId)) {
+      map.off('click', militaryPointsLayerId, handleMilitaryClick);
+      map.off('mousemove', militaryPointsLayerId, boundaryHover.onHoverEnter);
+      map.off('mouseleave', militaryPointsLayerId, boundaryHover.onHoverLeave);
+      map.removeLayer(militaryPointsLayerId);
+    }
+    if (map.getSource(militaryPointsSourceId)) map.removeSource(militaryPointsSourceId);
+  }
+
+  async function setupMilitaryLayer() {
+    if (!map) return;
+    if (militaryLoadAbort) militaryLoadAbort.abort();
+    militaryLoadAbort = new AbortController();
+    let fc;
+    try {
+      fc = await loadMilitaryGeo(militaryLoadAbort.signal);
+    } catch (err) {
+      if (err?.name !== 'AbortError') {
+        console.warn('[status] Failed to load military sites', err);
+      }
+      return;
+    } finally {
+      militaryLoadAbort = null;
+    }
+    if (!map) return;
+    if (ui.activeTool !== 'military') return; // tool switched while loading
+
+    militaryGeoCache = fc;
+    setupBoundaryLayer(map, {
+      sourceId: boundarySourceId,
+      fillLayerId: boundaryFillLayerId,
+      outlineLayerId: boundaryOutlineLayerId,
+      data: fc,
+      dimLayerId,
+      drawFillLayerId,
+      onClick: handleMilitaryClick,
+      onHoverEnter: boundaryHover.onHoverEnter,
+      onHoverLeave: boundaryHover.onHoverLeave,
+    });
+    addMilitaryPointsLayer(fc);
+    boundaryModeLoaded = 'military';
+  }
+
+  function handleMilitaryClick(e) {
+    const f = e.features?.[0];
+    if (!f) return;
+    const props = f.properties || {};
+    const site = String(props.key ?? '');
+    if (!site) return;
+    // Marker clicks carry point geometry, and polygon clicks a tile-clipped
+    // fragment (see handleAdminClick) — either way, look up the full boundary.
+    const fullFeature = militaryGeoCache?.features?.find((feat) => feat.properties?.key === site);
+    const geometry = fullFeature?.geometry || f.geometry;
+    const bounds = geomBboxFromRegion(geometry);
+    ui.selectedRegion = {
+      type: 'military',
+      site,
+      name: props.name || '',
+      bounds,
+      geometry,
+    };
+    ui.activeTool = 'military';
+    ui.hasUsedAreaDrawTool = true;
+    teardownBoundarySelectionLayer();
+    // Installations are far smaller than states/HUCs — zoom in so the dim-mask
+    // cutout (and thus what was selected) is actually visible.
+    if (Array.isArray(bounds) && bounds.every(Number.isFinite)) {
+      map.fitBounds(
+        [[bounds[0], bounds[1]], [bounds[2], bounds[3]]],
+        { padding: 80, maxZoom: 11, duration: 700 },
+      );
+    }
   }
 
   function resetWbdDrill() {
@@ -687,7 +808,10 @@
       for (const [lng, lat] of region.coordinates) {
         growToInclude(lng, lat);
       }
-    } else if ((region.type === 'admin' || region.type === 'huc') && Array.isArray(region.bounds)) {
+    } else if (
+      (region.type === 'admin' || region.type === 'huc' || region.type === 'military')
+      && Array.isArray(region.bounds)
+    ) {
       const [bw, bs, be, bn] = region.bounds;
       growToInclude(bw, bs);
       growToInclude(be, bn);
@@ -732,7 +856,7 @@
       const pts = region.coordinates;
       if (pts.length < 3) return emptyFeatureCollection();
       holes = [asClockwiseHoleRing([...pts, pts[0]])];
-    } else if (region.type === 'admin' || region.type === 'huc') {
+    } else if (region.type === 'admin' || region.type === 'huc' || region.type === 'military') {
       const rings = regionGeometryHoles(region.geometry);
       holes = rings.map((ring) => asClockwiseHoleRing([...ring]));
       if (!holes.length) return emptyFeatureCollection();
@@ -1114,6 +1238,12 @@
         resetWbdDrill();
         setupAdminLayer(tool);
       }
+    } else if (tool === 'military') {
+      if (boundaryModeLoaded !== 'military') {
+        teardownBoundarySelectionLayer();
+        resetWbdDrill();
+        void setupMilitaryLayer();
+      }
     } else if (tool === 'watershed') {
       if (!ui.selectedRegion || ui.selectedRegion.type !== 'huc') {
         void setupWatershedTool();
@@ -1175,12 +1305,17 @@
       if (typeof data.maptiler_api_key === 'string') {
         appConfig.maptilerApiKey = data.maptiler_api_key;
       }
+      if (data.consistency && typeof data.consistency === 'object') {
+        appConfig.consistency = { ...appConfig.consistency, ...data.consistency };
+        ui.consistencyThreshold = appConfig.consistency.default_threshold_mm;
+        ui.consistencyScale = appConfig.consistency.default_scale_km;
+      }
       ui.model = appConfig.defaultModel;
       {
         const accKeys = accuracyStatKeys();
         let stat = appConfig.defaultStatistic;
         if (!accKeys.includes(stat)) {
-          stat = accKeys[0] || 'bias';
+          stat = accKeys[0] || 'nmad';
         }
         ui.statistic = stat;
       }
@@ -1248,7 +1383,8 @@
      */
     function refreshDimOnViewChange() {
       const r = ui.selectedRegion;
-      if ((r && (r.type === 'rectangle' || r.type === 'polygon' || r.type === 'admin' || r.type === 'huc'))
+      if ((r && (r.type === 'rectangle' || r.type === 'polygon' || r.type === 'admin'
+          || r.type === 'huc' || r.type === 'military'))
           || (ui.activeTool === 'watershed' && wbdPending)) {
         updateDimMask();
       }

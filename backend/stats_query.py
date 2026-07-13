@@ -10,11 +10,16 @@ from threading import Lock
 
 import numpy as np
 
-from backend import admin_boundaries, wbd_boundaries
+from backend import admin_boundaries, military_boundaries, wbd_boundaries
 from backend.static_store import LocalStaticStore, StaticStore, default_static_site_root
 from model_registry import MODEL_REGISTRY
 from forecast_variables import FORECAST_VARIABLES
-from statistics_plugins.registry import STATISTICS_BY_NAME
+from statistics_plugins.consistency import (
+    DEFAULT_SCALE_KM,
+    DEFAULT_THRESHOLD_MM,
+    combo_tag,
+)
+from statistics_plugins.registry import CONSISTENCY_STAT_NAMES, STATISTICS_BY_NAME
 
 # ---------------------------------------------------------------------------
 # In-process caches — keyed so that S3 round-trips are skipped entirely on
@@ -30,6 +35,7 @@ class _BoundedLRU:
         self._max = maxsize
         self._lock = Lock()
         self._d: "OrderedDict" = OrderedDict()
+        self._pending: dict = {}  # key -> Lock gating an in-flight compute
 
     def get(self, key):
         with self._lock:
@@ -45,14 +51,52 @@ class _BoundedLRU:
             while len(self._d) > self._max:
                 self._d.popitem(last=False)  # evict least-recently used
 
+    def get_or_compute(self, key, compute):
+        """Cached value, running ``compute`` at most once across threads.
 
-# Shared thread pool for every I/O fan-out (bin reads, per-(model, lead)
-# losses). One module-level pool bounds total worker threads across concurrent
-# requests instead of each request building its own — an unauthenticated caller
-# can no longer multiply Fargate's thread count by fanning out. Sized to overlap
-# S3 latency and to match the S3 client's connection pool (see static_store).
+        Concurrent misses on the same key wait on a per-key lock instead of all
+        running ``compute``. Without this, a cold panel burst (all-leads stats +
+        lead-winners + forecast, ~100 tasks) rasterizes the same region masks
+        dozens of times concurrently, serialized by the GIL — seconds of wall
+        time for one 50 ms answer.
+        """
+        value = self.get(key)
+        if value is not None:
+            return value
+        with self._lock:
+            gate = self._pending.get(key)
+            if gate is None:
+                gate = Lock()
+                self._pending[key] = gate
+        try:
+            with gate:
+                value = self.get(key)
+                if value is not None:
+                    return value
+                value = compute()
+                self.put(key, value)
+                return value
+        finally:
+            with self._lock:
+                self._pending.pop(key, None)
+
+
+# Shared thread pools for I/O fan-out. Module-level pools bound total worker
+# threads across concurrent requests instead of each request building its own —
+# an unauthenticated caller can no longer multiply Fargate's thread count by
+# fanning out. Sized to overlap S3 latency and to match the S3 client's
+# connection pool (see static_store).
+#
+# INVARIANT — two tiers, blocking flows one way only. ``_EXECUTOR`` runs *leaf*
+# tasks: pure reads that never submit further work. ``_LEADS_EXECUTOR`` runs the
+# per-lead tasks of ``stats_for_region_all_leads``, which block on leaf tasks.
+# Never submit a task to ``_EXECUTOR`` that itself waits on ``_EXECUTOR``: with
+# a bounded pool, two concurrent all-leads requests fill every worker with
+# outer tasks and the inner reads they wait on can never be scheduled — a
+# permanent deadlock that wedges the whole process (observed live).
 _EXECUTOR_WORKERS = 16
 _EXECUTOR = ThreadPoolExecutor(max_workers=_EXECUTOR_WORKERS, thread_name_prefix="stats")
+_LEADS_EXECUTOR = ThreadPoolExecutor(max_workers=_EXECUTOR_WORKERS, thread_name_prefix="stats-leads")
 
 _grid_cache: dict[tuple[str, str], tuple[np.ndarray, np.ndarray, int, int]] = {}
 # Verification stat bins (~156 KB each).  Bounded LRU so a long-lived Fargate
@@ -70,6 +114,7 @@ _bin_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
 _MASK_CACHE_MAX = 2048
 _admin_mask_cache = _BoundedLRU(_MASK_CACHE_MAX)
 _huc_mask_cache = _BoundedLRU(_MASK_CACHE_MAX)
+_military_mask_cache = _BoundedLRU(_MASK_CACHE_MAX)
 _geom_mask_cache = _BoundedLRU(_MASK_CACHE_MAX)
 
 # Forecast data lives in a separate store (S3 prefix) updated daily without
@@ -249,6 +294,208 @@ def _get_bin_cell(
     return float(arr[flat_idx])
 
 
+# ---------------------------------------------------------------------------
+# Consistency statistics (jumpiness / convergence).
+#
+# Their bins are PACKED: one (2, nCells) array per layer — plane 0 the
+# region-summable numerator, plane 1 the denominator (jumpiness: FSS numerator
+# Σ(f1-f2)² and denominator Σ(f1²+f2²) pooled over scorable valid dates;
+# convergence: Σ squared error and sample count). A region value is the ratio
+# of REGION-SUMMED planes (pooled FSS / pooled RMSE), not a mean of per-cell
+# values — the FSS sums run over the region by definition. Jumpiness bins are
+# float16 on disk (see export_static.export_consistency_layers), widened to
+# float32 here. Monthly bins are not exported (period UI is yearly/seasonal),
+# so monthly queries fall through to no_data.
+# ---------------------------------------------------------------------------
+
+_CONSISTENCY_BIN_DTYPES = {"jumpiness": np.float16, "convergence": np.float32}
+
+
+def _consistency_bin_relative_path(
+    model: str,
+    stat_name: str,
+    lead_key: str,
+    *,
+    period: str,
+    month: str | None,
+    season: str | None,
+    threshold: float,
+    scale: int,
+) -> Path:
+    path = Path("model_data") / model / stat_name
+    if stat_name == "jumpiness":
+        # threshold/scale are whitelisted in request_models (VALID_THRESHOLDS/
+        # VALID_SCALES), so the tag can only name a computed combination.
+        path = path / combo_tag(threshold, scale)
+    if period == "monthly" and month is not None:
+        path = path / "monthly" / month
+    elif period == "seasonal" and season is not None:
+        path = path / "seasonal" / season
+    prefix = "pair" if stat_name == "jumpiness" else "lead"
+    return path / f"{prefix}_{lead_key}.bin"
+
+
+def _get_consistency_bin(
+    store: StaticStore,
+    model: str,
+    stat_name: str,
+    lead_key: str,
+    *,
+    period: str,
+    month: str | None,
+    season: str | None,
+    threshold: float,
+    scale: int,
+) -> np.ndarray:
+    cache_key = (store.cache_key, model, stat_name, lead_key,
+                 period, month, season, threshold, scale)
+    with _bin_cache_lock:
+        cached = _bin_cache.get(cache_key)
+        if cached is not None:
+            _bin_cache.move_to_end(cache_key)
+            return cached
+    relative_path = str(_consistency_bin_relative_path(
+        model, stat_name, lead_key, period=period, month=month, season=season,
+        threshold=threshold, scale=scale,
+    ))
+    raw_bytes = store.read_bytes(relative_path)
+    dtype = _CONSISTENCY_BIN_DTYPES[stat_name]
+    flat = np.frombuffer(raw_bytes, dtype=dtype).astype(np.float32)
+    if flat.size % 2:
+        raise OSError(f"Corrupt consistency bin: {relative_path}")
+    planes = flat.reshape(2, -1)
+    with _bin_cache_lock:
+        _bin_cache[cache_key] = planes
+        _bin_cache.move_to_end(cache_key)
+        while len(_bin_cache) > _BIN_CACHE_MAX:
+            _bin_cache.popitem(last=False)  # evict least-recently used
+    return planes
+
+
+def _read_consistency_bin_or_none(
+    store: StaticStore,
+    model: str,
+    stat_name: str,
+    lead_key: str,
+    *,
+    period: str,
+    month: str | None,
+    season: str | None,
+    threshold: float,
+    scale: int,
+) -> np.ndarray | None:
+    try:
+        return _get_consistency_bin(
+            store, model, stat_name, lead_key, period=period, month=month,
+            season=season, threshold=threshold, scale=scale,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+
+
+def _consistency_value(
+    stat_name: str,
+    planes: np.ndarray,
+    *,
+    mask: np.ndarray | None = None,
+    flat_idx: int | None = None,
+) -> float | None:
+    """Pooled region value from packed planes; None where undefined.
+
+    Jumpiness J = Σnum/Σden (= 1 - FSS between the paired runs); a zero
+    denominator means neither run exceeded the threshold anywhere in the
+    region over the pooled dates — undefined, per the statistic's definition
+    (missing, not zero). Convergence is pooled RMSE sqrt(Σsse/Σcount).
+    """
+    if flat_idx is not None:
+        if flat_idx >= planes.shape[1]:
+            return None
+        num = float(planes[0, flat_idx])
+        den = float(planes[1, flat_idx])
+    else:
+        if mask is None or mask.size != planes.shape[1] or not np.any(mask):
+            return None
+        num = float(planes[0][mask].sum(dtype=np.float64))
+        den = float(planes[1][mask].sum(dtype=np.float64))
+    if not np.isfinite(num) or not np.isfinite(den) or den <= 0.0:
+        return None
+    if stat_name == "jumpiness":
+        return num / den
+    return float(np.sqrt(num / den))
+
+
+_consistency_meta_cache: dict[tuple[str, str], dict | None] = {}
+
+
+def _consistency_dates(
+    store: StaticStore, model: str, period: str,
+    month: str | None, season: str | None,
+) -> int | None:
+    """Pooled valid-date count for the period, from consistency_meta.json.
+
+    Surfaced with each consistency value because cross-model comparisons are
+    only valid over identical valid-date sets — the count makes a mismatch
+    visible. None when the meta file is absent (older exports).
+    """
+    key = (store.cache_key, model)
+    if key not in _consistency_meta_cache:
+        try:
+            text = store.read_text(str(Path("model_data") / model / "consistency_meta.json"))
+            _consistency_meta_cache[key] = json.loads(text)
+        except (FileNotFoundError, OSError, ValueError):
+            _consistency_meta_cache[key] = None
+    meta = _consistency_meta_cache[key]
+    if not meta:
+        return None
+    counts = meta.get("date_counts", {})
+    if period == "seasonal" and season is not None:
+        value = counts.get("seasonal", {}).get(season)
+    elif period == "monthly" and month is not None:
+        value = counts.get("monthly", {}).get(month)
+    else:
+        value = counts.get("yearly")
+    return int(value) if value is not None else None
+
+
+def _consistency_entries(
+    store: StaticStore,
+    model: str,
+    lead_key: str,
+    stat_names: list[str],
+    *,
+    period: str,
+    month: str | None,
+    season: str | None,
+    threshold: float,
+    scale: int,
+    mask: np.ndarray | None = None,
+    flat_idx: int | None = None,
+) -> dict[str, dict[str, float | None | str | bool | int]]:
+    """Response entries for the requested consistency stats (point or area)."""
+    result: dict[str, dict[str, float | None | str | bool | int]] = {}
+    for stat_name in stat_names:
+        planes = _read_consistency_bin_or_none(
+            store, model, stat_name, lead_key, period=period, month=month,
+            season=season, threshold=threshold, scale=scale,
+        )
+        value = None
+        if planes is not None:
+            value = _consistency_value(stat_name, planes, mask=mask, flat_idx=flat_idx)
+        if value is None:
+            result[stat_name] = _no_data_entry(stat_name)
+            continue
+        entry: dict[str, float | None | str | bool | int] = {
+            "value": value,
+            "units": STATISTICS_BY_NAME[stat_name].spec.units,
+            "no_data": False,
+        }
+        dates = _consistency_dates(store, model, period, month, season)
+        if dates is not None:
+            entry["dates"] = dates
+        result[stat_name] = entry
+    return result
+
+
 def _cells_for_stats_parallel(
     store: StaticStore,
     model: str,
@@ -318,19 +565,37 @@ def _bins_for_stats_parallel(
     return out
 
 
-def _point_in_polygon(lon: float, lat: float, ring: list[list[float]]) -> bool:
-    if len(ring) < 3:
-        return False
-    inside = False
-    j = len(ring) - 1
-    for i, (xi, yi) in enumerate(ring):
-        xj, yj = ring[j]
-        if (yi > lat) != (yj > lat):
-            x_int = xi + ((xj - xi) * (lat - yi)) / (yj - yi)
-            if lon < x_int:
-                inside = not inside
-        j = i
-    return inside
+def _points_in_ring(xs: np.ndarray, ys: np.ndarray, ring: list[list[float]]) -> np.ndarray:
+    """Vectorized ray-cast of many points against one ring.
+
+    Classic even-odd rule: an edge whose endpoints straddle the point's
+    latitude toggles containment when the point sits left of the edge's
+    crossing longitude. Edges are processed in blocks so the (edges × points)
+    temporaries stay bounded however large the ring is — a HUC2 boundary is
+    thousands of vertices, and the scalar per-cell loop this replaces took
+    ~0.8 s per grid.
+    """
+    if len(ring) < 3 or xs.size == 0:
+        return np.zeros(xs.shape, dtype=bool)
+    verts = np.asarray([(p[0], p[1]) for p in ring], dtype=np.float64)
+    vx, vy = verts[:, 0], verts[:, 1]
+    px, py = np.roll(vx, 1), np.roll(vy, 1)  # previous vertex of each edge
+    crossings = np.zeros(xs.shape, dtype=np.int64)
+    block = max(16, min(int(vx.size), 2_000_000 // int(xs.size)))
+    for start in range(0, vx.size, block):
+        yi = vy[start:start + block, None]
+        yj = py[start:start + block, None]
+        straddles = (yi > ys[None, :]) != (yj > ys[None, :])
+        # Horizontal edges (yi == yj) never straddle; the div-by-zero rows they
+        # produce are masked out by ``straddles`` (NaN/inf compare False anyway).
+        with np.errstate(divide="ignore", invalid="ignore"):
+            x_int = vx[start:start + block, None] + (
+                (px[start:start + block, None] - vx[start:start + block, None])
+                * (ys[None, :] - yi)
+                / (yj - yi)
+            )
+        crossings += (straddles & (xs[None, :] < x_int)).sum(axis=0)
+    return (crossings % 2).astype(bool)
 
 
 def _cell_axis_bounds(centers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -368,6 +633,20 @@ def _mask_rectangle_overlap(
     return np.outer(lat_ok, lon_ok).reshape(-1)
 
 
+def _subgrid_mask(
+    n_lon: int,
+    n_cells: int,
+    ridx: np.ndarray,
+    cidx: np.ndarray,
+    inside: np.ndarray,
+) -> np.ndarray:
+    """Scatter a bbox-subgrid ``inside`` vector back onto the full flat grid."""
+    mask = np.zeros(n_cells, dtype=bool)
+    flat = (ridx[:, None] * n_lon + cidx[None, :]).ravel()
+    mask[flat[inside]] = True
+    return mask
+
+
 def _polygon_mask_centers(
     lats: np.ndarray,
     lons: np.ndarray,
@@ -375,23 +654,21 @@ def _polygon_mask_centers(
     n_lon: int,
     ring: list[list[float]],
 ) -> np.ndarray:
-    mask = np.zeros(n_lat * n_lon, dtype=bool)
+    if len(ring) < 3:
+        return np.zeros(n_lat * n_lon, dtype=bool)
     lons_ring = [p[0] for p in ring]
     lats_ring = [p[1] for p in ring]
-    min_lon = min(lons_ring)
-    max_lon = max(lons_ring)
-    min_lat = min(lats_ring)
-    max_lat = max(lats_ring)
-    for r, lat in enumerate(lats):
-        if lat < min_lat or lat > max_lat:
-            continue
-        base = r * n_lon
-        for c, lon in enumerate(lons):
-            if lon < min_lon or lon > max_lon:
-                continue
-            if _point_in_polygon(float(lon), float(lat), ring):
-                mask[base + c] = True
-    return mask
+    ridx = np.nonzero((lats >= min(lats_ring)) & (lats <= max(lats_ring)))[0]
+    cidx = np.nonzero((lons >= min(lons_ring)) & (lons <= max(lons_ring)))[0]
+    if ridx.size == 0 or cidx.size == 0:
+        return np.zeros(n_lat * n_lon, dtype=bool)
+    gy, gx = np.meshgrid(
+        np.asarray(lats[ridx], dtype=np.float64),
+        np.asarray(lons[cidx], dtype=np.float64),
+        indexing="ij",
+    )
+    inside = _points_in_ring(gx.ravel(), gy.ravel(), ring)
+    return _subgrid_mask(n_lon, n_lat * n_lon, ridx, cidx, inside)
 
 
 def _polygon_mask_centers_or_corners(
@@ -402,38 +679,31 @@ def _polygon_mask_centers_or_corners(
     ring: list[list[float]],
 ) -> np.ndarray:
     """Include cells whose center or any corner lies inside the polygon."""
+    if len(ring) < 3:
+        return np.zeros(n_lat * n_lon, dtype=bool)
     lat_low, lat_high = _cell_axis_bounds(lats)
     lon_low, lon_high = _cell_axis_bounds(lons)
-    mask = np.zeros(n_lat * n_lon, dtype=bool)
     lons_ring = [p[0] for p in ring]
     lats_ring = [p[1] for p in ring]
-    min_lon = min(lons_ring)
-    max_lon = max(lons_ring)
-    min_lat = min(lats_ring)
-    max_lat = max(lats_ring)
-    corners_template = ((0, 0), (1, 0), (1, 1), (0, 1))
-
-    for r in range(n_lat):
-        if lat_high[r] < min_lat or lat_low[r] > max_lat:
-            continue
-        cy = float(lats[r])
-        y_lo, y_hi = float(lat_low[r]), float(lat_high[r])
-        base = r * n_lon
-        for c in range(n_lon):
-            if lon_high[c] < min_lon or lon_low[c] > max_lon:
-                continue
-            cx = float(lons[c])
-            x_lo, x_hi = float(lon_low[c]), float(lon_high[c])
-            if _point_in_polygon(cx, cy, ring):
-                mask[base + c] = True
-                continue
-            for ix, iy in corners_template:
-                x = x_lo if ix == 0 else x_hi
-                y = y_lo if iy == 0 else y_hi
-                if _point_in_polygon(x, y, ring):
-                    mask[base + c] = True
-                    break
-    return mask
+    ridx = np.nonzero((lat_high >= min(lats_ring)) & (lat_low <= max(lats_ring)))[0]
+    cidx = np.nonzero((lon_high >= min(lons_ring)) & (lon_low <= max(lons_ring)))[0]
+    if ridx.size == 0 or cidx.size == 0:
+        return np.zeros(n_lat * n_lon, dtype=bool)
+    inside = np.zeros(ridx.size * cidx.size, dtype=bool)
+    for ys_axis, xs_axis in (
+        (lats[ridx], lons[cidx]),        # cell centers
+        (lat_low[ridx], lon_low[cidx]),  # then the four cell corners
+        (lat_low[ridx], lon_high[cidx]),
+        (lat_high[ridx], lon_low[cidx]),
+        (lat_high[ridx], lon_high[cidx]),
+    ):
+        gy, gx = np.meshgrid(
+            np.asarray(ys_axis, dtype=np.float64),
+            np.asarray(xs_axis, dtype=np.float64),
+            indexing="ij",
+        )
+        inside |= _points_in_ring(gx.ravel(), gy.ravel(), ring)
+    return _subgrid_mask(n_lon, n_lat * n_lon, ridx, cidx, inside)
 
 
 def _multi_polygon_mask(
@@ -477,25 +747,21 @@ def _admin_region_mask(
     level: str,
     fips: str,
 ) -> np.ndarray:
-    cache_key = (id(lats), id(lons), level, fips)
-    cached = _admin_mask_cache.get(cache_key)
-    if cached is not None:
-        return cached
-    try:
-        entry = admin_boundaries.get_entry(level, fips)
-    except (KeyError, admin_boundaries.AdminBoundariesUnavailable):
-        empty = np.zeros(n_lat * n_lon, dtype=bool)
-        _admin_mask_cache.put(cache_key, empty)
-        return empty
-    polygons = entry.get("polygons") or []
-    mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
-    if not np.any(mask):
-        mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
-    # No centroid fallback: a region that covers no grid cell (too small, or off
-    # the grid) is honest no_data — not the nearest edge cell dressed up as the
-    # region's value.
-    _admin_mask_cache.put(cache_key, mask)
-    return mask
+    def compute() -> np.ndarray:
+        try:
+            entry = admin_boundaries.get_entry(level, fips)
+        except (KeyError, admin_boundaries.AdminBoundariesUnavailable):
+            return np.zeros(n_lat * n_lon, dtype=bool)
+        polygons = entry.get("polygons") or []
+        mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
+        if not np.any(mask):
+            mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
+        # No centroid fallback: a region that covers no grid cell (too small, or off
+        # the grid) is honest no_data — not the nearest edge cell dressed up as the
+        # region's value.
+        return mask
+
+    return _admin_mask_cache.get_or_compute((id(lats), id(lons), level, fips), compute)
 
 
 def _huc_region_mask(
@@ -505,23 +771,51 @@ def _huc_region_mask(
     n_lon: int,
     huc: str,
 ) -> np.ndarray:
-    cache_key = (id(lats), id(lons), huc)
-    cached = _huc_mask_cache.get(cache_key)
-    if cached is not None:
-        return cached
-    try:
-        entry = wbd_boundaries.get_entry(huc)
-    except (KeyError, ValueError, wbd_boundaries.WbdBoundariesUnavailable):
-        empty = np.zeros(n_lat * n_lon, dtype=bool)
-        _huc_mask_cache.put(cache_key, empty)
-        return empty
-    polygons = entry.get("polygons") or []
-    mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
-    if not np.any(mask):
-        mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
-    # No centroid fallback (see _admin_region_mask): no covered cell → no_data.
-    _huc_mask_cache.put(cache_key, mask)
-    return mask
+    def compute() -> np.ndarray:
+        try:
+            entry = wbd_boundaries.get_entry(huc)
+        except (KeyError, ValueError, wbd_boundaries.WbdBoundariesUnavailable):
+            return np.zeros(n_lat * n_lon, dtype=bool)
+        polygons = entry.get("polygons") or []
+        mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
+        if not np.any(mask):
+            mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
+        # No centroid fallback (see _admin_region_mask): no covered cell → no_data.
+        return mask
+
+    return _huc_mask_cache.get_or_compute((id(lats), id(lons), huc), compute)
+
+
+def _military_region_mask(
+    lats: np.ndarray,
+    lons: np.ndarray,
+    n_lat: int,
+    n_lon: int,
+    site: str,
+) -> np.ndarray:
+    def compute() -> np.ndarray:
+        try:
+            entry = military_boundaries.get_entry(site)
+        except (KeyError, military_boundaries.MilitaryBoundariesUnavailable):
+            return np.zeros(n_lat * n_lon, dtype=bool)
+        polygons = entry.get("polygons") or []
+        mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
+        if not np.any(mask):
+            mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
+        if not np.any(mask):
+            # Unlike admin/HUC regions, most installations are smaller than a grid
+            # cell, so a polygon that contains no cell center or corner is the norm,
+            # not an off-grid query. Fall back to the cells whose footprint overlaps
+            # the site's bbox — the same "cell containing the site" answer the point
+            # tool would give for a click on it. A genuinely off-grid site still
+            # yields an empty mask here (bbox overlaps no cell footprint) → no_data.
+            bbox = entry.get("bbox") or []
+            if len(bbox) == 4:
+                west, south, east, north = (float(v) for v in bbox)
+                return _mask_rectangle_overlap(lats, lons, west, south, east, north)
+        return mask
+
+    return _military_mask_cache.get_or_compute((id(lats), id(lons), site), compute)
 
 
 def _build_region_mask(
@@ -537,28 +831,26 @@ def _build_region_mask(
     if region_type == "rectangle":
         west, south, east, north = region["bounds"]
         geom_key = (id(lats), id(lons), "rect", west, south, east, north)
-        cached = _geom_mask_cache.get(geom_key)
-        if cached is not None:
-            return cached
         # No nearest-cell fabrication: a rectangle covering no grid cell is no_data.
-        mask = _mask_rectangle_overlap(lats, lons, west, south, east, north)
-        _geom_mask_cache.put(geom_key, mask)
-        return mask
+        return _geom_mask_cache.get_or_compute(
+            geom_key,
+            lambda: _mask_rectangle_overlap(lats, lons, west, south, east, north),
+        )
 
     if region_type == "polygon":
         ring = [[float(p[0]), float(p[1])] for p in region.get("coordinates", [])]
         if len(ring) < 3:
             return mask
         geom_key = (id(lats), id(lons), "poly", tuple((p[0], p[1]) for p in ring))
-        cached = _geom_mask_cache.get(geom_key)
-        if cached is not None:
-            return cached
-        mask = _polygon_mask_centers(lats, lons, n_lat, n_lon, ring)
-        if not np.any(mask):
-            mask = _polygon_mask_centers_or_corners(lats, lons, n_lat, n_lon, ring)
-        # No nearest-cell fabrication: a polygon covering no grid cell is no_data.
-        _geom_mask_cache.put(geom_key, mask)
-        return mask
+
+        def compute_poly() -> np.ndarray:
+            poly_mask = _polygon_mask_centers(lats, lons, n_lat, n_lon, ring)
+            if not np.any(poly_mask):
+                poly_mask = _polygon_mask_centers_or_corners(lats, lons, n_lat, n_lon, ring)
+            # No nearest-cell fabrication: a polygon covering no grid cell is no_data.
+            return poly_mask
+
+        return _geom_mask_cache.get_or_compute(geom_key, compute_poly)
 
     if region_type == "admin":
         level = str(region.get("level") or "")
@@ -572,6 +864,12 @@ def _build_region_mask(
         if not huc:
             return mask
         return _huc_region_mask(lats, lons, n_lat, n_lon, huc)
+
+    if region_type == "military":
+        site = str(region.get("site") or "")
+        if not site:
+            return mask
+        return _military_region_mask(lats, lons, n_lat, n_lon, site)
 
     return mask
 
@@ -600,9 +898,17 @@ def stats_for_region(
     period: str = "yearly",
     month: str | None = None,
     season: str | None = None,
+    threshold: float | None = None,
+    scale: int | None = None,
 ) -> dict[str, dict[str, float | None | str | bool]]:
     lead_key = str(lead)
     stat_names = stat_names or list(STATISTICS_BY_NAME)
+    # Consistency stats aggregate as ratios of region-summed accumulator
+    # planes, so they take a separate read path from the per-cell-mean stats.
+    consistency_names = [s for s in stat_names if s in CONSISTENCY_STAT_NAMES]
+    stat_names = [s for s in stat_names if s not in CONSISTENCY_STAT_NAMES]
+    threshold = DEFAULT_THRESHOLD_MM if threshold is None else float(threshold)
+    scale = DEFAULT_SCALE_KM if scale is None else int(scale)
     resolved_store = store or LocalStaticStore(static_root or default_static_site_root())
     lats, lons, n_lat, n_lon = _get_grid(resolved_store, model)
     region_type = region.get("type")
@@ -620,7 +926,8 @@ def stats_for_region(
         lon_step = float(abs(lons[1] - lons[0])) if lons.size > 1 else float("inf")
         if (abs(float(lats[lat_idx]) - lat) > lat_step
                 or abs(float(lons[lon_idx]) - lon) > lon_step):
-            return {stat_name: _no_data_entry(stat_name) for stat_name in stat_names}
+            return {stat_name: _no_data_entry(stat_name)
+                    for stat_name in stat_names + consistency_names}
         flat_idx = lat_idx * n_lon + lon_idx
         # One cell needed — the cached full bin is indexed, not the whole grid re-read.
         cells = _cells_for_stats_parallel(
@@ -643,11 +950,18 @@ def stats_for_region(
                 "units": STATISTICS_BY_NAME[stat_name].spec.units,
                 "no_data": False,
             }
+        if consistency_names:
+            result.update(_consistency_entries(
+                resolved_store, model, lead_key, consistency_names,
+                period=period, month=month, season=season,
+                threshold=threshold, scale=scale, flat_idx=flat_idx,
+            ))
         return result
 
     mask = _build_region_mask(lats, lons, n_lat, n_lon, region)
     if not np.any(mask):
-        return {stat_name: _no_data_entry(stat_name) for stat_name in stat_names}
+        return {stat_name: _no_data_entry(stat_name)
+                for stat_name in stat_names + consistency_names}
 
     bins = _bins_for_stats_parallel(
         resolved_store,
@@ -676,14 +990,22 @@ def stats_for_region(
             "no_data": False,
         }
 
+    if consistency_names:
+        result.update(_consistency_entries(
+            resolved_store, model, lead_key, consistency_names,
+            period=period, month=month, season=season,
+            threshold=threshold, scale=scale, mask=mask,
+        ))
+
     return result
 
 
 def _winner_metric_label(stat_name: str) -> str:
     """Human-readable description of how models are ranked for this statistic."""
-    if stat_name == "bias":
-        # O5: rank by |regional signed-mean bias| so the ranking matches the
-        # signed mean shown in the panel (not the mean of per-cell |bias|).
+    if stat_name == "rb":
+        # O5: RB is signed (near zero is best), so rank by |regional signed-mean|
+        # to match the signed mean shown in the panel (not the mean of per-cell
+        # |rb|).
         return "region_abs_mean_value_lower_better"
     if stat_name == "cc":
         return "region_mean_value_higher_better"
@@ -691,10 +1013,10 @@ def _winner_metric_label(stat_name: str) -> str:
 
 
 def _loss_from_value(v: float, stat_name: str) -> float | None:
-    """Per-cell loss (lower is better): abs for bias, negated for CC, else identity."""
+    """Per-cell loss (lower is better): abs for signed RB, negated for CC, else identity."""
     if not np.isfinite(v):
         return None
-    if stat_name == "bias":
+    if stat_name == "rb":
         return float(abs(v))
     if stat_name == "cc":
         return float(-v)
@@ -709,8 +1031,8 @@ def _region_loss_scalar(
     flat_idx: int | None = None,
 ) -> float | None:
     """
-    Scalar loss for winner selection; **lower is better**. Bias ranks by the
-    magnitude of the region's signed-mean bias (|mean|, O5), so the winner
+    Scalar loss for winner selection; **lower is better**. RB (signed) ranks by
+    the magnitude of the region's signed mean (|mean|, O5), so the winner
     matches the signed number shown in the panel; CC negates the mean (higher
     correlation → lower loss); every other stat uses the plain region mean.
     """
@@ -723,7 +1045,7 @@ def _region_loss_scalar(
     finite = masked[np.isfinite(masked)]
     if finite.size == 0:
         return None
-    if stat_name == "bias":
+    if stat_name == "rb":
         return float(abs(np.mean(finite)))
     if stat_name == "cc":
         return float(-np.mean(finite))
@@ -791,7 +1113,7 @@ def lead_winners_for_region(
 ) -> dict[str, object]:
     """
     For each lead day, pick the model with the lowest loss over ``region`` (see
-    ``_region_loss_scalar``: |signed mean| for bias, negated mean for CC, plain
+    ``_region_loss_scalar``: |signed mean| for RB, negated mean for CC, plain
     mean otherwise). Computed live — there is no static lead_winners.json.
     """
     model_order = tuple(sorted(MODEL_REGISTRY.keys()))
@@ -972,6 +1294,8 @@ def stats_for_region_all_leads(
     period: str = "yearly",
     month: str | None = None,
     season: str | None = None,
+    threshold: float | None = None,
+    scale: int | None = None,
 ) -> list[dict[str, object]]:
     resolved_store = store or LocalStaticStore(static_root or default_static_site_root())
     lead_range = list(range(min_lead, max_lead + 1))
@@ -992,13 +1316,18 @@ def stats_for_region_all_leads(
                     period=period,
                     month=month,
                     season=season,
+                    threshold=threshold,
+                    scale=scale,
                 ),
             }
             for lead in lead_range
         ]
     by_lead: dict[int, dict[str, dict[str, float | None | str | bool]]] = {}
+    # NOTE: stats_for_region fans out its per-stat reads on _EXECUTOR, so these
+    # per-lead tasks must run on the separate _LEADS_EXECUTOR (see pool invariant
+    # at the top of this module) or concurrent requests deadlock the shared pool.
     future_to_lead = {
-        _EXECUTOR.submit(
+        _LEADS_EXECUTOR.submit(
             stats_for_region,
             store=resolved_store,
             model=model,
@@ -1008,6 +1337,8 @@ def stats_for_region_all_leads(
             period=period,
             month=month,
             season=season,
+            threshold=threshold,
+            scale=scale,
         ): lead
         for lead in lead_range
     }

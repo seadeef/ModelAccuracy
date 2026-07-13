@@ -1,5 +1,5 @@
 <script>
-  import { appConfig, ui, statLabel, accuracyStatKeys } from '../state.svelte.js';
+  import { appConfig, ui, statLabel, accuracyStatKeys, isConsistencyStat } from '../state.svelte.js';
   import {
     statisticTooltip,
     PERIOD_HELP,
@@ -9,6 +9,7 @@
   import { downloadPanelStatsCsv } from '../exportPanelStatsCsv.js';
   import { getModelLeadBounds } from '../tile.js';
   import { modelPalette, statColor } from '../palette.js';
+  import { computeLockIn } from '../lockIn.js';
   import { glyphPanelClose } from '../appIcons.js';
 
   let { onleadchange, onstatchange, onperiodchange, onmodelchange } = $props();
@@ -20,7 +21,7 @@
   let loading = $state(false);
   let leadData = $state([]);
   /** Chart / card highlight; must match `ui.statistic` when the panel opens (map layer). */
-  let activeStat = $state('bias');
+  let activeStat = $state('nmad');
   let hoverLead = $state(null);
   /** When true, chart scrubbing does not move the map lead; click the chart again to unlock. */
   let leadScrubLocked = $state(false);
@@ -93,7 +94,10 @@
       const lons = r.coordinates.map(c => c[0]);
       return { lat: lats.reduce((a, b) => a + b, 0) / lats.length, lon: lons.reduce((a, b) => a + b, 0) / lons.length };
     }
-    if (r.type === 'admin' && Array.isArray(r.bounds) && r.bounds.length === 4) {
+    if (
+      (r.type === 'admin' || r.type === 'military')
+      && Array.isArray(r.bounds) && r.bounds.length === 4
+    ) {
       const [w, s, e, n] = r.bounds;
       return { lat: (s + n) / 2, lon: (w + e) / 2 };
     }
@@ -112,14 +116,15 @@
       const tag = r.huc ? `HUC-${r.level} ${r.huc}` : `HUC-${r.level}`;
       return r.name ? `${r.name} (${tag}) \u2014 ${coord}` : `${tag} \u2014 ${coord}`;
     }
+    if (r.type === 'military') return r.name ? `${r.name} \u2014 ${coord}` : coord;
     return coord;
   }
 
-  /** Panel chart + stat grid order: NMAD and Bias swapped vs config (map toolbar unchanged). */
+  /** Panel chart + stat grid order: NMAD and RB swapped vs config (map toolbar unchanged). */
   const chartStats = $derived.by(() => {
     const keys = accuracyStatKeys();
     const out = [...keys];
-    const ib = out.indexOf('bias');
+    const ib = out.indexOf('rb');
     const inm = out.indexOf('nmad');
     if (ib !== -1 && inm !== -1) {
       [out[ib], out[inm]] = [out[inm], out[ib]];
@@ -130,6 +135,44 @@
   const bounds = $derived(getModelLeadBounds(appConfig.models, ui.model));
   const leadMin = $derived(bounds.min);
   const leadMax = $derived(bounds.max);
+
+  /** Lock-in summary (L_stab / L_acc / gap) for the active model's curves.
+   *  Both consistency series ride in `leadData`, so this needs no extra fetch. */
+  const lockIn = $derived.by(() => {
+    if (!leadData.length) return null;
+    return computeLockIn({
+      jSeries: seriesFor('jumpiness'),
+      eSeries: seriesFor('convergence'),
+      leadMin,
+      fraction: appConfig.consistency.lock_in_fraction ?? 0.5,
+    });
+  });
+
+  /** Pooled valid-date count for the current slice (same for J and e_L). */
+  const consistencyDates = $derived.by(() => {
+    for (const row of leadData) {
+      const d = row.stats?.jumpiness?.dates ?? row.stats?.convergence?.dates;
+      if (d != null) return d;
+    }
+    return null;
+  });
+
+  function formatLockInLead(lead) {
+    return lead === null || lead === undefined ? '—' : `${lead} d`;
+  }
+
+  function formatLockInGap(gap) {
+    if (gap === null || gap === undefined) return '—';
+    return gap > 0 ? `+${gap} d` : `${gap} d`;
+  }
+
+  /** Positive gap = stopped changing before becoming accurate (false confidence). */
+  function gapColorClass(gap) {
+    if (gap === null || gap === undefined) return '';
+    if (gap > 0) return 'c-bad';
+    if (gap === 0) return 'c-good';
+    return 'c-ok';
+  }
 
   const palette = $derived(modelPalette(appConfig.models));
   /** Number of lead-day columns; shared by charts and winners table for alignment. */
@@ -177,13 +220,39 @@
     });
   }
 
+  /**
+   * Value at fractional lead ``frac`` on the same monotone-tangent cubic that
+   * ``drawSmoothLine`` renders (identical tangent rule and Hermite segments),
+   * so the scrub dot and hover pill ride the drawn curve — plain linear
+   * interpolation sat visibly off the line on steep slopes. Nulls are skipped
+   * exactly like the renderer skips them (segments bridge gaps), and ``frac``
+   * outside the data range clamps to the endpoints.
+   */
   function interpValue(data, frac) {
-    const i = frac - leadMin;
-    const lo = Math.max(0, Math.min(data.length - 1, Math.floor(i)));
-    const hi = Math.min(data.length - 1, lo + 1);
-    if (data[lo] === null) return data[hi];
-    if (data[hi] === null) return data[lo];
-    return data[lo] + (data[hi] - data[lo]) * (i - lo);
+    const pts = [];
+    for (let i = 0; i < data.length; i++) {
+      if (data[i] !== null) pts.push({ x: leadMin + i, y: data[i] });
+    }
+    if (pts.length === 0) return null;
+    if (pts.length === 1) return pts[0].y;
+    const n = pts.length;
+    const x = Math.max(pts[0].x, Math.min(pts[n - 1].x, frac));
+    let s = 0;
+    while (s < n - 2 && x > pts[s + 1].x) s++;
+    const m = [];
+    for (let i = 0; i < n - 1; i++) m.push((pts[i + 1].y - pts[i].y) / (pts[i + 1].x - pts[i].x));
+    const tangent = (i) =>
+      i === 0 ? m[0]
+      : i === n - 1 ? m[n - 2]
+      : (m[i - 1] * m[i] <= 0 ? 0 : (m[i - 1] + m[i]) / 2);
+    const dx = pts[s + 1].x - pts[s].x;
+    const t = (x - pts[s].x) / dx;
+    const t2 = t * t;
+    const t3 = t2 * t;
+    return (2 * t3 - 3 * t2 + 1) * pts[s].y
+      + (t3 - 2 * t2 + t) * dx * tangent(s)
+      + (-2 * t3 + 3 * t2) * pts[s + 1].y
+      + (t3 - t2) * dx * tangent(s + 1);
   }
 
   /** Per-lead forecast values for one model (aligned to leadMin..leadMax). */
@@ -313,7 +382,7 @@
   /**
    * Y-axis uses the highlighted metric only so its variation fills the plot.
    * Using min/max across all stats on one axis often makes every line look flat
-   * when magnitudes differ (e.g. bias vs NRMSE).
+   * when magnitudes differ (e.g. CC vs NRMSE).
    */
   function getYRange() {
     let min = Infinity;
@@ -639,8 +708,8 @@
   }
 
   /**
-   * Good / ok / bad tiers for panel values (same units as API: % for NRMSE/NMAD,
-   * unitless -1..1 for CC, mm for bias).
+   * Good / ok / bad tiers for panel values (same units as API: % for NRMSE/NMAD/RB,
+   * unitless -1..1 for CC).
    * Cutoffs rounded from a one-off analysis of static_export/ranges (legend vmin/vmax per
    * model/stat/period) so tiers sit near the scale of real outputs instead of mistaken 0–1 bounds.
    */
@@ -649,9 +718,9 @@
     if (statName === 'cc') return value > 0.42 ? 'c-good' : value > 0.20 ? 'c-ok' : 'c-bad';
     if (statName === 'nmad') return value < 100 ? 'c-good' : value < 125 ? 'c-ok' : 'c-bad';
     if (statName === 'nrmse') return value < 350 ? 'c-good' : value < 510 ? 'c-ok' : 'c-bad';
-    if (statName === 'bias') {
+    if (statName === 'rb') {
       const a = Math.abs(value);
-      return a < 2 ? 'c-good' : a < 4 ? 'c-ok' : 'c-bad';
+      return a < 15 ? 'c-good' : a < 30 ? 'c-ok' : 'c-bad';
     }
     return '';
   }
@@ -660,7 +729,7 @@
   /** Only true right after we transition from no region → region (not on every reactive run). */
   let hadSelectedRegion = $state(false);
 
-  // Keep panel emphasis aligned with the map's current statistic (avoids stale default e.g. NRMSE vs bias).
+  // Keep panel emphasis aligned with the map's current statistic (avoids a stale default).
   $effect(() => {
     if (!ui.selectedRegion) return;
     const keys = accuracyStatKeys();
@@ -710,6 +779,10 @@
         ? `Best model (${statLabel(ui.statistic)})`
         : null,
       forecastPayload,
+      consistencyParams: {
+        threshold: ui.consistencyThreshold,
+        scale: ui.consistencyScale,
+      },
     });
   }
 
@@ -753,6 +826,9 @@
     if (r.type === 'huc' && r.huc) {
       return `h:${r.huc}`;
     }
+    if (r.type === 'military' && r.site) {
+      return `m:${r.site}`;
+    }
     return '';
   }
 
@@ -761,7 +837,8 @@
     if (!r) return '';
     const geo = regionGeometryKey(r);
     if (!geo) return '';
-    return `${geo}|${ui.model}|${ui.period}|${ui.month}|${ui.season}`;
+    return `${geo}|${ui.model}|${ui.period}|${ui.month}|${ui.season}`
+      + `|q${ui.consistencyThreshold}|s${ui.consistencyScale}`;
   }
 
   $effect(() => {
@@ -771,6 +848,8 @@
     const period = ui.period;
     const month = ui.month;
     const season = ui.season;
+    const threshold = ui.consistencyThreshold;
+    const scale = ui.consistencyScale;
 
     // Compute key from deps
     const key = fetchKey();
@@ -802,6 +881,8 @@
         season,
         minLead: b.min,
         maxLead: b.max,
+        threshold,
+        scale,
       }).then((results) => {
         if (lid !== leadFetchGen) return;
         leadData = results;
@@ -819,7 +900,10 @@
     const accKeys = accuracyStatKeys();
     const b = getModelLeadBounds(appConfig.models, ui.model);
 
-    if (!region || !accKeys.includes(stat)) {
+    // Consistency stats have no winners table: the backend refuses them (the
+    // interpretation rules require reading the full J/e_L curve pair, not a
+    // per-lead scalar ranking) — the panel shows the lock-in summary instead.
+    if (!region || !accKeys.includes(stat) || isConsistencyStat(stat)) {
       winnersGen += 1;
       winnersPayload = null;
       winnersLoading = false;
@@ -1190,6 +1274,32 @@
             </div>
 
             <div class="compare-section">
+          {#if isConsistencyStat(ui.statistic)}
+          <div
+            class="section-label compare-section-label"
+            style:padding-left="{50 / nLeadCols}%"
+            title={`Lock-in summary for ${modelLabel(ui.model)} over this region and period. Stabilizes (L_stab): the longest lead from which Jumpiness stays below ${Math.round((appConfig.consistency.lock_in_fraction ?? 0.5) * 100)}% of its own curve maximum — the forecast has stopped changing. Accurate (L_acc): the same lead on the Convergence RMSE curve — the forecast has become close to the outcome. A positive gap means the forecast locked in before it earned it (false confidence); a gap near zero means stability was earned.`}
+          >
+            <span>Forecast lock-in — <span style:color={palette[ui.model]?.text || '#6eb5ff'}>{modelLabel(ui.model)}</span></span>
+          </div>
+          <div class="lockin-row">
+            <div class="lockin-item">
+              <span class="lockin-label" style:color={statColor('jumpiness')}>Stabilizes</span>
+              <span class="lockin-val">{formatLockInLead(lockIn?.lStab)}</span>
+            </div>
+            <div class="lockin-item">
+              <span class="lockin-label" style:color={statColor('convergence')}>Accurate</span>
+              <span class="lockin-val">{formatLockInLead(lockIn?.lAcc)}</span>
+            </div>
+            <div class="lockin-item">
+              <span class="lockin-label">Lock-in gap</span>
+              <span class="lockin-val {gapColorClass(lockIn?.gap)}">{formatLockInGap(lockIn?.gap)}</span>
+            </div>
+            <div class="lockin-note">
+              q={ui.consistencyThreshold} mm/d · n={ui.consistencyScale} km{consistencyDates != null ? ` · ${consistencyDates} dates` : ''}
+            </div>
+          </div>
+          {:else}
           <div
             class="section-label compare-section-label"
             style:padding-left="{50 / nLeadCols}%"
@@ -1246,6 +1356,7 @@
               </table>
             </div>
           {/if}
+          {/if}
             </div>
           </div>
 
@@ -1291,6 +1402,37 @@
                     <div class="stat-unit">{s?.units || ''}</div>
                   </div>
                 {/each}
+                {#if activeStat === 'jumpiness'}
+                  <!-- Jumpiness slice parameters. Every J value on screen is a
+                       property of one (threshold, scale) pair — switching either
+                       refetches the curves for the new slice. -->
+                  <div class="param-group" title="Exceedance threshold q: rain heavier than this counts as an event (mm/day).">
+                    <div class="param-caption">Threshold mm/d</div>
+                    <div class="param-chips">
+                      {#each appConfig.consistency.thresholds_mm as q}
+                        <button
+                          type="button"
+                          class="param-chip"
+                          class:active={ui.consistencyThreshold === q}
+                          onclick={() => { ui.consistencyThreshold = q; }}
+                        >{q}</button>
+                      {/each}
+                    </div>
+                  </div>
+                  <div class="param-group" title="Neighborhood scale n: width of the square window (in km) over which event fractions are compared.">
+                    <div class="param-caption">Scale km</div>
+                    <div class="param-chips">
+                      {#each appConfig.consistency.scales_km as n}
+                        <button
+                          type="button"
+                          class="param-chip"
+                          class:active={ui.consistencyScale === n}
+                          onclick={() => { ui.consistencyScale = n; }}
+                        >{n}</button>
+                      {/each}
+                    </div>
+                  </div>
+                {/if}
               </div>
             </div>
             <div class="strip-controls">
@@ -1507,19 +1649,21 @@
   }
   /* Selector blocks anchored beside the charts at the same vertical layer:
      forecast variables next to the top (Ensemble) chart, accuracy stats next to
-     the bottom (Accuracy) chart. The stack mirrors the charts-track-region height
-     (two 100px chart-sections + a 4px gap) so each 2×2 block lines up with its
-     graph. Both blocks share .stat-card styling so they look/behave identically. */
+     the bottom (Accuracy) chart. Each block spans at least its chart's height
+     so a 4-card block lines up with its graph exactly; rows are implicit
+     (grid-auto-rows) so a block with more stats (the config-driven accuracy
+     list) grows downward instead of crushing cards into a fixed 2×2 frame.
+     Both blocks share .stat-card styling so they look/behave identically. */
   .selector-stack {
     display: flex;
     flex-direction: column;
     gap: 4px;
   }
   .selector-block {
-    height: var(--chart-h);
+    min-height: var(--chart-h);
     display: grid;
     grid-template-columns: 1fr 1fr;
-    grid-template-rows: 1fr 1fr;
+    grid-auto-rows: 1fr;
     gap: 6px;
   }
   .selector-block .stat-card {
@@ -1535,6 +1679,48 @@
   }
   .selector-block .stat-unit {
     font-size: 11px;
+  }
+  /* Jumpiness slice parameters (threshold / scale chips) under the stat cards. */
+  .param-group {
+    grid-column: 1 / -1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 0;
+  }
+  .param-caption {
+    font-size: 10px;
+    color: var(--text-secondary, #9aa3b2);
+    white-space: nowrap;
+    flex: 0 0 auto;
+    width: 76px;
+  }
+  .param-chips {
+    display: flex;
+    gap: 3px;
+    flex: 1;
+  }
+  .param-chip {
+    flex: 1;
+    font-family: inherit;
+    font-size: 11px;
+    padding: 3px 0;
+    background: var(--surface);
+    color: var(--text-secondary, #9aa3b2);
+    border: 1px solid color-mix(in srgb, var(--panel-border) 85%, transparent);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: border-color 0.15s, color 0.15s, background-color 0.15s;
+  }
+  .param-chip:hover {
+    border-color: var(--panel-border);
+    color: var(--text-primary, #e8ecf2);
+  }
+  .param-chip.active {
+    color: #0c0f16;
+    background: #8b93ff; /* STAT_COLORS.jumpiness */
+    border-color: #8b93ff;
+    font-weight: 600;
   }
   .strip-controls {
     display: flex;
@@ -1801,6 +1987,40 @@
     color: var(--text-secondary);
     padding: 4px 0;
   }
+  /* Lock-in summary (shown in place of the winners table for the consistency
+     statistics: their cross-model story is the curve pair, not a per-lead rank). */
+  .lockin-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    padding: 6px 8px;
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+  }
+  .lockin-item {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+  .lockin-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
+  .lockin-val {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--text-primary);
+    white-space: nowrap;
+  }
+  .lockin-note {
+    margin-left: auto;
+    font-size: 10px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+  }
   .winners-table-wrap {
     flex: 1 1 auto;
     overflow-x: auto;
@@ -1971,7 +2191,7 @@
     /* Columns stack on mobile, so the blocks no longer need to mirror chart height;
        let the cards size to their content with a comfortable tap target. */
     .selector-block {
-      height: auto;
+      min-height: 0;
     }
     .selector-block .stat-card {
       min-height: 58px;

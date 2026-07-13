@@ -1,25 +1,30 @@
 from __future__ import annotations
 
 from statistics_plugins.base import StatisticPlugin
-from statistics_plugins.bias import BiasPlugin
 from statistics_plugins.cc import CCPlugin
+from statistics_plugins.consistency import ConvergencePlugin, JumpinessPlugin
 from statistics_plugins.forecast import ForecastPlugin
 from statistics_plugins.nmad import NMADPlugin
-from statistics_plugins.nmse import NMSEPlugin
 from statistics_plugins.nrmse import NRMSEPlugin
 from statistics_plugins.rb import RBPlugin
-from statistics_plugins.rmse import RMSEPlugin
 
 
 # Verification statistics used by compute_stats.py (require GFS+PRISM pairs).
+# RB leads: it replaced the absolute Bias stat (relative bias is comparable
+# across wet and dry regions) and keeps its slot in the UI ordering.
 VERIFICATION_STATISTICS: list[StatisticPlugin] = [
-    BiasPlugin(),
+    RBPlugin(),
     CCPlugin(),
     NRMSEPlugin(),
     NMADPlugin(),
-    RBPlugin(),
-    RMSEPlugin(),
-    NMSEPlugin(),
+]
+
+# Consistency statistics computed by compute_consistency.py (run-to-run
+# pairing over scorable valid dates, not the per-(init, lead) pairing of
+# compute_stats.py). Panel-only: no map tiles, no legend ranges.
+CONSISTENCY_STATISTICS: list[StatisticPlugin] = [
+    JumpinessPlugin(),
+    ConvergencePlugin(),
 ]
 
 # Display-only statistics (not computed by compute_stats.py).
@@ -29,7 +34,11 @@ DISPLAY_STATISTICS: list[StatisticPlugin] = [
 
 # All statistics (used by tile generator, API, frontend).
 # Forecast first so it's the default in the UI.
-ENABLED_STATISTICS: list[StatisticPlugin] = DISPLAY_STATISTICS + VERIFICATION_STATISTICS
+ENABLED_STATISTICS: list[StatisticPlugin] = (
+    DISPLAY_STATISTICS + VERIFICATION_STATISTICS + CONSISTENCY_STATISTICS
+)
+
+CONSISTENCY_STAT_NAMES = {plugin.spec.name for plugin in CONSISTENCY_STATISTICS}
 
 STATISTICS_BY_NAME = {plugin.spec.name: plugin for plugin in ENABLED_STATISTICS}
 

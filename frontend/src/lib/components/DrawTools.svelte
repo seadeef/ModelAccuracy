@@ -22,6 +22,7 @@
     { id: 'state', label: 'Pick a state', icon: drawToolGlyph.state },
     { id: 'county', label: 'Pick a county', icon: drawToolGlyph.county },
     { id: 'watershed', label: 'Pick a watershed', icon: drawToolGlyph.watershed },
+    { id: 'military', label: 'Pick a military site', icon: drawToolGlyph.military },
   ];
 
   function toolTitle(tool) {
@@ -34,6 +35,9 @@
     }
     if (tool.id === 'watershed') {
       return `${tool.label} — Click to drill down; press Enter to analyze at the current level`;
+    }
+    if (tool.id === 'military') {
+      return `${tool.label} — Click a marker to analyze that installation`;
     }
     return `${tool.label} — Draw to get started`;
   }
@@ -123,6 +127,7 @@
     if (t === 'polygon') return '⬠';
     if (t === 'admin') return region.level === 'county' ? '▦' : '◫';
     if (t === 'huc') return '💧';
+    if (t === 'military') return '🛡';
     return '📍';
   }
 </script>

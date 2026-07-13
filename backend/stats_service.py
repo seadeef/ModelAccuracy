@@ -5,7 +5,12 @@ from pathlib import Path
 from fastapi.responses import JSONResponse
 
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
-from statistics_plugins.registry import STATISTICS_BY_NAME, VERIFICATION_STATISTICS
+from statistics_plugins.consistency import DEFAULT_SCALE_KM, DEFAULT_THRESHOLD_MM
+from statistics_plugins.registry import (
+    CONSISTENCY_STAT_NAMES,
+    STATISTICS_BY_NAME,
+    VERIFICATION_STATISTICS,
+)
 from backend.request_models import ForecastAllModelsRequest, LeadWinnersRequest, StatsQueryRequest
 from backend.static_store import LocalStaticStore, StaticStore, default_static_site_root
 from backend.stats_query import (
@@ -103,6 +108,18 @@ def query_stats_payload(
     if payload.period == "seasonal" and season is None:
         season = current_season_str(now_month)
 
+    # Jumpiness parameters: resolve defaults here and echo them in the
+    # response, so a client that omitted them still knows which (q, n) slice
+    # the numbers describe (comparisons are only valid within one slice).
+    threshold = payload.threshold if payload.threshold is not None else DEFAULT_THRESHOLD_MM
+    scale = payload.scale if payload.scale is not None else DEFAULT_SCALE_KM
+    requested = stat_names if stat_names is not None else list(STATISTICS_BY_NAME)
+    consistency_echo = (
+        {"threshold_mm": threshold, "scale_km": scale}
+        if any(name in CONSISTENCY_STAT_NAMES for name in requested)
+        else None
+    )
+
     if payload.lead is not None:
         stats = stats_for_region(
             store=resolved_store,
@@ -113,8 +130,10 @@ def query_stats_payload(
             period=payload.period,
             month=month,
             season=season,
+            threshold=threshold,
+            scale=scale,
         )
-        return {
+        response = {
             "model": model_key,
             "lead": str(payload.lead),
             "period": payload.period,
@@ -122,6 +141,9 @@ def query_stats_payload(
             "season": season,
             "stats": stats,
         }
+        if consistency_echo:
+            response["consistency"] = consistency_echo
+        return response
 
     results = stats_for_region_all_leads(
         store=resolved_store,
@@ -133,8 +155,10 @@ def query_stats_payload(
         period=payload.period,
         month=month,
         season=season,
+        threshold=threshold,
+        scale=scale,
     )
-    return {
+    response = {
         "model": model_key,
         "minLead": payload.minLead,
         "maxLead": payload.maxLead,
@@ -143,6 +167,9 @@ def query_stats_payload(
         "season": season,
         "results": results,
     }
+    if consistency_echo:
+        response["consistency"] = consistency_echo
+    return response
 
 
 def query_lead_winners_payload(
@@ -159,7 +186,8 @@ def query_lead_winners_payload(
         )
     if payload.statistic not in VERIFICATION_STAT_NAMES:
         return JSONResponse(
-            {"error": "Lead winners are only computed for verification statistics (not forecast)."},
+            {"error": "Lead winners are only computed for verification statistics "
+                      "(not forecast or the consistency statistics)."},
             status_code=400,
         )
 

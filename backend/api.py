@@ -106,6 +106,7 @@ class LongCacheStaticMiddleware(BaseHTTPMiddleware):
         "/zip/",
         "/admin/",
         "/wbd/",
+        "/military/",
         "/assets/",
     )
 

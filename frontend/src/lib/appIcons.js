@@ -15,6 +15,8 @@ export const drawToolGlyph = {
   county: '<rect x="2.5" y="2.5" width="11" height="11" rx="1"/><path d="M6.17 2.5v11M9.83 2.5v11M2.5 6.17h11M2.5 9.83h11"/><rect x="6.17" y="6.17" width="3.66" height="3.66" fill="currentColor" fill-opacity="0.30" stroke="none"/>',
   // Watershed: water drop.
   watershed: '<path d="M8 2.2c-2.2 3.4-4.5 5.8-4.5 8.6a4.5 4.5 0 009 0c0-2.8-2.3-5.2-4.5-8.6z"/>',
+  // Military site: shield.
+  military: '<path d="M8 1.8l5 1.9v3.6c0 3.3-2.1 5.8-5 7-2.9-1.2-5-3.7-5-7V3.7z"/>',
 };
 
 /** Map toolbar download; parent stroke-width="1.5" */

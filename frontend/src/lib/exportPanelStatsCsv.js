@@ -38,10 +38,13 @@ function regionToken(region) {
   if (region.type === 'huc' && region.huc) {
     return `huc-${region.huc}`;
   }
+  if (region.type === 'military' && region.site) {
+    return `military-${region.site}`;
+  }
   return region.type || 'region';
 }
 
-function headerForStat(statKey, leadRows) {
+function headerForStat(statKey, leadRows, consistencyParams) {
   const label = statLabel(statKey);
   let units = '';
   for (const row of leadRows) {
@@ -50,6 +53,12 @@ function headerForStat(statKey, leadRows) {
       units = u;
       break;
     }
+  }
+  // Jumpiness is a different statistic at each (threshold, scale) — name the
+  // slice in the header so exported numbers are never compared across slices.
+  if (statKey === 'jumpiness' && consistencyParams) {
+    const { threshold, scale } = consistencyParams;
+    return `${label} (q=${threshold} mm/day, n=${scale} km)`;
   }
   return units ? `${label} (${units})` : label;
 }
@@ -121,12 +130,13 @@ export function buildPanelStatsCsv({
   bestModelByLead = null,
   bestModelColumnHeader = null,
   forecastPayload = null,
+  consistencyParams = null,
 }) {
   const forecast = forecastColumnsFromPayload(forecastPayload, models);
 
   const headers = ['lead_day'];
   for (const k of statKeys) {
-    headers.push(headerForStat(k, leadData));
+    headers.push(headerForStat(k, leadData, consistencyParams));
   }
   if (bestModelByLead && bestModelColumnHeader) {
     headers.push(bestModelColumnHeader);
@@ -176,6 +186,7 @@ export function downloadPanelStatsCsv(opts) {
     bestModelByLead,
     bestModelColumnHeader,
     forecastPayload,
+    consistencyParams,
   } = opts;
 
   const csv = buildPanelStatsCsv({
@@ -190,6 +201,7 @@ export function downloadPanelStatsCsv(opts) {
     bestModelByLead,
     bestModelColumnHeader,
     forecastPayload,
+    consistencyParams,
   });
 
   const name = [

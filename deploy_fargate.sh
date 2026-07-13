@@ -307,7 +307,12 @@ verify_static_export() {
     echo "ERROR: $WBD_CHUNKS missing — run export_static.py --image (after load_boundaries.py --wbd or --wbd-sample)." >&2
     exit 1
   fi
-  echo "OK: static_export/model_data contains grid.json; admin/boundaries.json and wbd/chunks present"
+  local MILITARY="$ROOT/static_export/military/boundaries.json"
+  if [[ ! -f "$MILITARY" ]]; then
+    echo "ERROR: $MILITARY missing — run export_static.py --image (after load_boundaries.py --military or --military-sample)." >&2
+    exit 1
+  fi
+  echo "OK: static_export/model_data contains grid.json; admin/military boundaries.json and wbd/chunks present"
 }
 
 collect_ecs_targets_for_redeploy() {

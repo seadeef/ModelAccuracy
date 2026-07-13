@@ -5,7 +5,7 @@
 # Steps:
 #   1. python3 download.py --forecast        # latest forecast → stats_output/{model}/forecast/
 #   2. python3 export_static.py --static      # builds static_export/ root assets AND static_export/forecast/
-#   3. aws s3 sync static_export/{config.json,zip,admin,wbd,tiles,ranges} → s3://$BUCKET/… (root)
+#   3. aws s3 sync static_export/{config.json,zip,admin,wbd,military,tiles,ranges} → s3://$BUCKET/… (root)
 #   4. aws s3 sync static_export/forecast/ → s3://$BUCKET/$FORECAST_PREFIX/
 #   5. CloudFront invalidation of the data paths (/config.json, /zip/*, /admin/*, …)
 #
@@ -17,7 +17,8 @@
 #                            They share the bucket root with the SPA (./deploy_frontend.sh);
 #                            each sync uses --delete only within its own subdir.
 #                            Cache-Control matches backend/api.py:LongCacheStaticMiddleware:
-#                              zip/, admin/, wbd/ (map assets only)  → 1yr immutable
+#                              zip/, admin/, wbd/ (map assets only),
+#                              military/ (sites.geojson only)        → 1yr immutable
 #                              tiles/, ranges/, config.json          → 300s must-revalidate
 #
 #   static_export/forecast/  Read by the Fargate backend via forecast_store_from_env
@@ -141,6 +142,17 @@ sync_static() {
       --region "$AWS_REGION" --delete \
       --cache-control "$CC_IMMUTABLE" \
       --exclude "chunks/*"
+  fi
+
+  # Military frontend map assets only (backend boundaries.json is baked into the
+  # API image). MIRTA is a yearly release, so immutable is safe.
+  MILITARY="$STATIC_SRC/military"
+  if [[ -d "$MILITARY" ]]; then
+    echo "==> Sync $dest/military/ map assets ($CC_IMMUTABLE; excludes boundaries.json)"
+    aws s3 sync "$MILITARY" "$dest/military" \
+      --region "$AWS_REGION" --delete \
+      --cache-control "$CC_IMMUTABLE" \
+      --exclude "boundaries.json"
   fi
 
   # Mutable (refreshed each stats rerun).

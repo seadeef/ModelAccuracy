@@ -38,6 +38,9 @@ Reads from stats_output/ and tiles_output/, writes to static_export/:
             index.json          (HUC2 units only)
             index/{huc2}.json   (per-HUC2 descendant metadata)
             huc2.topojson
+        military/
+            boundaries.json     (image: backend region masks)
+            sites.geojson       (S3: frontend map layer)
 
 URL scheme: every browser-fetched data file is served from the site root mirroring
 this layout (e.g. ``/config.json``, ``/wbd/index.json``, ``/model_data/…``); the SPA
@@ -49,9 +52,9 @@ Boundary source data lives in ``boundary_data/`` (data only), populated by
 
 Build modes (at most one; omit all for a full export):
 
-* ``--image`` — Docker image inputs: admin/HUC polygon exports + ``model_data/`` (``.bin`` + ``grid.json``).
-* ``--static`` — S3/CloudFront assets: ``zip/``, admin/HUC TopoJSON, ``config.json``,
-  ``tiles/``, ``ranges/``, and ``forecast/`` (bins + ``forecast_calendar.json``).
+* ``--image`` — Docker image inputs: admin/HUC/military polygon exports + ``model_data/`` (``.bin`` + ``grid.json``).
+* ``--static`` — S3/CloudFront assets: ``zip/``, admin/HUC TopoJSON, military GeoJSON,
+  ``config.json``, ``tiles/``, ``ranges/``, and ``forecast/`` (bins + ``forecast_calendar.json``).
 * ``--data`` — only ``static_export/model_data/``.
 * ``--forecast`` — only ``static_export/forecast/``.
 * ``--frontend`` — only the bundled Vite SPA under ``static_export/frontend/``.
@@ -61,6 +64,7 @@ Boundary export flags (combinable with each other; not with build modes above):
 * ``--zip`` — ``zip/{code}.json`` from ``boundary_data/zip/zip_lookup.csv``.
 * ``--admin`` — ``boundaries.json`` + ``states.topojson`` + ``counties.topojson``.
 * ``--huc`` — WBD map assets (``huc2.topojson``, ``children/``, ``index.json`` + ``index/{huc2}.json``) + ``chunks/``.
+* ``--military`` — DISDI MIRTA sites: ``military/boundaries.json`` (image) + ``military/sites.geojson`` (S3).
 
 WBD export depth is capped by ``--max-huc-level`` (default 12) to bound image size /
 S3 object count; ``boundary_data/`` keeps the full HU16 source for re-export.
@@ -105,6 +109,7 @@ from boundary_paths import (
     ADMIN_COUNTIES_TOPOJSON,
     ADMIN_SOURCE_LABEL,
     ADMIN_STATES_TOPOJSON,
+    MILITARY_SITES_JSON,
     WBD_LAYERS_DIR,
     WBD_SOURCE_LABEL,
     ZIP_LOOKUP_CSV,
@@ -116,12 +121,22 @@ from wbd_core import layer_cache_path as _wbd_layer_cache_path
 from wbd_core import parent_huc as _wbd_parent_huc
 from wbd_core import polygons_bbox as _polygons_bbox
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
+from compute_stats import SEASONS
 from forecast_variables import FORECAST_VARIABLES
 from stats_grid_metadata import load_model_metadata, model_metadata_path
 from statistics_plugins.registry import (
+    CONSISTENCY_STAT_NAMES,
     DEFAULT_STATISTIC,
     ENABLED_STATISTICS,
     STATISTICS_BY_NAME,
+)
+from statistics_plugins.consistency import (
+    DEFAULT_SCALE_KM,
+    DEFAULT_THRESHOLD_MM,
+    JUMPINESS_SCALES_KM,
+    JUMPINESS_THRESHOLDS_MM,
+    LOCK_IN_FRACTION,
+    combo_tag,
 )
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -413,6 +428,78 @@ def export_admin_boundaries(
         print(f"  {p} ({p.stat().st_size:,} bytes)")
 
 
+def export_military_boundaries(
+    out_dir: Path,
+    *,
+    write_boundaries_json: bool = True,
+    write_geojson: bool = True,
+) -> None:
+    """DISDI MIRTA installation sites, from ``boundary_data/military/sites.json``.
+
+    Two halves (mirrors admin): ``boundaries.json`` — key → {name, bbox, polygons}
+    for backend region masks (baked into the API image); ``sites.geojson`` — a
+    FeatureCollection served to the frontend map. Sites don't share borders, so
+    plain GeoJSON is used (TopoJSON's shared-arc encoding wouldn't shrink it).
+    Feature ids are numeric (MapLibre feature-state needs castable ids; the slug
+    key rides in ``properties.key``); the site's fly-to point rides in
+    ``properties.point``.
+    """
+    if not MILITARY_SITES_JSON.is_file():
+        raise FileNotFoundError(
+            "military sites missing — run python load_boundaries.py --military "
+            f"({MILITARY_SITES_JSON})"
+        )
+    expected: list[Path] = []
+    if write_boundaries_json:
+        expected.append(out_dir / "boundaries.json")
+    if write_geojson:
+        expected.append(out_dir / "sites.geojson")
+    if _outputs_fresh(expected, [MILITARY_SITES_JSON]):
+        print(f"  {out_dir}/ up to date — skipping")
+        return
+    data = json.loads(MILITARY_SITES_JSON.read_text(encoding="utf-8"))
+    source = data.get("source") or ""
+    sites = data.get("sites") or {}
+    written: list[Path] = []
+    if write_boundaries_json:
+        boundaries = {
+            "version": 1,
+            "source": source,
+            "sites": {
+                key: {"name": s["name"], "bbox": s["bbox"], "polygons": s["polygons"]}
+                for key, s in sites.items()
+            },
+        }
+        boundaries_path = out_dir / "boundaries.json"
+        _write_text_if_changed(boundaries_path, json.dumps(boundaries, separators=(",", ":")))
+        written.append(boundaries_path)
+    if write_geojson:
+        features = []
+        for i, (key, s) in enumerate(sorted(sites.items())):
+            features.append({
+                "type": "Feature",
+                "id": i,
+                "properties": {
+                    "key": key,
+                    "name": s["name"],
+                    "component": s.get("component") or "",
+                    "status": s.get("status") or "",
+                    "state": s.get("state") or "",
+                    "point": s.get("point") or [],
+                },
+                "geometry": {"type": "MultiPolygon", "coordinates": s["polygons"]},
+            })
+        geojson_path = out_dir / "sites.geojson"
+        _write_text_if_changed(
+            geojson_path,
+            json.dumps({"type": "FeatureCollection", "features": features},
+                       separators=(",", ":")),
+        )
+        written.append(geojson_path)
+    for p in written:
+        print(f"  {p} ({p.stat().st_size:,} bytes)")
+
+
 def _wbd_features_to_topojson(features: list[dict], object_name: str) -> dict:
     from topojson import Topology
 
@@ -689,6 +776,8 @@ def export_boundary_parts(
     admin_polys: bool = False,
     huc_topo: bool = False,
     huc_polys: bool = False,
+    military_geo: bool = False,
+    military_polys: bool = False,
     huc_max_level: int = DEFAULT_MAX_HUC_LEVEL,
 ) -> None:
     """Write selected boundary artifacts at the ``static_export/`` root from cache."""
@@ -712,10 +801,17 @@ def export_boundary_parts(
             write_map_assets=huc_topo,
             max_level=huc_max_level,
         )
+    if military_geo or military_polys:
+        print("  military/...")
+        export_military_boundaries(
+            assets_dir / "military",
+            write_boundaries_json=military_polys,
+            write_geojson=military_geo,
+        )
 
 
 def export_boundaries(site_root: Path, huc_max_level: int = DEFAULT_MAX_HUC_LEVEL) -> None:
-    """All boundary parts (zip, admin topo+polys, HUC topo+polys)."""
+    """All boundary parts (zip, admin topo+polys, HUC topo+polys, military geo+polys)."""
     export_boundary_parts(
         site_root,
         zip=True,
@@ -723,6 +819,8 @@ def export_boundaries(site_root: Path, huc_max_level: int = DEFAULT_MAX_HUC_LEVE
         admin_polys=True,
         huc_topo=True,
         huc_polys=True,
+        military_geo=True,
+        military_polys=True,
         huc_max_level=huc_max_level,
     )
 
@@ -761,6 +859,17 @@ def export_config(export_dir: Path, maptiler_key: str) -> None:
         "default_model": DEFAULT_MODEL,
         "statistics": statistics,
         "default_statistic": DEFAULT_STATISTIC,
+        # Parameters of the consistency statistics (jumpiness/convergence):
+        # the frontend renders its q/n selectors and the lock-in definition
+        # from here so they can never drift from the compute pipeline.
+        "consistency": {
+            "stats": sorted(CONSISTENCY_STAT_NAMES),
+            "thresholds_mm": list(JUMPINESS_THRESHOLDS_MM),
+            "scales_km": list(JUMPINESS_SCALES_KM),
+            "default_threshold_mm": DEFAULT_THRESHOLD_MM,
+            "default_scale_km": DEFAULT_SCALE_KM,
+            "lock_in_fraction": LOCK_IN_FRACTION,
+        },
         "maptiler_api_key": maptiler_key,
     }
 
@@ -771,20 +880,51 @@ def export_config(export_dir: Path, maptiler_key: str) -> None:
 
 # ── data layers (.bin) ──────────────────────────────────────────────
 
+def _prune_stale_stat_dirs(parent: Path, valid_stats: set[str]) -> int:
+    """Remove exported per-statistic dirs for stats no longer in the registry
+    (e.g. ``sacc`` after the CC rename) so ``aws s3 sync --delete`` drops them
+    from S3 too. *parent* is a single model's export dir; files (``grid.json``)
+    are left alone."""
+    removed = 0
+    if not parent.is_dir():
+        return 0
+    for child in parent.iterdir():
+        if child.is_dir() and child.name not in valid_stats:
+            shutil.rmtree(child)
+            removed += 1
+    return removed
+
+
+def _verification_stat_names() -> set[str]:
+    return {p.spec.name for p in ENABLED_STATISTICS if p.spec.name != "forecast"}
+
+
 def export_data_layers(data_root: Path) -> None:
     data_dir = data_root
     total = 0
+    valid_stats = _verification_stat_names()
+    pruned_dirs = pruned_bins = 0
 
     for model_key in MODEL_REGISTRY:
         model_stats = STATS_ROOT / model_key
         if not model_stats.exists():
             continue
 
+        # Drop artifacts from removed features so they don't linger in the
+        # Docker image / S3: renamed stats (sacc → cc) and lead-window bins.
+        pruned_dirs += _prune_stale_stat_dirs(data_dir / model_key, valid_stats)
+        for stale_bin in (data_dir / model_key).rglob("lead_*_*.bin"):
+            stale_bin.unlink()
+            pruned_bins += 1
+
         # Export each layer as flat float32 .bin (verification stats + any non-forecast dirs).
         for plugin in ENABLED_STATISTICS:
             stat_name = plugin.spec.name
             if stat_name == "forecast":
                 # Separate tree (``static_export/forecast/``) — see ``export_forecast_data_layers``.
+                continue
+            if stat_name in CONSISTENCY_STAT_NAMES:
+                # Packed two-plane bins — see ``export_consistency_layers``.
                 continue
             field = plugin.spec.render_field
             stat_dir = model_stats / stat_name
@@ -815,7 +955,146 @@ def export_data_layers(data_root: Path) -> None:
                         data_dir / model_key / stat_name / "seasonal" / season_dir.name,
                     )
 
+    if pruned_dirs or pruned_bins:
+        print(f"  pruned {pruned_dirs} stale stat dir(s), {pruned_bins} stale window bin(s)")
     print(f"  {total} .bin layer files exported")
+    export_consistency_layers(data_dir)
+
+
+# ── consistency statistics (jumpiness / convergence) ────────────────
+#
+# Region values for the consistency statistics are ratios of region-summed
+# accumulators (pooled FSS: 1 - Σnum/Σden; pooled RMSE: sqrt(Σsse/Σcount)),
+# not means of per-cell values, so the bins carry BOTH accumulator planes,
+# packed as one array of shape (2, nLat, nLon): plane 0 the numerator, plane
+# 1 the denominator.
+#
+# Jumpiness planes are float16: values are sums of squared neighborhood
+# fractions, bounded by 2x the pooled date count (thousands at most, well
+# inside float16 range) and read back as float32 for the region sums —
+# quantization is ~1e-3 relative per cell and averages out over region sums,
+# invisible at the 2-3 digits J is displayed with. This halves an otherwise
+# 12-combo-per-pair fan-out that would double the image size. Convergence
+# keeps float32 (squared mm/day errors overflow float16).
+#
+# Monthly bins are deliberately NOT exported: the period UI exposes yearly +
+# seasonal only (open decision O7), and the 12-month fan-out would triple the
+# consistency payload. The monthly .npz primitives exist in stats_output, so
+# wiring monthly in later is an exporter change only.
+
+def _export_packed_layer(npz_path: Path, keys: tuple[str, str], dtype,
+                         out_path: Path) -> int:
+    """Write two npz arrays as one packed (2, H, W) .bin. Returns 1 on success."""
+    if (
+        not _FORCE_EXPORT
+        and out_path.is_file()
+        and out_path.stat().st_mtime >= npz_path.stat().st_mtime
+    ):
+        return 1
+    try:
+        with np.load(npz_path) as data:
+            if keys[0] not in data or keys[1] not in data:
+                return 0
+            packed = np.stack([data[keys[0]], data[keys[1]]]).astype(dtype)
+    except Exception:
+        return 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_bytes_if_changed(out_path, packed.tobytes())
+    return 1
+
+
+def _consistency_periods(stat_dir: Path) -> list[tuple[Path, Path]]:
+    """(source dir, relative out dir) pairs: yearly root + each season."""
+    periods = [(stat_dir, Path("."))]
+    seasonal_root = stat_dir / "seasonal"
+    if seasonal_root.is_dir():
+        for season_dir in sorted(seasonal_root.glob("*")):
+            if season_dir.is_dir():
+                periods.append((season_dir, Path("seasonal") / season_dir.name))
+    return periods
+
+
+def export_consistency_layers(data_root: Path) -> None:
+    total = 0
+    for model_key in MODEL_REGISTRY:
+        model_stats = STATS_ROOT / model_key
+        jump_dir = model_stats / "jumpiness"
+        conv_dir = model_stats / "convergence"
+
+        if jump_dir.is_dir():
+            for src_dir, rel_out in _consistency_periods(jump_dir):
+                for npz_path in sorted(src_dir.glob("pair_*.npz")):
+                    if not npz_path.stem.removeprefix("pair_").isdigit():
+                        continue
+                    for q in JUMPINESS_THRESHOLDS_MM:
+                        for n in JUMPINESS_SCALES_KM:
+                            tag = combo_tag(q, n)
+                            out_path = (data_root / model_key / "jumpiness" / tag
+                                        / rel_out / (npz_path.stem + ".bin"))
+                            total += _export_packed_layer(
+                                npz_path, (f"num_{tag}", f"den_{tag}"),
+                                np.float16, out_path,
+                            )
+
+        if conv_dir.is_dir():
+            for src_dir, rel_out in _consistency_periods(conv_dir):
+                for npz_path in sorted(src_dir.glob("lead_*.npz")):
+                    if not npz_path.stem.removeprefix("lead_").isdigit():
+                        continue
+                    out_path = (data_root / model_key / "convergence"
+                                / rel_out / (npz_path.stem + ".bin"))
+                    total += _export_packed_layer(
+                        npz_path, ("sum_squared_error", "sample_count"),
+                        np.float32, out_path,
+                    )
+
+        _export_consistency_meta(model_stats, data_root / model_key)
+
+    print(f"  {total} consistency .bin layer files exported")
+
+
+def _export_consistency_meta(model_stats: Path, out_dir: Path) -> None:
+    """Write consistency_meta.json: the valid-date counts per period.
+
+    The interpretation rules require identical (q, n, lead-pair, region,
+    valid-date set) slices for cross-model comparison; the date counts make
+    the valid-date-set part of that visible to the client.
+    """
+    manifest_path = model_stats / "consistency_manifest.json"
+    if not manifest_path.exists():
+        return
+    try:
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+    dates = manifest.get("processed_valid_dates", [])
+    month_counts: dict[str, int] = {}
+    season_counts: dict[str, int] = {}
+    month_to_season = {
+        month: season for season, months in SEASONS.items() for month in months
+    }
+    for date_str in dates:
+        month = int(date_str[4:6])
+        month_counts[f"{month:02d}"] = month_counts.get(f"{month:02d}", 0) + 1
+        season = month_to_season[month]
+        season_counts[season] = season_counts.get(season, 0) + 1
+    payload = {
+        "date_counts": {
+            "yearly": len(dates),
+            "seasonal": season_counts,
+            "monthly": month_counts,
+        },
+        "first_valid_date": dates[0] if dates else None,
+        "last_valid_date": dates[-1] if dates else None,
+        "lead_days_min": manifest.get("lead_days_min"),
+        "lead_days_max": manifest.get("lead_days_max"),
+        "thresholds_mm": manifest.get("thresholds_mm"),
+        "scales_km": manifest.get("scales_km"),
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write_text_if_changed(out_dir / "consistency_meta.json",
+                           json.dumps(payload, indent=2))
 
 
 def export_model_grids(data_root: Path) -> None:
@@ -921,10 +1200,16 @@ def export_forecast_data_layers(forecast_root: Path) -> None:
     has one uniform path layout to read.
     """
     total = 0
+    pruned = 0
     for model_key in MODEL_REGISTRY:
         base = STATS_ROOT / model_key / "forecast"
         if not base.is_dir():
             continue
+        # Lead windows are gone (Phase 2) — drop stale window bins so the S3
+        # sync --delete removes them too.
+        for stale_bin in (forecast_root / model_key).rglob("lead_*_*.bin"):
+            stale_bin.unlink()
+            pruned += 1
         variables = _forecast_variables_on_disk(model_key)
         if variables:
             for var_key in variables:
@@ -938,6 +1223,8 @@ def export_forecast_data_layers(forecast_root: Path) -> None:
             out_dir = forecast_root / model_key / "precip"
             for npz_path in sorted(base.glob("lead_*.npz")):
                 total += _export_layer(npz_path, npz_key, out_dir)
+    if pruned:
+        print(f"  pruned {pruned} stale window bin(s)")
     print(f"  {total} forecast .bin files (forecast/{{model}}/{{var}}/)")
 
 
@@ -1024,12 +1311,16 @@ def export_tiles(export_dir: Path) -> None:
             total += 1
             if _copy_file_if_changed(src / rel, dst / rel):
                 copied += 1
-        # Prune tiles that no longer exist in the source.
+        # Prune tiles that no longer exist in the source, then any directory
+        # emptied by the prune (e.g. a whole stat dir after a rename).
         if dst.exists():
             for p in dst.rglob("*.png"):
                 if p.relative_to(dst) not in src_rel:
                     p.unlink()
                     pruned += 1
+            for d in sorted((q for q in dst.rglob("*") if q.is_dir()), reverse=True):
+                if not any(d.iterdir()):
+                    d.rmdir()
 
     print(f"  {total} tile PNGs ({copied} updated, {pruned} pruned) under {tiles_dest}")
 
@@ -1087,15 +1378,19 @@ def export_value_ranges(assets_dir: Path) -> None:
     """Write ``static/ranges/…/*.json`` for client-side map PNG export (legend scale)."""
     ranges_root = assets_dir / "ranges"
     written = 0
+    valid_stats = _verification_stat_names()
+    pruned_dirs = 0
     for model_key in MODEL_REGISTRY:
         model_stats = STATS_ROOT / model_key
         if not model_stats.exists():
             continue
+        # Drop ranges for stats no longer in the registry (sacc → cc, forecast).
+        pruned_dirs += _prune_stale_stat_dirs(ranges_root / model_key, valid_stats)
 
         for plugin in ENABLED_STATISTICS:
             stat_name = plugin.spec.name
-            if stat_name == "forecast":
-                continue  # forecast is panel-only — no map tiles or legend ranges
+            if stat_name == "forecast" or stat_name in CONSISTENCY_STAT_NAMES:
+                continue  # panel-only stats — no map tiles or legend ranges
             stat_dir = model_stats / stat_name
             if not stat_dir.is_dir():
                 continue
@@ -1142,6 +1437,8 @@ def export_value_ranges(assets_dir: Path) -> None:
                         _write_range_json(out_path, vmin, vmax, colormap)
                     written += 1
 
+    if pruned_dirs:
+        print(f"  pruned {pruned_dirs} stale range dir(s)")
     if written == 0:
         print("  SKIP: no range JSON files (stats_output/ missing or empty)")
     else:
@@ -1181,17 +1478,20 @@ def _maptiler_key() -> str:
 
 
 def _has_boundary_flags(args: argparse.Namespace) -> bool:
-    return any((args.zip, args.admin, args.huc))
+    return any((args.zip, args.admin, args.huc, args.military))
 
 
 def _resolve_boundary_parts(args: argparse.Namespace) -> dict[str, bool]:
-    # --admin / --huc each export both halves (TopoJSON for S3 + polygons for the image).
+    # --admin / --huc / --military each export both halves
+    # (TopoJSON/GeoJSON for S3 + polygons for the image).
     return {
         "zip": args.zip,
         "admin_topo": args.admin,
         "admin_polys": args.admin,
         "huc_topo": args.huc,
         "huc_polys": args.huc,
+        "military_geo": args.military,
+        "military_polys": args.military,
     }
 
 
@@ -1245,6 +1545,10 @@ def main() -> None:
         help="WBD map TopoJSON/index + chunks/ polygon tree",
     )
     parser.add_argument(
+        "--military", action="store_true",
+        help="Military sites boundaries.json + sites.geojson (DISDI MIRTA)",
+    )
+    parser.add_argument(
         "--max-huc-level", type=int, choices=WBD_HU_LEVELS, default=DEFAULT_MAX_HUC_LEVEL,
         help=f"Deepest WBD HU level to export (default: {DEFAULT_MAX_HUC_LEVEL}; "
              "boundary_data/ keeps full HU16 source)",
@@ -1264,7 +1568,7 @@ def main() -> None:
         )
     if _has_boundary_flags(args) and mode_count:
         parser.error(
-            "Boundary flags (--zip, --admin, --huc) cannot combine "
+            "Boundary flags (--zip, --admin, --huc, --military) cannot combine "
             "with --static, --image, --data, --forecast, or --frontend."
         )
 
@@ -1301,9 +1605,9 @@ def main() -> None:
     if args.static:
         site_root.mkdir(parents=True, exist_ok=True)
         maptiler_key = _maptiler_key()
-        print("--static: exporting zip/ and admin/HUC TopoJSON...")
+        print("--static: exporting zip/, admin/HUC TopoJSON, military GeoJSON...")
         export_boundary_parts(
-            site_root, zip=True, admin_topo=True, huc_topo=True,
+            site_root, zip=True, admin_topo=True, huc_topo=True, military_geo=True,
             huc_max_level=args.max_huc_level,
         )
         print("--static: exporting config, tiles, ranges...")
@@ -1322,9 +1626,9 @@ def main() -> None:
 
     if args.image:
         site_root.mkdir(parents=True, exist_ok=True)
-        print("--image: exporting admin/HUC polygons...")
+        print("--image: exporting admin/HUC/military polygons...")
         export_boundary_parts(
-            site_root, admin_polys=True, huc_polys=True,
+            site_root, admin_polys=True, huc_polys=True, military_polys=True,
             huc_max_level=args.max_huc_level,
         )
         data_root = site_root / DATA_DIR_NAME

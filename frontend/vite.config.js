@@ -42,7 +42,7 @@ export default defineConfig({
     // Proxy the API and every root-level data path to the backend; Vite serves
     // the SPA (/, /assets, /@vite, …) itself.
     proxy: {
-      '^/(api|config\\.json|wbd|admin|tiles|ranges|zip|model_data|forecast)(/|$)':
+      '^/(api|config\\.json|wbd|admin|military|tiles|ranges|zip|model_data|forecast)(/|$)':
         'http://localhost:8000',
     },
   },

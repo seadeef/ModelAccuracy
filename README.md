@@ -75,6 +75,31 @@ stats_output/{model}/
       lead_{N}.npz
 ```
 
+Computes the consistency statistics (**jumpiness** and **convergence** — see
+the Statistics section) by pairing *successive runs for the same valid date*,
+which is why it is a separate pipeline from `compute_stats.py`'s per-(init,
+lead) pairing. Single-process and incremental: a full run is minutes per
+model; a daily catch-up folds in only newly scorable valid dates (a date
+becomes scorable once its last missing lead or PRISM day arrives).
+
+Outputs under `stats_output/{model}/`:
+
+```
+jumpiness/
+  pair_{L}.npz                      # yearly; pair_L = runs issued at leads L+1 and L
+  monthly/MM/pair_{L}.npz           # the primitive (num_/den_ per q,n combo)
+  seasonal/{djf,mam,jja,son}/pair_{L}.npz
+convergence/
+  lead_{N}.npz (+ monthly/, seasonal/)   # sum_squared_error / sample_count / value
+consistency_daily.npz               # exact per-valid-date CONUS J and e_L curves
+consistency_manifest.json           # processed valid dates; param changes force recompute
+```
+
+Changing the threshold or scale sets (`statistics_plugins/consistency.py`)
+invalidates the manifest and forces a full recompute. Export packs the
+accumulator pairs into two-plane `.bin`s (`export_static.py --data`); no tiles
+are rendered for these statistics.
+
 ### `compute_tiles.py`
 
 Generates PNG tile images for the map viewer.
@@ -88,45 +113,80 @@ Generates tiles for yearly, current month, and current season. Forecast tiles ar
 
 ### `export_static.py`
 
-Builds the flat `static_export/` tree for disk-backed serving: the bundled Vite SPA (`static_export/frontend/`: `index.html`, `assets/`, favicons), the root data assets (`config.json`, `zip/`, `tiles/`, `ranges/`, `admin/`, `wbd/`), `static_export/model_data/` (grid metadata and verification `.bin` arrays), and `static_export/forecast/` (forecast `.bin` arrays + `forecast_calendar.json`). `config.json` is the only regular file at the root. Run this before `docker build` or local API use.
+Builds the flat `static_export/` tree for disk-backed serving: the bundled Vite SPA (`static_export/frontend/`: `index.html`, `assets/`, favicons), the root data assets (`config.json`, `zip/`, `tiles/`, `ranges/`, `admin/`, `wbd/`, `military/`), `static_export/model_data/` (grid metadata and verification `.bin` arrays), and `static_export/forecast/` (forecast `.bin` arrays + `forecast_calendar.json`). `config.json` is the only regular file at the root. Run this before `docker build` or local API use.
 
 - `python export_static.py` — full export (all of the above).
-- `python export_static.py --image` — Docker image: admin/HUC polygons + `static_export/model_data/`.
-- `python export_static.py --static` — S3/CloudFront: `zip/`, admin/HUC TopoJSON, `config.json`, `tiles/`, `ranges/`, and `forecast/` (bins + `forecast_calendar.json`).
+- `python export_static.py --image` — Docker image: admin/HUC/military polygons + `static_export/model_data/`.
+- `python export_static.py --static` — S3/CloudFront: `zip/`, admin/HUC TopoJSON, military GeoJSON, `config.json`, `tiles/`, `ranges/`, and `forecast/` (bins + `forecast_calendar.json`).
 - `python export_static.py --data` — only `static_export/model_data/` (verification `.bin` + `grid.json`).
 - `python export_static.py --forecast` — only `static_export/forecast/` (forecast bins + `forecast_calendar.json`).
 - `python export_static.py --frontend` — only the bundled SPA under `static_export/frontend/`.
 
-Boundary flags (combinable with each other, not with build modes): `--zip`, `--admin`, `--huc`. Each writes both halves of its output — `--admin`/`--huc` produce the TopoJSON used by S3 *and* the polygon JSON baked into the image.
+Boundary flags (combinable with each other, not with build modes): `--zip`, `--admin`, `--huc`, `--military`. Each writes both halves of its output — `--admin`/`--huc`/`--military` produce the TopoJSON/GeoJSON used by S3 *and* the polygon JSON baked into the image.
 
 Use `python export_static.py --help` for `--output` and `--clean` (full export only).
 
 ``boundary_data/`` holds only data (like ``model_data/``): normalized ``zip/``,
-``admin/``, and ``wbd/layers/`` outputs at the top level, plus a ``cache/`` for the
-large transient WBD GDB download. It is populated by ``load_boundaries.py``.
+``admin/``, ``wbd/layers/``, and ``military/`` outputs at the top level, plus a
+``cache/`` for the large transient raw downloads (WBD GDB, MIRTA zip). It is
+populated by ``load_boundaries.py``.
 Export modes write the deploy tree ``static_export/``; Docker and S3 deploys only copy from there:
 
 ```bash
-python load_boundaries.py                 # zip + admin + wbd (downloads ~2.7 GB GDB for --wbd)
-python export_static.py --image           # Docker: admin/HUC polys + data/
+python load_boundaries.py                 # zip + admin + wbd + military (downloads ~2.7 GB GDB for --wbd)
+python export_static.py --image           # Docker: admin/HUC/military polys + data/
 ./deploy_fargate.sh                       # COPY static_export/{data,static/...} into image
-python export_static.py --static          # S3: zip + topos + config/tiles/ranges + forecast
+python export_static.py --static          # S3: zip + topos + military geojson + config/tiles/ranges + forecast
 ./deploy_static.sh                        # download forecast → export --static → sync S3 + invalidate
 ```
 
-`load_boundaries.py` takes additive `--zip` / `--admin` / `--wbd` selectors (all run when none are given). For local dev without the ~2.7 GB GDB: `python load_boundaries.py --wbd-sample` then `python export_static.py --image`.
+`load_boundaries.py` takes additive `--zip` / `--admin` / `--wbd` / `--military` selectors (all run when none are given). For local dev without the big downloads: `python load_boundaries.py --wbd-sample --military-sample` then `python export_static.py --image`.
+
+`--military` loads the DoD **DISDI MIRTA** dataset (Military Installations, Ranges, and Training Areas — the public `installations_ranges.zip` from acq.osd.mil, a yearly FY release, ~4 MB): 820 US installation sites keyed by a `siteName + state` slug, with boundary polygons (simplified to ~100 m), the published site point, service component, and operational status. The acq.osd.mil server sends an incomplete TLS chain, so the loader completes verification with the pinned IdenTrust chain in `certs/identrust_trustid_server_ca_o1.pem` (never disables verification). Frontend: the shield tool in the draw toolbar shows every site as a marker + boundary; clicking one selects it as the analysis region (`region.type = "military"`, masked server-side from `military/boundaries.json`, with a containing-cell fallback for sites smaller than a grid cell).
 
 ## Statistics
 
-Verification statistics (computed from model + PRISM pairs):
+Verification statistics (computed per (init, lead) from model + PRISM pairs by
+`compute_stats.py`; rendered as map tiles and panel charts):
 
-- **bias** — mean precipitation bias (mm)
 - **cc** — correlation coefficient (Pearson on raw values, unitless −1..1)
 - **nrmse** — normalized root mean square error (%)
 - **nmad** — normalized mean absolute difference (%)
 - **rb** — relative bias, Σ(model−obs) / Σobs (%)
-- **rmse** — root mean square error (mm)
-- **nmse** — normalized mean square error, MSE / mean(obs)² (unitless)
+
+- **jumpiness** — run-to-run jumpiness J = 1 − FSS between the two successive
+  runs valid on the same date, after binarizing at threshold q ∈ {1, 5, 10,
+  25} mm/day and converting to neighborhood fractions over a square window of
+  n ∈ {25, 50, 100} **kilometers** (latitude-aware cell windows with
+  fractional weights, not fixed cell counts). J = 0 → successive runs agree;
+  J → 1 → complete flip. The value at lead L compares the runs issued at
+  leads L+1 and L. If neither run exceeds q anywhere in the region over the
+  pooled dates the denominator is zero and the value is missing, not zero.
+- **convergence** — RMSE vs PRISM per lead (mm/day), over exactly the same
+  valid dates as jumpiness.
+
+Consistency-statistics ground rules (from their definition):
+
+- A valid date is *scorable* for a model only if **all** leads
+  1..lead_days_max exist on disk **and** the PRISM day exists — so the J and
+  e_L curves always describe the identical valid-date set and can be read
+  jointly.
+- Aggregation is **pooled**: monthly per-cell FSS numerator/denominator (and
+  squared-error/count) sums are the storage primitive; seasons/years sum
+  months, and a region value is the ratio of region-summed accumulators
+  (standard multi-case FSS aggregation), *not* the mean of per-date values.
+  The exact per-date CONUS-wide curves are kept in
+  `stats_output/{model}/consistency_daily.npz` for offline analysis.
+- Derived lock-in quantities (computed client-side from the two curves):
+  **L_stab** — largest lead from which J stays below `lock_in_fraction`
+  (0.75) of its own curve maximum; **L_acc** — the analogous lead on the e_L
+  curve; **lock-in gap = L_stab − L_acc** (positive → the forecast stopped
+  changing before it became accurate: false confidence).
+- Cross-model comparisons are valid only on identical (q, n, lead-pair,
+  region, period, valid-date set) slices; the API reports the pooled date
+  count with every value. AIFS jumpiness is a property of a single model
+  version — values from different AIFS versions are different statistics and
+  must never be pooled.
 
 Display statistics:
 
@@ -164,7 +224,7 @@ Production splits `static_export/` across three deploy paths. Each shell script 
 
 | Artifact | Refreshes | Notes |
 |----------|-----------|-------|
-| [Dockerfile](Dockerfile) | API image | Bakes `static_export/model_data/`, `static_export/admin/boundaries.json`, and `static_export/wbd/chunks/`; fails if any is missing |
+| [Dockerfile](Dockerfile) | API image | Bakes `static_export/model_data/`, `static_export/admin/boundaries.json`, `static_export/wbd/chunks/`, and `static_export/military/boundaries.json`; fails if any is missing |
 | [deploy_fargate.sh](deploy_fargate.sh) | API image → ECR (+ optional ECS redeploy) | Runs `export_static.py --image`, verifies data, `docker build`, ECR push (us-west-1 default) |
 | [deploy_static.sh](deploy_static.sh) | `static_export/` root data assets → `s3://$BUCKET/` (root) and `static_export/forecast/` → S3 | No flags: downloads the latest forecast, runs `export_static.py --static`, syncs both subtrees, and invalidates the data paths (`/config.json`, `/zip/*`, `/admin/*`, …) |
 | [deploy_frontend.sh](deploy_frontend.sh) | Bundled SPA (`static_export/frontend/`: `index.html`, `assets/`, favicons) → `s3://$BUCKET/` (root) | Invalidates non-hashed files; `/assets/` URLs are content-hashed |
@@ -206,7 +266,7 @@ SKIP_BUILD=1 ./deploy_static.sh          # skip download+export, upload existing
 SKIP_INVALIDATE=1 ./deploy_static.sh     # skip the CloudFront invalidation
 ```
 
-Cache-Control mirrors `LongCacheStaticMiddleware` in `backend/api.py`: `zip/`, `admin/`, and `wbd/` are 1 yr immutable; `tiles/`, `ranges/`, and `config.json` are 300 s `must-revalidate`. The forecast S3 prefix is derived from `DATA_S3_URI` (sibling of the stats prefix); see the script header for the parsing rule.
+Cache-Control mirrors `LongCacheStaticMiddleware` in `backend/api.py`: `zip/`, `admin/`, `wbd/`, and `military/` are 1 yr immutable; `tiles/`, `ranges/`, and `config.json` are 300 s `must-revalidate`. The forecast S3 prefix is derived from `DATA_S3_URI` (sibling of the stats prefix); see the script header for the parsing rule.
 
 ### Frontend (`deploy_frontend.sh`)
 

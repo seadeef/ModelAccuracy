@@ -371,6 +371,14 @@ def _run_for_model(model_key: str) -> None:
     images_root = OUTPUT_DIR / model_key
     tmp_root = OUTPUT_DIR / "tmp"
 
+    # Drop tile dirs for statistics no longer in the registry (e.g. bias/rmse/
+    # nmse after the RB consolidation) so export_static stops mirroring them.
+    valid_stats = {p.spec.name for p in plugins}
+    for child in sorted(images_root.iterdir()) if images_root.is_dir() else []:
+        if child.is_dir() and child.name not in valid_stats:
+            shutil.rmtree(child)
+            print(f"Pruned stale tiles: {child}")
+
     meta = load_metadata(stats_root)
 
     # Build land mask from PRISM, reprojected onto the model grid.

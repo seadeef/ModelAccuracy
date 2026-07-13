@@ -13,7 +13,10 @@ function headersWithAuth(base = {}) {
  *  frontend only carries ``geometry`` for local rendering (dim mask). */
 function regionPayload(region) {
   if (!region) return region;
-  if ((region.type === 'admin' || region.type === 'huc') && region.geometry) {
+  if (
+    (region.type === 'admin' || region.type === 'huc' || region.type === 'military')
+    && region.geometry
+  ) {
     const { geometry: _g, ...rest } = region;
     return rest;
   }
@@ -172,6 +175,8 @@ export async function fetchStatsAllLeads({
   season,
   minLead,
   maxLead,
+  threshold,
+  scale,
 }) {
   const statList = verificationStatisticsOnly();
   if (!statList?.length) {
@@ -189,6 +194,9 @@ export async function fetchStatsAllLeads({
       minLead: minLead,
       maxLead: maxLead,
       statistics: statList.map((s) => s.key),
+      // Jumpiness slice parameters (ignored by the other statistics).
+      ...(threshold != null ? { threshold } : {}),
+      ...(scale != null ? { scale } : {}),
     }),
   });
   if (!resp.ok) {

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from statistics_plugins.consistency import JUMPINESS_SCALES_KM, JUMPINESS_THRESHOLDS_MM
 
 
 def _reject_non_digit_lead(v):
@@ -10,12 +14,19 @@ def _reject_non_digit_lead(v):
         raise ValueError("lead must be a non-negative integer")
     return v
 
-VALID_REGION_TYPES = {"point", "rectangle", "polygon", "admin", "huc"}
+VALID_REGION_TYPES = {"point", "rectangle", "polygon", "admin", "huc", "military"}
 VALID_ADMIN_LEVELS = {"state", "county"}
+# Military site keys are loader-generated slugs (siteName + state), e.g.
+# "fort-liberty-nc". Whitelisted so the key can only index the boundaries dict.
+MILITARY_SITE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,99}$")
 VALID_HUC_LEVELS = {2, 4, 6, 8, 10, 12, 14, 16}
 VALID_PERIODS = {"yearly", "monthly", "seasonal"}
 VALID_SEASONS = {"djf", "mam", "jja", "son"}
 VALID_MONTHS = {f"{m:02d}" for m in range(1, 13)}
+# Jumpiness parameters are whitelisted because they select pre-computed bin
+# paths (like month/season above): only the exact computed combinations exist.
+VALID_THRESHOLDS = {float(q) for q in JUMPINESS_THRESHOLDS_MM}
+VALID_SCALES = {int(n) for n in JUMPINESS_SCALES_KM}
 
 # Caps on request-driven fan-out so an unauthenticated caller can't force the
 # backend to read tens of thousands of layers or walk a giant polygon. Any real
@@ -48,6 +59,8 @@ class StatsRegion(BaseModel):
     fips: str | None = None
     # huc type only:
     huc: str | None = None
+    # military type only:
+    site: str | None = None
 
     @model_validator(mode="after")
     def validate_shape(self) -> "StatsRegion":
@@ -94,6 +107,10 @@ class StatsRegion(BaseModel):
                 )
             if self.level is not None and int(self.level) != huc_len:
                 raise ValueError("region.level must match the digit count of region.huc")
+
+        if self.type == "military":
+            if not self.site or not MILITARY_SITE_RE.match(str(self.site)):
+                raise ValueError("region.site must be a lowercase site key (letters/digits/hyphens)")
         return self
 
 
@@ -108,6 +125,10 @@ class StatsQueryRequest(BaseModel):
     month: str | None = None
     season: str | None = None
     statistics: list[str] | None = None
+    # Jumpiness parameters (ignored by the other statistics). None → defaults
+    # (statistics_plugins.consistency.DEFAULT_THRESHOLD_MM / DEFAULT_SCALE_KM).
+    threshold: float | None = None  # exceedance threshold q in mm/day
+    scale: int | None = None        # neighborhood width n in km
 
     _lead_digits = field_validator("lead", mode="before")(_reject_non_digit_lead)
 
@@ -116,6 +137,10 @@ class StatsQueryRequest(BaseModel):
         if self.period not in VALID_PERIODS:
             raise ValueError("period must be yearly, monthly, or seasonal")
         _validate_month_season(self.month, self.season)
+        if self.threshold is not None and float(self.threshold) not in VALID_THRESHOLDS:
+            raise ValueError(f"threshold must be one of {sorted(VALID_THRESHOLDS)}")
+        if self.scale is not None and int(self.scale) not in VALID_SCALES:
+            raise ValueError(f"scale must be one of {sorted(VALID_SCALES)}")
         has_single = self.lead is not None
         has_range = self.minLead is not None or self.maxLead is not None
         if has_single == has_range:

@@ -6,6 +6,7 @@ Writes the normalized outputs that ``export_static.py`` reads:
     boundary_data/zip/zip_lookup.csv          (--zip)
     boundary_data/admin/{states,counties}-10m.json   (--admin)
     boundary_data/wbd/layers/hu{2,4,…}.json   (--wbd, or --wbd-sample for dev)
+    boundary_data/military/sites.json         (--military, or --military-sample for dev)
 
 The ZIP lookup CSV is derived from the US Census ZCTA cartographic-boundary
 shapefile (each ZIP's fly-to centroid and zoom bbox come from its polygon); the
@@ -15,16 +16,19 @@ too and is likewise reused.
 
 Usage::
 
-    python load_boundaries.py                  # everything (zip + admin + wbd)
+    python load_boundaries.py                  # everything (zip + admin + wbd + military)
     python load_boundaries.py --zip            # only the ZIP lookup CSV
     python load_boundaries.py --admin          # only us-atlas TopoJSON
     python load_boundaries.py --wbd            # only WBD HU layers (downloads GDB)
     python load_boundaries.py --wbd-sample     # synthetic WBD layers for local dev
     python load_boundaries.py --wbd --force    # re-decode even if layers exist
     python load_boundaries.py --wbd --max-huc-level 16   # full source (default caps at HU12)
+    python load_boundaries.py --military       # only DISDI MIRTA military sites (~4 MB zip)
+    python load_boundaries.py --military-sample  # synthetic military sites for local dev
 
-Selection flags (``--zip``/``--admin``/``--wbd``/``--wbd-sample``) are additive;
-with none given, all of zip + admin + wbd run.
+Selection flags (``--zip``/``--admin``/``--wbd``/``--wbd-sample``/``--military``/
+``--military-sample``) are additive; with none given, all of zip + admin + wbd +
+military run.
 """
 
 from __future__ import annotations
@@ -32,7 +36,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import shutil
+import ssl
 import sys
 import tempfile
 import urllib.request
@@ -42,6 +48,13 @@ from pathlib import Path
 from boundary_paths import (
     ADMIN_COUNTIES_TOPOJSON,
     ADMIN_STATES_TOPOJSON,
+    MILITARY_CA_PEM,
+    MILITARY_DIR,
+    MILITARY_GDB_DIR,
+    MILITARY_SITES_JSON,
+    MILITARY_SOURCE_LABEL,
+    MILITARY_URL,
+    MILITARY_ZIP,
     PROJECT_ROOT,
     US_ATLAS_CDN,
     WBD_CACHE,
@@ -82,11 +95,19 @@ def _rel(path: Path) -> str:
         return str(path)
 
 
-def _download(url: str, dest: Path, *, user_agent: str, timeout: int = 600) -> None:
+def _download(
+    url: str, dest: Path, *, user_agent: str, timeout: int = 600, extra_cafile: Path | None = None
+) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     print(f"==> downloading {url}")
     req = urllib.request.Request(url, headers={"User-Agent": user_agent})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    context = None
+    if extra_cafile is not None:
+        # Default verification plus a pinned chain, for hosts that serve an
+        # incomplete certificate chain (e.g. www.acq.osd.mil).
+        context = ssl.create_default_context()
+        context.load_verify_locations(cafile=str(extra_cafile))
+    with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
         data = resp.read()
     dest.write_bytes(data)
     print(f"  wrote {_rel(dest)} ({dest.stat().st_size:,} bytes)")
@@ -502,6 +523,242 @@ def load_wbd_sample() -> int:
     return 0
 
 
+# ── Military installations (DISDI MIRTA) ───────────────────────────
+#
+# The DoD DISDI program publishes MIRTA — one public zip holding an ESRI file
+# geodatabase with two layers: per-site points (FY{yy}MirtaLocations) and site
+# boundary multipolygons (FY{yy}MirtaLocations_A), both EPSG:4326. Sites are
+# keyed here by a slug of siteName + state (the source has no stable ID field);
+# boundary polygons are aggregated per key and the matching point (fly-to
+# target) is attached, falling back to the bbox center for polygon-only sites.
+MILITARY_SIMPLIFY_TOLERANCE = 0.001  # ~100 m; sites are far smaller than HUCs
+_MILITARY_COORD_DECIMALS = 5
+
+
+def _slugify(*parts: str) -> str:
+    joined = "-".join(p for p in parts if p)
+    slug = re.sub(r"[^a-z0-9]+", "-", joined.lower()).strip("-")
+    return slug or "site"
+
+
+def _resolve_military_zip(mirta_zip: Path | None) -> Path:
+    """Return the MIRTA zip, preferring the cached copy in ``cache/`` (same
+    resolution order as :func:`_resolve_zcta_zip`)."""
+    if (
+        mirta_zip is not None
+        and mirta_zip.is_file()
+        and mirta_zip.resolve() != MILITARY_ZIP.resolve()
+        and not MILITARY_ZIP.is_file()
+    ):
+        WBD_CACHE.mkdir(parents=True, exist_ok=True)
+        print(f"==> staging {_rel(mirta_zip)} → {_rel(MILITARY_ZIP)}")
+        shutil.copy2(mirta_zip, MILITARY_ZIP)
+
+    if MILITARY_ZIP.is_file() and MILITARY_ZIP.stat().st_size > 100_000:
+        print(f"==> using cached {_rel(MILITARY_ZIP)}")
+        return MILITARY_ZIP
+
+    _download(
+        MILITARY_URL,
+        MILITARY_ZIP,
+        user_agent="ModelAccuracy load_boundaries (military)",
+        extra_cafile=MILITARY_CA_PEM if MILITARY_CA_PEM.is_file() else None,
+    )
+    return MILITARY_ZIP
+
+
+def _extract_military_gdb(zip_path: Path, gdb_dir: Path) -> Path:
+    if gdb_dir.is_dir() and any(gdb_dir.iterdir()):
+        print(f"==> using extracted GDB at {_rel(gdb_dir)}")
+        return gdb_dir
+    print("==> extracting MIRTA zip")
+    with tempfile.TemporaryDirectory(prefix="mirta_gdb_") as tmp:
+        tmp_path = Path(tmp)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(tmp_path)
+        gdb_dirs = list(tmp_path.rglob("*.gdb"))
+        if not gdb_dirs:
+            raise RuntimeError("no .gdb directory found in MIRTA zip")
+        if gdb_dir.exists():
+            shutil.rmtree(gdb_dir)
+        shutil.copytree(gdb_dirs[0], gdb_dir)
+    print(f"  extracted to {_rel(gdb_dir)}")
+    return gdb_dir
+
+
+def _mirta_layer_names(gdb_path: Path) -> tuple[str, str]:
+    """(point_layer, polygon_layer) — layer names embed the fiscal year, so
+    discover them by geometry type instead of hard-coding FY24."""
+    import pyogrio
+
+    point_layer = polygon_layer = ""
+    for name, gtype in pyogrio.list_layers(str(gdb_path)):
+        gtype = str(gtype or "")
+        if "Polygon" in gtype and not polygon_layer:
+            polygon_layer = str(name)
+        elif "Point" in gtype and not point_layer:
+            point_layer = str(name)
+    if not polygon_layer:
+        raise RuntimeError(f"no polygon layer found in {gdb_path}")
+    return point_layer, polygon_layer
+
+
+def _read_mirta_rows(gdb_path: Path, layer: str) -> list[tuple[dict, object]]:
+    """Rows of (attributes, shapely geometry) for a MIRTA layer."""
+    from pyogrio.raw import read as ogr_read
+    from shapely import from_wkb
+
+    meta, _, geoms, col_arrays = ogr_read(str(gdb_path), layer=layer, read_geometry=True)
+    field_names = [str(f) for f in meta["fields"]]
+    cols = {name: col_arrays[i] for i, name in enumerate(field_names)}
+
+    def val(name: str, i: int) -> str:
+        arr = cols.get(name)
+        return str(arr[i]).strip() if arr is not None and arr[i] is not None else ""
+
+    rows: list[tuple[dict, object]] = []
+    for i, wkb in enumerate(geoms):
+        if wkb is None:
+            continue
+        attrs = {
+            "name": val("siteName", i) or val("featureName", i),
+            "component": val("siteReportingComponent", i),
+            "status": val("siteOperationalStatus", i).lower(),
+            "state": val("stateNameCode", i).lower(),
+            "joint_base": val("isJointBase", i).lower() == "yes",
+        }
+        if not attrs["name"]:
+            continue
+        rows.append((attrs, from_wkb(wkb)))
+    return rows
+
+
+def _round_polygons(polygons: list[list[list[list[float]]]]) -> list[list[list[list[float]]]]:
+    return [
+        [[[round(x, _MILITARY_COORD_DECIMALS), round(y, _MILITARY_COORD_DECIMALS)] for x, y in ring]
+         for ring in poly]
+        for poly in polygons
+    ]
+
+
+def _normalize_mirta(gdb_path: Path) -> dict[str, dict]:
+    from shapely import make_valid
+
+    point_layer, polygon_layer = _mirta_layer_names(gdb_path)
+    sites: dict[str, dict] = {}
+    for attrs, geom in _read_mirta_rows(gdb_path, polygon_layer):
+        if geom is None or geom.is_empty:
+            continue
+        if not geom.is_valid:
+            geom = make_valid(geom)
+            if geom.is_empty:
+                continue
+        simplified = geom.simplify(MILITARY_SIMPLIFY_TOLERANCE, preserve_topology=True)
+        if simplified.is_empty:
+            simplified = geom
+        polygons = _round_polygons(geom_to_polygons(simplified))
+        if not polygons:
+            continue
+        key = _slugify(attrs["name"], attrs["state"])
+        entry = sites.get(key)
+        if entry is None:
+            sites[key] = {
+                "name": attrs["name"],
+                "bbox": polygons_bbox(polygons),
+                "polygons": polygons,
+                "component": attrs["component"],
+                "status": attrs["status"],
+                "state": attrs["state"],
+                "joint_base": attrs["joint_base"],
+            }
+        else:
+            # Same site split across several boundary features → union them.
+            entry["polygons"].extend(polygons)
+            entry["bbox"] = polygons_bbox(entry["polygons"])
+
+    # Attach each site's published point (fly-to target); bbox center fallback.
+    points: dict[str, list[float]] = {}
+    if point_layer:
+        for attrs, geom in _read_mirta_rows(gdb_path, point_layer):
+            if geom is None or geom.is_empty or geom.geom_type != "Point":
+                continue
+            key = _slugify(attrs["name"], attrs["state"])
+            points.setdefault(
+                key,
+                [round(float(geom.x), _MILITARY_COORD_DECIMALS),
+                 round(float(geom.y), _MILITARY_COORD_DECIMALS)],
+            )
+    for key, entry in sites.items():
+        w, s, e, n = entry["bbox"]
+        entry["point"] = points.get(
+            key,
+            [round((w + e) / 2, _MILITARY_COORD_DECIMALS),
+             round((s + n) / 2, _MILITARY_COORD_DECIMALS)],
+        )
+    return sites
+
+
+def _write_military_sites(sites: dict[str, dict]) -> None:
+    MILITARY_DIR.mkdir(parents=True, exist_ok=True)
+    MILITARY_SITES_JSON.write_text(
+        json.dumps(
+            {"version": 1, "source": MILITARY_SOURCE_LABEL, "sites": sites},
+            separators=(",", ":"),
+        )
+    )
+
+
+def load_military(*, mirta_zip: Path | None = None, force: bool = False) -> int:
+    """Normalize DISDI MIRTA installation sites into ``boundary_data/military/sites.json``."""
+    if MILITARY_SITES_JSON.is_file() and not force:
+        print(f"==> using cached {_rel(MILITARY_SITES_JSON)}")
+        return 0
+    try:
+        import pyogrio  # noqa: F401
+        from shapely import make_valid  # noqa: F401
+    except ImportError as exc:
+        print("ERROR: pyogrio and shapely required for --military", file=sys.stderr)
+        raise SystemExit(1) from exc
+
+    src_zip = _resolve_military_zip(mirta_zip)
+    gdb_dir = _extract_military_gdb(src_zip, MILITARY_GDB_DIR)
+    sites = _normalize_mirta(gdb_dir)
+    if not sites:
+        print("ERROR: no MIRTA sites decoded", file=sys.stderr)
+        return 1
+    _write_military_sites(sites)
+    print(f"==> wrote {len(sites):,} military sites → {_rel(MILITARY_SITES_JSON)}")
+    return 0
+
+
+_SAMPLE_MILITARY_BOXES: dict[str, tuple[str, str, str, list[float]]] = {
+    # key → (name, component, state, bbox)
+    "sample-army-base-ks": ("Sample Army Base", "usa", "ks", [-97.0, 38.7, -96.6, 39.1]),
+    "sample-air-station-ca": ("Sample Air Station", "usaf", "ca", [-120.7, 34.6, -120.5, 34.8]),
+    "sample-naval-range-fl": ("Sample Naval Range", "usn", "fl", [-86.9, 30.4, -86.4, 30.7]),
+}
+
+
+def load_military_sample() -> int:
+    """Write synthetic military sites (no download) for local dev."""
+    sites = {}
+    for key, (name, component, state, bbox) in _SAMPLE_MILITARY_BOXES.items():
+        w, s, e, n = bbox
+        sites[key] = {
+            "name": name,
+            "bbox": bbox,
+            "polygons": _box_polygon(bbox),
+            "component": component,
+            "status": "act",
+            "state": state,
+            "joint_base": False,
+            "point": [round((w + e) / 2, 5), round((s + n) / 2, 5)],
+        }
+    _write_military_sites(sites)
+    print(f"Wrote {len(sites)} sample military sites → {_rel(MILITARY_SITES_JSON)}")
+    return 0
+
+
 # ── CLI ─────────────────────────────────────────────────────────────
 
 def main() -> int:
@@ -515,6 +772,18 @@ def main() -> int:
     parser.add_argument(
         "--wbd-sample", action="store_true",
         help="Write synthetic WBD layers for local dev (no download)",
+    )
+    parser.add_argument(
+        "--military", action="store_true",
+        help="Load DISDI MIRTA military installation sites (~4 MB zip)",
+    )
+    parser.add_argument(
+        "--military-sample", action="store_true",
+        help="Write synthetic military sites for local dev (no download)",
+    )
+    parser.add_argument(
+        "--mirta-zip", type=Path, default=None,
+        help="Use an existing MIRTA installations_ranges.zip",
     )
     parser.add_argument("--force", action="store_true", help="Re-fetch/re-decode even if outputs exist")
     parser.add_argument("--zcta-zip", type=Path, default=None, help="Use an existing ZCTA boundary shapefile zip")
@@ -530,9 +799,14 @@ def main() -> int:
 
     if args.wbd and args.wbd_sample:
         parser.error("use at most one of --wbd / --wbd-sample")
+    if args.military and args.military_sample:
+        parser.error("use at most one of --military / --military-sample")
 
-    # No selection flag → load everything (real WBD, not the sample).
-    select_all = not (args.zip or args.admin or args.wbd or args.wbd_sample)
+    # No selection flag → load everything (real WBD/military, not the samples).
+    select_all = not (
+        args.zip or args.admin or args.wbd or args.wbd_sample
+        or args.military or args.military_sample
+    )
 
     rc = 0
     if args.zip or select_all:
@@ -553,6 +827,12 @@ def main() -> int:
             force=args.force,
             max_level=args.max_huc_level,
         )
+    if args.military_sample:
+        print("=== Military sites (synthetic sample) ===")
+        rc |= load_military_sample()
+    elif args.military or select_all:
+        print("=== Military sites (DISDI MIRTA) ===")
+        rc |= load_military(mirta_zip=args.mirta_zip, force=args.force)
     return rc
 
 

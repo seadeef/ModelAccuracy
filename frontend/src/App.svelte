@@ -81,12 +81,14 @@
     ui.activeTool === 'point' && !ui.hasUsedPinTool,
   );
   const showBoundaryGuide = $derived(
-    (ui.activeTool === 'state' || ui.activeTool === 'county' || ui.activeTool === 'watershed')
+    (ui.activeTool === 'state' || ui.activeTool === 'county' || ui.activeTool === 'watershed'
+      || ui.activeTool === 'military')
     && !ui.hasUsedAreaDrawTool,
   );
   const boundaryGuideText = $derived.by(() => {
     if (ui.activeTool === 'county') return 'Click a county to analyze';
     if (ui.activeTool === 'state') return 'Click a state to analyze';
+    if (ui.activeTool === 'military') return 'Click a military installation marker to analyze';
     const crumb = ui.wbdDrillPath.length ? `${ui.wbdDrillPath.join(' → ')} — ` : '';
     return `${crumb}Click a watershed to drill down. Press Enter to analyze at the current level.`;
   });

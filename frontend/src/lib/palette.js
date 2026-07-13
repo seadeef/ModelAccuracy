@@ -11,12 +11,11 @@
 
 export const STAT_COLORS = {
   nrmse: '#6eb5ff',   // blue
-  bias:  '#e0a4ff',   // lavender
   cc:    '#5ce0d6',   // teal
   nmad:  '#f0a07a',   // peach
-  rb:    '#c0a8ff',   // periwinkle
-  rmse:  '#88bce8',   // steel blue
-  nmse:  '#d0a0e0',   // orchid
+  rb:    '#e0a4ff',   // lavender (inherited from the Bias stat it replaced)
+  jumpiness:   '#8b93ff',  // periwinkle (consistency: run-to-run J)
+  convergence: '#e392cf',  // orchid (consistency: RMSE-to-truth by lead)
 };
 
 export function statColor(key) {
