@@ -29,19 +29,26 @@
   });
   const ends = endLabelPlugin((ds) => ds.ident);
   const config = $derived.by(() => {
+    // Consecutive sweep steps often land on the same (recall, precision) point; keep one.
+    const dedupe = (r) => r.recall.map((x, i) => ({ x, y: r.precision[i], t: r.triggers?.[i] })).filter((pt, i, arr) => i === 0 || pt.x !== arr[i - 1].x || pt.y !== arr[i - 1].y);
     const datasets = results.filter((r) => !r.unavailable).map((r) => ({
-      label: r.label, ident: pal[r.key]?.ident,
-      data: r.recall.map((x, i) => ({ x, y: r.precision[i] })),
+      label: r.label, ident: pal[r.key]?.ident, modelKey: r.key,
+      data: dedupe(r),
       borderColor: r.key === ui.model ? pal[r.key]?.text : alpha(pal[r.key]?.text, 0.75), endLabelColor: pal[r.key]?.text,
       borderWidth: r.key === ui.model ? 2.6 : 1.4, pointRadius: 0, tension: 0, showLine: true, order: r.key === ui.model ? 0 : 1,
     }));
     for (const r of results.filter((x) => !x.unavailable && x.point)) {
-      datasets.push({ label: `${r.label} at ${r.q} mm`, data: [{ x: r.point.recall, y: r.point.precision }], borderColor: pal[r.key]?.text, backgroundColor: pal[r.key]?.text, pointRadius: 4.5, pointStyle: 'rectRot', showLine: false, order: 0, endLabel: false });
+      datasets.push({ label: `${r.label} at ${r.q} mm`, modelKey: r.key, isPoint: true, data: [{ x: r.point.recall, y: r.point.precision, t: r.q }], borderColor: pal[r.key]?.text, backgroundColor: pal[r.key]?.text, pointRadius: 4.5, pointStyle: 'rectRot', showLine: false, order: 0, endLabel: false });
     }
     const opts = {
       responsive: true, maintainAspectRatio: false, interaction: { mode: 'nearest', intersect: false },
       layout: { padding: { top: 8, right: 10 } },
-      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => ` ${c.dataset.label}: recall ${fmt(c.parsed.x, 2)} · precision ${fmt(c.parsed.y, 2)}` } } },
+      plugins: { legend: { display: false }, tooltip: {
+        // One row per model: drop repeated curve hits, and the diamond when its curve row is already listed.
+        filter: (item, idx, items) => items.findIndex((o) => o.datasetIndex === item.datasetIndex) === idx
+          && !(item.dataset.isPoint && items.some((o) => !o.dataset.isPoint && o.dataset.modelKey === item.dataset.modelKey)),
+        callbacks: { title: () => '', label: (c) => ` ${c.dataset.label}${c.raw?.t != null ? ` at trigger ${fmt(c.raw.t, 1)} mm` : ''}: recall ${fmt(c.parsed.x, 2)} · precision ${fmt(c.parsed.y, 2)}` },
+      } },
       scales: {
         x: { type: 'linear', min: 0, max: 1, grid: { color: '#ffffff0b' }, border: { display: false }, ticks: { font: { size: 11.5 }, maxTicksLimit: 6 }, title: { display: true, text: 'Recall · share of heavy days caught', color: '#8f9aab', font: { size: 11 } } },
         y: { type: 'linear', min: 0, max: 1, grid: { color: '#ffffff0b' }, border: { display: false }, ticks: { font: { size: 11.5 }, maxTicksLimit: 5 }, title: { display: true, text: 'Precision · share of calls that verified', color: '#8f9aab', font: { size: 11 } } },

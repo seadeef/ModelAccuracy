@@ -80,12 +80,12 @@
       {#if basinNote}<span class="cap" title="Storm analyses use the HUC6 basin's forecast history">{basinNote} basin</span>{/if}
       {#if showStorm}
         <span class="cap">Storm</span>
-        <Dropdown items={stormShown} value={stormValue} ariaLabel="Storm or date range" title="Storm, AR episode or the full record. Sets the revision day, the highlighted storm and the days behind the storm population." compact width="196px" align="right"
+        <Dropdown items={stormShown} value={stormValue} ariaLabel="Storm or date range" title="Storm, AR episode or the full record. Sets the revision day, the highlighted storm and the days behind the storm population." compact width="182px" align="right"
           onselect={pickStorm} onhover={hoverStorm} />
       {/if}
       {#if showDay}
         <span class="cap">Day</span>
-        <Dropdown items={dayItems} value={isoToYmd(ui.arTargetDate)} ariaLabel="Storm day" title="The day whose forecasts are traced (green = observed at or above the heavy-rain threshold)" compact width="98px" align="right"
+        <Dropdown items={dayItems} value={isoToYmd(ui.arTargetDate)} ariaLabel="Storm day" title="The day whose forecasts are traced (green = observed at or above the heavy-rain threshold)" compact width="92px" align="right"
           onselect={(k) => { ui.arTargetDate = ymdToIso(k); }} />
       {/if}
       {#if !basinTabsOk && ui.selectedRegion}
@@ -109,7 +109,7 @@
   .pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   .strip { display: flex; align-items: center; gap: 2px; padding: 4px 10px 0 10px; border-bottom: 1px solid var(--rule); flex: none; min-width: 0; }
   .tabs { display: flex; align-items: center; gap: 2px; flex: 1; min-width: 0; overflow-x: auto; scrollbar-width: none; }
-  .tab { font: inherit; font-size: 13px; font-weight: 600; padding: 9px 9px 10px; background: none; border: 0; border-bottom: 2px solid transparent; color: var(--text-secondary); cursor: pointer; white-space: nowrap; margin-bottom: -1px; }
+  .tab { font: inherit; font-size: 13px; font-weight: 600; padding: 9px 8px 10px; background: none; border: 0; border-bottom: 2px solid transparent; color: var(--text-secondary); cursor: pointer; white-space: nowrap; margin-bottom: -1px; }
   .tab:hover { color: var(--text-primary); }
   .tab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
   .tab.ar.active { border-bottom-color: #b9a6ff; }
