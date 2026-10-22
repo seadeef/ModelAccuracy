@@ -184,6 +184,8 @@ Selecting any region (point, drawn area, state, county, watershed, military inst
 
 Basin analyses need a HUC6 basin with an exported series (California, Pacific Northwest, Upper Colorado; `export_static.py --basins`). For a HUC8–HUC12 pick inside one of those basins the enclosing HUC6 is used; other regions keep the gridded panes and show the grid-pooled R ranking instead. The header exports a CSV (every model × lead × statistic, best model, and the basin series), the raw basin series as JSON, or the map image. The previous floating panel (`Panel.svelte`) was removed once its features were carried over.
 
+The first committed version of this UI is `3421887` (tag `dashboard-v1`, branch `dashboard-redesign`); later commits on that branch refine it.
+
 Dev: `DEV=1 .venv/bin/python -m uvicorn backend.api:app --port 8000` and `cd frontend && npm run dev` (set `API_PROXY=http://127.0.0.1:<port>` if the API runs elsewhere). In dev builds `window.__rcUi`, `window.__rcMap` and `window.__rcSelectHuc('180201')` are exposed for capture tooling.
 
 ## Statistics
