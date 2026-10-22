@@ -16,7 +16,7 @@
     fetchForecastAllVariables,
   } from '../api.js';
   import { STATIC_BASE } from '../constants.js';
-  import { dash, resetDash, leadAxis, leadSink } from './dashData.svelte.js';
+  import { dash, resetDash, leadAxis, leadSink, regionKind, periodLabel } from './dashData.svelte.js';
   import { datesInRange, wettestDay } from '../basinAnalysis.js';
   import { ymdToIso, isoToYmd } from '../bootstrap.js';
   import LeadBar from './LeadBar.svelte';
@@ -256,7 +256,10 @@
 </script>
 
 <section class="results">
-  <LeadBar />
+  <div class="top">
+    <div class="eyebrow" title="The map, the lead bar and both curves pool every scored day of this period over the drawn region. The storm panes below read the basin's own forecast history instead.">Pooled over the {regionKind(ui.selectedRegion).toLowerCase()} · <em>{periodLabel()}</em></div>
+    <LeadBar />
+  </div>
   <div class="paired">
     <AccuracyPane />
     <ConsistencyPane />
@@ -267,20 +270,26 @@
 <style>
   .results {
     display: grid;
-    grid-template-rows: 48px minmax(190px, 34%) minmax(0, 1fr);
-    gap: 12px;
+    grid-template-rows: auto minmax(200px, 35%) minmax(0, 1fr);
     min-width: 0;
     min-height: 0;
+    background: var(--pane-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 12px;
+    overflow: hidden;
   }
+  .top { display: flex; flex-direction: column; gap: 9px; padding: 12px 16px 12px; border-bottom: 1px solid var(--rule); }
   .paired {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 12px;
     min-width: 0;
     min-height: 0;
+    border-bottom: 1px solid var(--rule);
   }
+  .paired > :global(*:last-child) { border-left: 1px solid var(--rule); }
   @media (max-width: 1100px) {
     .paired { grid-template-columns: 1fr; }
-    .results { grid-template-rows: 48px auto minmax(0, 1fr); }
+    .paired > :global(*:last-child) { border-left: 0; border-top: 1px solid var(--rule); }
+    .results { grid-template-rows: auto auto minmax(0, 1fr); }
   }
 </style>

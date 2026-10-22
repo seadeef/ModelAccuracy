@@ -3,17 +3,18 @@
   import { ui, appConfig, accuracyStatKeys, statLabel } from '../state.svelte.js';
   import { statisticTooltip } from '../helpText.js';
   import { statColor } from '../palette.js';
-  import { dash, selectedLead, statAt } from './dashData.svelte.js';
+  import { dash, selectedLead, statAt, modelLabel, palette } from './dashData.svelte.js';
   import { fmt } from './chartSetup.js';
 
   let { onstatchange } = $props();
-  const NAMES = { nmad: 'Error (NMAD)', cc: 'Correlation', nrmse: 'RMS error', rb: 'Bias' };
+  const NAMES = { nmad: 'Error · NMAD', cc: 'Correlation', nrmse: 'RMS error', rb: 'Bias' };
   const ORDER = ['nmad', 'cc', 'nrmse', 'rb'];
   const keys = $derived.by(() => {
     const k = accuracyStatKeys().filter((x) => !appConfig.consistency.stats.includes(x));
     return [...ORDER.filter((x) => k.includes(x)), ...k.filter((x) => !ORDER.includes(x))];
   });
   const lead = $derived(selectedLead());
+  const pal = $derived(palette());
   function pick(k) {
     ui.statistic = k;
     ui.activeWindow = null;
@@ -22,33 +23,31 @@
 </script>
 
 <div class="tiles">
-  <div class="block-title">Accuracy at lead day <b>{lead}</b></div>
+  <div class="eyebrow"><em style:color={pal[ui.model]?.text}>{modelLabel(ui.model)}</em> at lead day <em>{lead}</em></div>
   <div class="grid">
     {#each keys as k (k)}
       {@const s = statAt(dash.accuracy?.[ui.model], lead, k)}
-      <button type="button" class="tile" class:on={ui.statistic === k} style:--stat-color={statColor(k)} title={statisticTooltip(k)} onclick={() => pick(k)}>
+      <button type="button" class="tile" class:on={ui.statistic === k} style:--stat-color={statColor(k)} title={`${statisticTooltip(k)} Click to show this statistic on the map and the lead bar.`} onclick={() => pick(k)}>
         <span class="label">{NAMES[k] || statLabel(k)}</span>
         <span class="val">{s ? fmt(s.value, 2) : '—'}</span>
-        <span class="unit">{s?.units || ''}</span>
+        <span class="unit">{s?.units || ' '}</span>
       </button>
     {/each}
   </div>
 </div>
 
 <style>
-  .tiles { flex: none; padding: 9px 10px 10px; border: 1px solid var(--panel-border); border-radius: 10px; background: var(--pane-bg); }
-  .block-title { font-size: 14px; font-weight: 600; margin-bottom: 7px; }
-  .block-title b { font-weight: 600; color: var(--accent); }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .tiles { flex: none; padding: 12px 14px 14px; border: 1px solid var(--panel-border); border-radius: 12px; background: var(--pane-bg); display: flex; flex-direction: column; gap: 10px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .tile {
-    display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 6px 4px; font: inherit; cursor: pointer;
-    background: #ffffff05; border: 1px solid var(--panel-border); border-radius: 8px; color: var(--text-primary); position: relative; overflow: hidden;
+    display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 10px 6px 8px; font: inherit; cursor: pointer;
+    background: #ffffff05; border: 1px solid var(--panel-border); border-radius: 10px; color: var(--text-primary); position: relative; overflow: hidden;
   }
-  .tile::after { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--stat-color); opacity: .35; }
-  .tile.on { border-color: var(--stat-color); background: color-mix(in srgb, var(--stat-color) 12%, transparent); }
+  .tile::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: var(--stat-color); opacity: 0; }
+  .tile.on { border-color: color-mix(in srgb, var(--stat-color) 60%, transparent); background: color-mix(in srgb, var(--stat-color) 10%, transparent); }
   .tile.on::after { opacity: 1; }
   .tile:hover { background: var(--hover-bg); }
-  .label { font-size: 11px; color: var(--text-secondary); }
-  .val { font-size: 22px; font-weight: 600; color: var(--stat-color); line-height: 1.1; font-variant-numeric: tabular-nums; }
-  .unit { font-size: 10px; color: var(--text-secondary); min-height: 12px; }
+  .label { font-size: 11.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--text-secondary); }
+  .val { font-size: 27px; font-weight: 600; color: var(--stat-color); line-height: 1.1; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+  .unit { font-size: 11.5px; color: var(--text-secondary); min-height: 14px; }
 </style>

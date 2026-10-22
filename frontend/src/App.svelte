@@ -254,12 +254,6 @@
       <Dashboard onleadchange={(lead) => mapView?.onLeadSliderInput(lead)} />
     {/if}
   </div>
-  {#if dashActive}
-    <footer class="dash-footer">
-      <span>Kevin Toren 2026{authSession.ready && authSession.mode === 'cognito' && authSession.hasSession ? ` · ${authSession.userLabel ?? 'signed in'}` : ''}</span>
-      <span>{ui.selectedRegion?.type === 'huc' ? `HUC${String(ui.selectedRegion.huc).length} ${ui.selectedRegion.huc}` : ''}</span>
-    </footer>
-  {/if}
 </div>{:else}<div class="app-loading">Loading configuration…</div>{/if}
 
 <style>
@@ -278,7 +272,8 @@
     --surface: rgba(255,255,255,0.04);
     --radius: 10px;
     --fs-base: 15px;
-    --pane-bg: #171e28;
+    --pane-bg: #121822;
+    --rule: rgba(255,255,255,0.07);
   }
   :global(*) { box-sizing: border-box; }
   :global(html) {
@@ -335,41 +330,32 @@
 
   /* ── One-screen dashboard: map column + analysis column ── */
   .app.dash {
-    background: #0e1117;
-    padding: 0 14px;
+    background: #0b0f16;
+    padding: 0 14px 14px;
   }
   .app.dash .workspace {
     display: grid;
-    grid-template-columns: minmax(270px, 29%) minmax(0, 1fr);
+    grid-template-columns: minmax(290px, 30%) minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
-    gap: 12px;
+    gap: 14px;
     padding-top: 12px;
   }
   .app.dash .geography {
-    gap: 12px;
+    gap: 14px;
   }
   .app.dash .map-box {
     container: map-box / size;
-    border-radius: 10px;
+    border-radius: 12px;
     overflow: hidden;
     border: 1px solid var(--panel-border);
   }
-  /* The draw toolbar sits under the map title in the narrow map column. */
+  /* The draw toolbar sits at the top of the narrow map column. */
   .app.dash .map-box :global(.toolbar) {
-    top: 66px;
-    left: 10px;
+    top: 12px;
+    left: 12px;
   }
   .app.dash .map-box :global(.map-wrap) {
     height: 100%;
-  }
-  .dash-footer {
-    height: 24px;
-    flex: none;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    color: #929dae;
-    font-size: 11px;
   }
   @media (max-width: 900px) {
     .app.dash .workspace {
@@ -378,6 +364,28 @@
       overflow-y: auto;
     }
   }
+
+  /* ── Dashboard-wide idiom (shared by every pane) ── */
+  :global(.eyebrow) {
+    font-size: 11.5px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase;
+    color: #8f9aab; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+  }
+  :global(.eyebrow em) { font-style: normal; color: var(--text-primary); }
+  :global(.chips) { display: inline-flex; align-items: center; gap: 4px; }
+  :global(.chip) {
+    font: inherit; font-size: 12px; font-weight: 600; padding: 3px 9px; line-height: 1.2;
+    background: transparent; border: 1px solid var(--panel-border); border-radius: 6px;
+    color: var(--text-secondary); cursor: pointer; white-space: nowrap;
+  }
+  :global(.chip:hover) { color: var(--text-primary); background: var(--hover-bg); }
+  :global(.chip.active) { color: #fff; border-color: #ffffff38; background: #ffffff12; }
+  :global(.chip:disabled) { opacity: .4; cursor: default; }
+  :global(.seg) { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 7px; overflow: hidden; }
+  :global(.seg button) { font: inherit; font-size: 12px; font-weight: 600; padding: 3px 10px; background: none; border: 0; color: var(--text-secondary); cursor: pointer; white-space: nowrap; }
+  :global(.seg button.active) { background: #ffffff14; color: #fff; }
+  :global(.cap) { font-size: 12px; color: var(--text-secondary); white-space: nowrap; }
+  :global(.plot) { position: relative; flex: 1; min-height: 60px; }
+  :global(.plot-empty) { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; color: var(--text-secondary); font-size: 13px; padding: 0 12%; line-height: 1.5; }
 
   .app-credit {
     position: absolute;

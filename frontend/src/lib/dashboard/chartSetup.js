@@ -8,14 +8,14 @@ Chart.register(LineController, BarController, ScatterController, LineElement, Po
   CategoryScale, LinearScale, Filler, Tooltip, Legend);
 
 Chart.defaults.font.family = "'DM Sans', system-ui, sans-serif";
-Chart.defaults.font.size = 11;
+Chart.defaults.font.size = 11.5;
 Chart.defaults.color = '#a3aab6';
 Chart.defaults.animation = false;
 Chart.defaults.plugins.legend.display = false;
 Chart.defaults.plugins.tooltip.backgroundColor = '#0b111b';
 Chart.defaults.plugins.tooltip.padding = 8;
-Chart.defaults.plugins.tooltip.titleFont = { size: 11, weight: '600' };
-Chart.defaults.plugins.tooltip.bodyFont = { size: 11 };
+Chart.defaults.plugins.tooltip.titleFont = { size: 12, weight: '600' };
+Chart.defaults.plugins.tooltip.bodyFont = { size: 12 };
 Chart.defaults.elements.point.radius = 0;
 Chart.defaults.elements.point.hitRadius = 8;
 Chart.defaults.elements.line.tension = 0.18;
@@ -26,12 +26,12 @@ export const GRID = '#ffffff0b';
 export const CURSOR = '#a4b9d4';
 
 /** Base options for a lead-axis line chart. */
-export function leadAxisOptions({ yTitle = '', yMin, yMax, xTitle = '', ticksLimit = 4, tooltipLabel } = {}) {
+export function leadAxisOptions({ yTitle = '', yMin, yMax, xTitle = '', ticksLimit = 4, tooltipLabel, endLabels = false } = {}) {
   return {
     responsive: true,
     maintainAspectRatio: false,
     interaction: { mode: 'index', intersect: false },
-    layout: { padding: { top: 6, right: 8 } },
+    layout: { padding: { top: 8, right: endLabels ? 48 : 10 } },
     plugins: {
       legend: { display: false },
       tooltip: {
@@ -42,14 +42,14 @@ export function leadAxisOptions({ yTitle = '', yMin, yMax, xTitle = '', ticksLim
       x: {
         grid: { display: false },
         border: { display: false },
-        ticks: { autoSkip: false, maxRotation: 0, font: { size: 10.5 } },
-        title: { display: !!xTitle, text: xTitle, color: '#919daf', font: { size: 10 }, padding: 0 },
+        ticks: { autoSkip: false, maxRotation: 0, font: { size: 11.5 } },
+        title: { display: !!xTitle, text: xTitle, color: '#8f9aab', font: { size: 11 }, padding: 2 },
       },
       y: {
         grid: { color: GRID },
         border: { display: false },
-        ticks: { maxTicksLimit: ticksLimit, font: { size: 10.5 } },
-        title: { display: !!yTitle, text: yTitle, color: '#919daf', font: { size: 10.5 } },
+        ticks: { maxTicksLimit: ticksLimit, font: { size: 11.5 } },
+        title: { display: !!yTitle, text: yTitle, color: '#8f9aab', font: { size: 11 } },
         ...(yMin != null ? { min: yMin } : {}),
         ...(yMax != null ? { max: yMax } : {}),
       },
@@ -78,6 +78,56 @@ export function onClickIndex(fn) {
     if (!Number.isFinite(v)) return;
     const idx = Math.max(0, Math.min(chart.data.labels.length - 1, Math.round(v)));
     fn(idx, chart.data.labels[idx]);
+  };
+}
+
+/**
+ * Direct labels at the right end of every line dataset (the print-figure
+ * idiom: model identity is on the line, not in a legend). ``ident(ds)``
+ * returns the short label; labels are pushed apart vertically so they
+ * never overprint.
+ */
+export function endLabelPlugin(ident, { minGap = 13, font = "600 11px 'DM Sans', system-ui, sans-serif" } = {}) {
+  return {
+    id: 'endLabels',
+    afterDatasetsDraw(chart) {
+      const { ctx, chartArea: a, scales: { x, y } } = chart;
+      if (!x || !y) return;
+      const labels = [];
+      chart.data.datasets.forEach((ds, i) => {
+        const meta = chart.getDatasetMeta(i);
+        if (meta.hidden || ds.type === 'bar' || ds.showLine === false || ds.endLabel === false) return;
+        const text = ident(ds, i);
+        if (!text) return;
+        const data = ds.data || [];
+        let k = data.length - 1;
+        while (k >= 0 && (data[k] == null || (typeof data[k] === 'object' && data[k].y == null))) k--;
+        if (k < 0) return;
+        const el = meta.data[k];
+        if (!el) return;
+        labels.push({ text, x: el.x, y: el.y, color: ds.endLabelColor || ds.borderColor, weight: ds.borderWidth });
+      });
+      if (!labels.length) return;
+      labels.sort((p, q) => p.y - q.y);
+      // Push overlapping labels apart, then clamp into the chart area.
+      for (let i = 1; i < labels.length; i++) {
+        if (labels[i].y - labels[i - 1].y < minGap) labels[i].y = labels[i - 1].y + minGap;
+      }
+      const over = labels[labels.length - 1].y - (a.bottom + 4);
+      if (over > 0) for (const l of labels) l.y -= over;
+      for (let i = labels.length - 2; i >= 0; i--) {
+        if (labels[i + 1].y - labels[i].y < minGap) labels[i].y = labels[i + 1].y - minGap;
+      }
+      ctx.save();
+      ctx.font = font;
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      for (const l of labels) {
+        ctx.fillStyle = l.color;
+        ctx.fillText(l.text, Math.min(l.x, a.right) + 7, l.y);
+      }
+      ctx.restore();
+    },
   };
 }
 

@@ -36,13 +36,14 @@
 </script>
 
 <div class="wrap">
-  <div class="h">tARget v4 date range — <span class="accent">{fmtRange() || '…'}</span> <small>Drill the timeline (year → season → month → week) to set the range; at week or episode depth click a day to inspect it. Purple markers are catalogued AR episodes; the needle scrubs the map's footprints.</small></div>
+  <div class="head">
+    <div class="eyebrow" title="Drill the timeline (year → season → month → week) to set the range; at week or episode depth click a day to inspect it. Purple markers are catalogued AR episodes; the needle scrubs the map's footprints.">Atmospheric-river timeline · <em class="accent">{fmtRange() || '…'}</em></div>
+  </div>
   <ArTimeline episodes={dash.episodes?.episodes ?? []} {dayWinners} winnerLabel="day revision efficiency — lower is better" />
 </div>
 
 <style>
   .wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; overflow: auto; }
-  .h { font-size: 12.5px; font-weight: 600; color: #d5dae2; margin-bottom: 4px; }
-  .h small { display: block; font-weight: 400; color: var(--text-secondary); font-size: 10px; }
+  .head { margin-bottom: 6px; }
   .accent { color: #b9a6ff; }
 </style>

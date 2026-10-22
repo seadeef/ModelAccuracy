@@ -52,7 +52,7 @@
       ctx.beginPath(); ctx.moveTo(ox, a.top); ctx.lineTo(ox, a.bottom); ctx.moveTo(a.left, oy); ctx.lineTo(a.right, oy); ctx.stroke();
       ctx.setLineDash([]);
       ctx.fillStyle = '#919daf';
-      ctx.font = '600 10px "DM Sans", system-ui, sans-serif';
+      ctx.font = '600 11px "DM Sans", system-ui, sans-serif';
       ctx.textBaseline = 'top';
       ctx.textAlign = 'right'; ctx.fillText('steadier · more accurate', a.right - 4, a.top + 3);
       ctx.textAlign = 'left'; ctx.fillText('jumpier · more accurate', a.left + 4, a.top + 3);
@@ -64,7 +64,7 @@
     afterDatasetsDraw(chart) {
       const { ctx, scales: { x, y }, chartArea: a } = chart;
       ctx.save();
-      ctx.font = '600 11px "DM Sans", system-ui, sans-serif';
+      ctx.font = '600 12px "DM Sans", system-ui, sans-serif';
       ctx.textBaseline = 'middle';
       for (const p of points) {
         const px = x.getPixelForValue(p.j);
@@ -106,8 +106,8 @@
         } },
       },
       scales: {
-        x: { type: 'linear', reverse: true, min: Math.max(0, jx0), max: Math.min(1, jx1), grid: { color: '#ffffff0b' }, border: { display: false }, ticks: { font: { size: 10.5 }, maxTicksLimit: 6, includeBounds: false }, title: { display: true, text: `Jumpiness J, runs at lead ${lead + 1} → ${lead} · steadier →`, color: '#919daf', font: { size: 10 } } },
-        y: { type: 'linear', reverse: lowerBetter, min: ay0, max: ay1, grid: { color: '#ffffff0b' }, border: { display: false }, ticks: { font: { size: 10.5 }, maxTicksLimit: 5, includeBounds: false }, title: { display: true, text: `${yLabel} · more accurate ↑`, color: '#919daf', font: { size: 10 } } },
+        x: { type: 'linear', reverse: true, min: Math.max(0, jx0), max: Math.min(1, jx1), grid: { color: '#ffffff0b' }, border: { display: false }, ticks: { font: { size: 11.5 }, maxTicksLimit: 6, includeBounds: false }, title: { display: true, text: `Jumpiness J, runs at lead ${lead + 1} → ${lead} · steadier →`, color: '#8f9aab', font: { size: 11 } } },
+        y: { type: 'linear', reverse: lowerBetter, min: ay0, max: ay1, grid: { color: '#ffffff0b' }, border: { display: false }, ticks: { font: { size: 11.5 }, maxTicksLimit: 5, includeBounds: false }, title: { display: true, text: `${yLabel} · more accurate ↑`, color: '#8f9aab', font: { size: 11 } } },
       },
     };
     return { type: 'scatter', data: { datasets }, options: opts, plugins: [decor] };
@@ -127,21 +127,26 @@
 
 <div class="grid">
   <section class="col">
-    <div class="h">Steadiness against accuracy at lead day {lead} <small>every model on the region's pooled curves · x = J for the run pair ending at this lead ({ui.consistencyThreshold} mm/d, {ui.consistencyScale} km) · y = {statLabel(ui.statistic)} at this lead · origin = <span style:color={pal[ui.model]?.text}>{modelLabel(ui.model)}</span></small></div>
+    <div class="head">
+      <div class="eyebrow" title="Every model at the inspected lead. x = jumpiness J for the run pair ending at this lead (threshold and scale from the consistency pane); y = the selected accuracy statistic at this lead. The selected model is the origin, so the shaded quadrant holds models that beat it on both.">
+        Steadiness against accuracy at lead day <em>{lead}</em>
+      </div>
+      <span class="cap">origin = <b style:color={pal[ui.model]?.text}>{modelLabel(ui.model)}</b></span>
+    </div>
     <div class="plot">
       {#if !supported}
-        <div class="empty">Consistency is computed for the full record and seasons — pick one in the period menu</div>
+        <div class="plot-empty">Consistency is computed for the full record and the four seasons</div>
       {:else if points.length >= 2}
         <ChartCanvas {config} />
       {:else}
-        <div class="empty">{dash.consistencyLoading || dash.accuracyLoading ? 'Loading curves…' : `Not enough models score at lead day ${lead}`}</div>
+        <div class="plot-empty">{dash.consistencyLoading || dash.accuracyLoading ? 'Loading curves…' : `Not enough models score at lead day ${lead}`}</div>
       {/if}
     </div>
   </section>
   <section class="side">
-    <div class="h">Relative to <span style:color={pal[ui.model]?.text}>{modelLabel(ui.model)}</span> <small>{verdict}</small></div>
+    <div class="verdict">{verdict}</div>
     <table>
-      <thead><tr><th></th><th>J</th><th>{statLabel(ui.statistic)}</th><th>steadier</th><th>more accurate</th></tr></thead>
+      <thead><tr><th></th><th title="Jumpiness for the run pair ending at this lead">J</th><th title={statLabel(ui.statistic)}>{statLabel(ui.statistic)}</th><th>Steadier</th><th>More accurate</th></tr></thead>
       <tbody>
         {#each points.slice().sort((a, b) => a.j - b.j) as p (p.key)}
           <tr class:on={p.key === ui.model}>
@@ -154,24 +159,23 @@
         {/each}
       </tbody>
     </table>
-    <div class="foot">Lower J = steadier run-to-run; {lowerBetter ? `lower ${statLabel(ui.statistic)}` : `higher ${statLabel(ui.statistic)}`} = more accurate{mode === 'absolute_lower' ? ' (magnitude)' : ''}. Switch the lead on the lead bar, the statistic on the tiles, and the origin model in the header. Pooled climatology, no uncertainty bands.</div>
+    <div class="cap">Lower J = steadier · {lowerBetter ? 'lower' : 'higher'} {statLabel(ui.statistic)} = more accurate{mode === 'absolute_lower' ? ' (magnitude)' : ''}</div>
   </section>
 </div>
 
 <style>
-  .grid { display: grid; grid-template-columns: 1.4fr 1fr; gap: 14px; flex: 1; min-height: 0; }
+  .grid { display: grid; grid-template-columns: 1.45fr 1fr; gap: 18px; flex: 1; min-height: 0; }
   .col, .side { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-  .side { border-left: 1px solid var(--panel-border); padding-left: 13px; }
-  .h { font-size: 12.5px; font-weight: 600; color: #d5dae2; margin-bottom: 4px; }
-  .h small { display: block; font-weight: 400; color: var(--text-secondary); font-size: 10px; line-height: 1.3; }
-  .plot { position: relative; flex: 1; min-height: 70px; }
-  .empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 12px; text-align: center; padding: 0 10%; }
-  table { border-collapse: collapse; font-size: 11.5px; width: 100%; margin-top: 4px; }
-  th { text-align: right; font-weight: 500; color: var(--text-secondary); font-size: 10px; padding: 1px 4px; white-space: nowrap; }
-  th:first-child { text-align: left; }
-  td { text-align: right; padding: 2px 4px; font-variant-numeric: tabular-nums; border-top: 1px solid #ffffff08; white-space: nowrap; color: var(--text-secondary); }
-  td:first-child { text-align: left; }
+  .side { border-left: 1px solid var(--rule); padding-left: 16px; justify-content: center; gap: 10px; }
+  .head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 6px; min-width: 0; }
+  .head .eyebrow { flex: 1; }
+  .cap b { font-weight: 600; }
+  .verdict { font-size: 15px; line-height: 1.45; color: var(--text-primary); }
+  table { border-collapse: collapse; font-size: 13px; width: 100%; }
+  th { text-align: right; font-weight: 600; color: var(--text-secondary); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; padding: 2px 6px 6px; white-space: nowrap; }
+  th:first-child { text-align: left; padding-left: 0; }
+  td { text-align: right; padding: 6px 6px; font-variant-numeric: tabular-nums; border-top: 1px solid var(--rule); white-space: nowrap; color: var(--text-secondary); }
+  td:first-child { text-align: left; padding-left: 0; }
   td.yes { color: #7fd6a8; font-weight: 600; }
   tr.on td { color: #fff; }
-  .foot { font-size: 10px; color: var(--text-secondary); margin-top: auto; padding-top: 6px; line-height: 1.35; }
 </style>
