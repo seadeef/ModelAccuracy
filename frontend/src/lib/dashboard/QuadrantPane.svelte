@@ -118,7 +118,10 @@
     if (!origin) return `${modelLabel(ui.model)} has no value at lead day ${lead} on this slice.`;
     const o = pal[ui.model]?.ident ?? origin.label;
     if (!beats.length) return `No model is both steadier and more accurate than ${o} at lead day ${lead}.`;
-    return `${beats.map((p) => pal[p.key]?.ident ?? p.label).join(' and ')} ${beats.length === 1 ? 'is' : 'are'} both steadier and more accurate than ${o} at lead day ${lead}.`;
+    const names = beats.map((p) => pal[p.key]?.ident ?? p.label);
+    const list = names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names[0];
+    const verb = names.length === 1 ? 'is' : names.length === 2 ? 'are both' : 'are all';
+    return `${list} ${verb} steadier and more accurate than ${o} at lead day ${lead}.`;
   });
 </script>
 

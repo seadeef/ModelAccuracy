@@ -11,12 +11,38 @@
   import { ymdToIso, isoToYmd } from '../bootstrap.js';
   import BasinNotice from './BasinNotice.svelte';
   import ChartCanvas from './ChartCanvas.svelte';
-  import { leadAxisOptions, cursorPlugin, fmt, fmtDate, alpha } from './chartSetup.js';
+  import { leadAxisOptions, cursorPlugin, fmt, fmtDate, alpha, ordinal } from './chartSetup.js';
   import { selectedLead } from './dashData.svelte.js';
 
   const pal = $derived(palette());
   const huc = $derived(dash.basinHuc);
-  const events = $derived((dash.storms?.events || []).filter((e) => e.basin_hucs?.includes(huc)).slice().reverse());
+  const touching = $derived((dash.storms?.events || []).filter((e) => e.basin_hucs?.includes(huc)));
+  /** Column sort: newest first by default; click a header to rank by size, span or peak. */
+  const COLS = [
+    { key: 'date', label: 'storm', title: 'Sort by date', get: (e) => e.start_date },
+    { key: 'days', label: 'days', title: 'Sort by span', get: (e) => e.span_days ?? 0 },
+    { key: 'basins', label: 'basins', title: 'Sort by basins touched', get: (e) => e.basins ?? 0 },
+    { key: 'volume', label: 'km³', title: 'Sort by PRISM water volume', get: (e) => e.volume_km3 ?? -1 },
+    { key: 'bar', label: '', title: '', get: null },
+    { key: 'peak', label: 'peak', title: 'Sort by peak-day PRISM percentile', get: (e) => e.peak?.prism_pct ?? -1 },
+    { key: 'rank', label: 'rank', title: 'Sort by volume rank (1 = largest of the record)', get: (e) => e.volume_rank ?? Infinity },
+  ];
+  let sortKey = $state('date');
+  let sortDesc = $state(true);
+  function sortBy(col) {
+    if (!col.get) return;
+    if (sortKey === col.key) sortDesc = !sortDesc;
+    else { sortKey = col.key; sortDesc = col.key !== 'rank'; }
+  }
+  const events = $derived.by(() => {
+    const col = COLS.find((c) => c.key === sortKey) ?? COLS[0];
+    const dir = sortDesc ? -1 : 1;
+    return touching.slice().sort((a, b) => {
+      const x = col.get(a), y = col.get(b);
+      const d = x < y ? -1 : x > y ? 1 : 0;
+      return d !== 0 ? dir * d : (a.start_date < b.start_date ? 1 : -1);
+    });
+  });
   const maxVol = $derived(Math.max(1, ...events.map((e) => e.volume_km3 || 0)));
   const selected = $derived(events.find((e) => e.start_date === ui.arRangeStart && e.end_date === ui.arRangeEnd) ?? null);
   let detailId = $state(null);
@@ -84,7 +110,11 @@
     <div class="table-wrap">
       <div class="caption">{dash.storms.region} · {events.length} storms touching {dash.basinInfo?.name}{dash.storms.record ? ` · record ${fmtDate(dash.storms.record.start, { month: 'short', year: 'numeric' })} – ${fmtDate(dash.storms.record.end, { month: 'short', year: 'numeric' })}` : ''} · click a storm to inspect it</div>
       <table>
-        <thead><tr><th>storm</th><th>days</th><th>basins</th><th>km³</th><th></th><th>peak</th><th>rank</th></tr></thead>
+        <thead><tr>
+          {#each COLS as c (c.key)}
+            <th class:sortable={!!c.get} class:sorted={sortKey === c.key} aria-sort={sortKey === c.key ? (sortDesc ? 'descending' : 'ascending') : 'none'} title={c.title} onclick={() => sortBy(c)}>{c.label}{#if sortKey === c.key}<span class="arrow">{sortDesc ? '▾' : '▴'}</span>{/if}</th>
+          {/each}
+        </tr></thead>
         <tbody>
           {#each events as e (e.event_id)}
             <tr class:on={e === selected} class:focus={e === detail} class:muted={!e.in_analysis} onclick={() => pick(e)} title={e.in_analysis ? 'Set the range and day to this storm' : 'Not in the analysed population (observation coverage incomplete)'}>
@@ -93,7 +123,7 @@
               <td>{e.basins}/{dash.storms.record?.basins ?? '—'}</td>
               <td>{e.volume_km3 != null ? fmt(e.volume_km3, e.volume_km3 >= 10 ? 0 : 1) : '—'}</td>
               <td class="bar"><i style:width="{e.volume_km3 ? (100 * e.volume_km3) / maxVol : 0}%"></i></td>
-              <td>{e.peak?.prism_pct != null ? `${fmt(e.peak.prism_pct, 0)}th pct` : '—'}</td>
+              <td>{e.peak?.prism_pct != null ? `${ordinal(e.peak.prism_pct)} pct` : '—'}</td>
               <td>{e.volume_rank ? `#${e.volume_rank}` : '—'}</td>
             </tr>
           {/each}
@@ -104,7 +134,7 @@
       {#if detail}
         <div class="d-title">{fmtDate(detail.start_date)} – {fmtDate(detail.end_date)} <small>{detail.span_days} d · {detail.basins} basins{detail.volume_km3 != null ? ` · ${fmt(detail.volume_km3, 1)} km³ (${fmt(detail.record_share_pct, 1)}% of record)` : ''}</small></div>
         {#if detail.peak?.date}
-          <div class="d-line">Peak {fmtDate(detail.peak.date)}: {fmt(detail.peak.mm, 1)} mm region-mean ({fmt(detail.peak.prism_pct, 0)}th PRISM pct){detail.peak.basin_name ? ` · wettest basin ${detail.peak.basin_name} ${fmt(detail.peak.basin_mm, 0)} mm` : ''}</div>
+          <div class="d-line">Peak {fmtDate(detail.peak.date)}: {fmt(detail.peak.mm, 1)} mm region-mean ({ordinal(detail.peak.prism_pct)} PRISM pct){detail.peak.basin_name ? ` · wettest basin ${detail.peak.basin_name} ${fmt(detail.peak.basin_mm, 0)} mm` : ''}</div>
         {/if}
         {#if jConfig}
           <div class="j-title">Steadiness through the storm <small>J by run pair, pooled over the storm's days on the region mask · lower is steadier</small></div>
@@ -144,6 +174,9 @@
   .caption { font-size: 11px; color: var(--text-secondary); margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
   th { text-align: left; font-weight: 500; color: var(--text-secondary); font-size: 10.5px; padding: 2px 6px 4px 0; position: sticky; top: 0; background: var(--pane-bg); }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover, th.sorted { color: var(--text-primary); }
+  th .arrow { margin-left: 3px; font-size: 9px; }
   td { padding: 3px 6px 3px 0; white-space: nowrap; border-top: 1px solid #ffffff08; font-variant-numeric: tabular-nums; }
   tbody tr { cursor: pointer; }
   tbody tr:hover { background: #ffffff06; }

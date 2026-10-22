@@ -61,6 +61,15 @@ export function leadAxisOptions({ yTitle = '', yMin, yMax, xTitle = '', ticksLim
  * Click handler that maps a click anywhere in the plot to the nearest
  * category index (so a click between points still lands on a lead).
  */
+/** 1 → "1st", 92 → "92nd", 100 → "100th". */
+export function ordinal(n) {
+  const v = Math.round(Number(n));
+  if (!Number.isFinite(v)) return '—';
+  const r100 = v % 100;
+  const suf = r100 >= 11 && r100 <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[v % 10] || 'th');
+  return `${v}${suf}`;
+}
+
 export function onClickIndex(fn) {
   return (evt, _elements, chart) => {
     const x = chart.scales?.x;

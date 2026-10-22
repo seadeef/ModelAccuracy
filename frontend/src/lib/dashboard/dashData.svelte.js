@@ -46,7 +46,6 @@ export function resetDash() {
   dash.episodes = null;
   dash.storms = null;
   dash.forecastByVar = null;
-  dash.valueRange = null;
 }
 
 /** Integer lead the dashboard inspects everywhere (map, tiles, cursors). */

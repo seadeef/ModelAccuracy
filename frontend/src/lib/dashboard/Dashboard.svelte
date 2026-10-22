@@ -253,23 +253,6 @@
     });
   });
 
-  // ── Map overlay value range for the key ──
-  $effect(() => {
-    const model = ui.model;
-    const stat = ui.statistic;
-    const period = gridPeriod();
-    const month = ui.month;
-    const season = ui.season;
-    const sub = period === 'monthly' ? `monthly/${month}` : period === 'seasonal' ? `seasonal/${season}` : 'yearly';
-    queueMicrotask(async () => {
-      try {
-        const resp = await fetch(`${STATIC_BASE}/ranges/${model}/${stat}/${sub}.json`);
-        dash.valueRange = resp.ok ? await resp.json() : null;
-      } catch {
-        dash.valueRange = null;
-      }
-    });
-  });
 </script>
 
 <section class="results">

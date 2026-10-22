@@ -1,7 +1,7 @@
 <script>
   import { onMount } from 'svelte';
   import { initAuth, authSession, beginCognitoSignIn } from './lib/authSession.svelte.js';
-  import { ui, appConfig, applyAppConfig } from './lib/state.svelte.js';
+  import { ui, appConfig, applyAppConfig, isArPeriod } from './lib/state.svelte.js';
   import { fetchConfig, fetchAtmosphericRiverFrame } from './lib/api.js';
   import { getModelLeadBounds, tileUrl } from './lib/tile.js';
   import { exportMapImage } from './lib/exportMapImage.js';
@@ -14,7 +14,27 @@
   import DashHeader from './lib/dashboard/DashHeader.svelte';
   import AccuracyTiles from './lib/dashboard/AccuracyTiles.svelte';
   import MapOverlay from './lib/dashboard/MapOverlay.svelte';
+  import { dash } from './lib/dashboard/dashData.svelte.js';
+  import { STATIC_BASE } from './lib/constants.js';
   let mapView = $state();
+
+  // Value range of the raster overlay for the colour key (bare map and dashboard alike).
+  $effect(() => {
+    const model = ui.model;
+    const stat = ui.statistic;
+    const period = isArPeriod(ui.period) ? 'yearly' : ui.period;
+    const month = ui.month;
+    const season = ui.season;
+    const sub = period === 'monthly' ? `monthly/${month}` : period === 'seasonal' ? `seasonal/${season}` : 'yearly';
+    queueMicrotask(async () => {
+      try {
+        const resp = await fetch(`${STATIC_BASE}/ranges/${model}/${stat}/${sub}.json`);
+        dash.valueRange = resp.ok ? await resp.json() : null;
+      } catch {
+        dash.valueRange = null;
+      }
+    });
+  });
   let configReady = $state(false);
   /** The one-screen dashboard opens whenever a region is selected. */
   const dashActive = $derived(!!ui.selectedRegion);
@@ -118,10 +138,13 @@
   const showPointGuide = $derived(
     ui.activeTool === 'point' && !ui.hasUsedPinTool,
   );
+  // The first-use hint hides once an area tool has been used, except that a
+  // watershed drill in progress keeps showing its breadcrumb (the only place
+  // the current drill depth is reported).
   const showBoundaryGuide = $derived(
     (ui.activeTool === 'state' || ui.activeTool === 'county' || ui.activeTool === 'watershed'
       || ui.activeTool === 'military')
-    && !ui.hasUsedAreaDrawTool,
+    && (!ui.hasUsedAreaDrawTool || (ui.activeTool === 'watershed' && ui.wbdDrillPath.length > 0)),
   );
   const boundaryGuideText = $derived.by(() => {
     if (ui.activeTool === 'county') return 'Click a county to analyze';
@@ -178,6 +201,7 @@
               onLocationSelect={handleLocationSelect}
               onSearchStatus={handleSearchStatus}
             />
+            <MapOverlay bare />
           {:else}
             <MapOverlay />
           {/if}

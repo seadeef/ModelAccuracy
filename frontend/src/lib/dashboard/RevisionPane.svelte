@@ -241,7 +241,7 @@
         {/if}
       </div>
       <div class="model-key">
-        {#each appConfig.models as m}<span><i style:background={pal[m.key]?.text}></i>{m.label}</span>{/each}
+        {#each appConfig.models as m}<span class:absent={rev && !paths[m.key]} title={rev && !paths[m.key] ? `${m.label}: no complete run sequence for this day` : ''}><i style:background={pal[m.key]?.text}></i>{m.label}</span>{/each}
         {#if pathView && observed != null}<span><i class="obs"></i>Observed</span>{/if}
       </div>
     </div>
@@ -295,6 +295,7 @@
   .empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-secondary); font-size: 12px; }
   .model-key { display: flex; gap: 10px; align-items: center; color: #bec6d2; font-size: 11px; }
   .model-key span { display: flex; align-items: center; gap: 5px; }
+  .model-key span.absent { opacity: 0.38; text-decoration: line-through; }
   .model-key i { width: 14px; height: 3px; border-radius: 2px; }
   .model-key i.obs { background: repeating-linear-gradient(90deg, #7fd6a8 0 4px, transparent 4px 7px); }
   .rev-summary { width: 250px; flex: none; border-left: 1px solid var(--panel-border); padding-left: 13px; display: flex; flex-direction: column; justify-content: center; gap: 14px; min-height: 0; overflow: auto; }

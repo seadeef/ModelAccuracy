@@ -47,6 +47,42 @@
   let map = null;
   let initialLoad = true;
   let resizeObserver = null;
+  /** Region to frame after the next container resize (the dashboard narrows the map). */
+  let fitPending = null;
+  let fitTimer = null;
+
+  /** [w, s, e, n] of a selected region, or null for a point / unknown shape. */
+  function regionBounds(region) {
+    if (!region) return null;
+    if (region.type === 'rectangle') {
+      const [sw, ne] = region.coordinates;
+      return [Math.min(sw[0], ne[0]), Math.min(sw[1], ne[1]), Math.max(sw[0], ne[0]), Math.max(sw[1], ne[1])];
+    }
+    if (region.type === 'polygon') {
+      const pts = region.coordinates || [];
+      if (pts.length < 3) return null;
+      return pts.reduce((b, [x, y]) => [Math.min(b[0], x), Math.min(b[1], y), Math.max(b[2], x), Math.max(b[3], y)],
+        [Infinity, Infinity, -Infinity, -Infinity]);
+    }
+    if (Array.isArray(region.bounds) && region.bounds.length === 4 && region.bounds.every(Number.isFinite)) {
+      return region.bounds;
+    }
+    return null;
+  }
+
+  /** Frame the region in the map box as it is sized right now. */
+  function fitRegion(region) {
+    const b = regionBounds(region);
+    if (!map || !b) return;
+    map.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 28, maxZoom: 10, duration: 500 });
+  }
+
+  function flushPendingFit() {
+    if (!fitPending || fitPending !== ui.selectedRegion) { fitPending = null; return; }
+    const r = fitPending;
+    fitPending = null;
+    fitRegion(r);
+  }
 
   function mapStyleUrl() {
     if (!appConfig.maptilerApiKey) return FALLBACK_STYLE_URL;
@@ -1538,9 +1574,24 @@
     // The dashboard resizes the map container (full screen ↔ one column);
     // MapLibre only tracks window resizes on its own.
     if (typeof ResizeObserver !== 'undefined' && mapContainer) {
-      resizeObserver = new ResizeObserver(() => { map?.resize(); });
+      resizeObserver = new ResizeObserver(() => {
+        map?.resize();
+        // The region was framed on the full-width map; frame it again in the column.
+        if (fitPending) flushPendingFit();
+      });
       resizeObserver.observe(mapContainer);
     }
+  });
+
+  // A newly selected region is framed after the dashboard has resized the map
+  // (ResizeObserver above); if no resize follows (the dashboard was already
+  // open, e.g. a basin picked from the AR layer), frame it after a short wait.
+  $effect(() => {
+    const region = ui.selectedRegion;
+    clearTimeout(fitTimer);
+    if (!region || region.type === 'point' || !regionBounds(region)) { fitPending = null; return; }
+    fitPending = region;
+    fitTimer = setTimeout(flushPendingFit, 450);
   });
 
   onDestroy(() => {
