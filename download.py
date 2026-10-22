@@ -9,6 +9,8 @@ Usage examples:
     python download.py --forecast --model gfs                          # just GFS
     python download.py --catchup                                       # fill gap through yesterday
     python download.py --catchup --model gfs                           # just GFS + PRISM
+    python download.py --ar                                            # index tARget v4 ERA5 data
+    python download.py --ar --start-date 2025-01-01 --end-date 2025-01-31
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from atmospheric_rivers import TARGET_AR_DATASET_URL, download_default_dataset
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL, ModelConfig
 from downloaders.prism_downloader import PRISMDownloaderParallel
 
@@ -100,6 +103,29 @@ def _run_prism_years(start_year: int, end_year: int) -> None:
         remove_zip_after_extract=True,
     )
     dl.download_year_range(start_year=start_year, end_year=end_year)
+
+
+def _run_ar_download(
+    *, start_date: str | None = None, end_date: str | None = None,
+    force: bool = False,
+) -> list[Path]:
+    """Delegate acquisition to the canonical tARget adapter."""
+    downloaded = download_default_dataset(
+        start_date=start_date, end_date=end_date, force=force,
+    )
+    if start_date is None:
+        print(
+            f"\nUpdated {len(downloaded)} canonical tARget virtual source index. "
+            "No frame data was requested.\n"
+            "Cache a range with --start-date/--end-date or --start-year/--end-year."
+        )
+    else:
+        print(
+            f"\nUpdated {len(downloaded)} canonical tARget virtual source(s). Next run:\n"
+            "  python3 compute_stats.py --only episodes\n"
+            "  python3 export_static.py"
+        )
+    return downloaded
 
 
 def _run_download(config: ModelConfig, args: argparse.Namespace) -> None:
@@ -279,23 +305,54 @@ def main() -> None:
                                  "then extract into stats format")
     mode_group.add_argument("--catchup", action="store_true",
                             help="Auto-detect last downloaded date and download through yesterday")
+    mode_group.add_argument(
+        "--ar", action="store_true",
+        help=f"Index/cache tARget v4 ERA5 data from {TARGET_AR_DATASET_URL}",
+    )
 
     parser.add_argument("--start-date",
-                        help="Start date (YYYY-MM-DD). Defaults to today.")
+                        help="Start date (YYYY-MM-DD). Model/PRISM default: today; AR default: index only")
     parser.add_argument("--end-date",
-                        help="End date (YYYY-MM-DD). Defaults to start date.")
+                        help="End date (YYYY-MM-DD). Defaults to start date when one is supplied")
     parser.add_argument("--no-prism", action="store_true",
                         help="Skip PRISM observation download")
     parser.add_argument("--start-year", type=int,
                         help="Start year (downloads full years)")
     parser.add_argument("--end-year", type=int,
                         help="End year (downloads full years)")
+    parser.add_argument(
+        "--force", action="store_true",
+        help="With --ar and an explicit range, redownload blocks touched by that range",
+    )
     args = parser.parse_args()
 
     if args.catchup and (args.start_date or args.end_date or args.start_year or args.end_year):
         parser.error("--catchup cannot be combined with explicit date/year ranges")
     if args.forecast and (args.start_date or args.end_date or args.start_year or args.end_year):
         parser.error("--forecast cannot be combined with explicit date/year ranges")
+    if args.ar:
+        if args.model is not None or args.no_prism:
+            parser.error("--ar cannot be combined with model or PRISM options")
+        if args.start_year and (args.start_date or args.end_date):
+            parser.error("Use either AR date options or AR year options, not both")
+        if args.end_year and not args.start_year:
+            parser.error("--end-year requires --start-year")
+        if args.start_year:
+            ar_start = f"{args.start_year:04d}-01-01"
+            ar_end = f"{(args.end_year or args.start_year):04d}-12-31"
+        elif args.start_date or args.end_date:
+            ar_start = args.start_date or args.end_date
+            ar_end = args.end_date or args.start_date
+        else:
+            ar_start = ar_end = None
+        try:
+            _run_ar_download(start_date=ar_start, end_date=ar_end, force=args.force)
+        except (ValueError, OSError) as exc:
+            parser.error(str(exc))
+        return
+
+    if args.force:
+        parser.error("--force is currently supported only with --ar")
 
     models = _resolve_models(args)
 

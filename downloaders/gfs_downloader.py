@@ -36,6 +36,7 @@ _this_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_this_dir.parent))
 sys.path.insert(0, str(_this_dir))
 
+from accumulation import daily_from_cumulative
 from base import BaseDownloader, grib_first_field, normalize_and_crop
 from forecast_variables import kelvin_to_celsius, wind_speed
 
@@ -74,14 +75,14 @@ def _convert_grib_to_npy(grib_path: Path, prev_grib_path: Path | None, npy_path:
     cur, lats, lons = grib_first_field(grib_path)
     if prev_grib_path is not None and prev_grib_path.exists():
         prev, _, _ = grib_first_field(prev_grib_path)
-        diff = cur - prev
     else:
         # No predecessor (f024 has no f000 cumulative — model starts at 0).
-        diff = cur
+        prev = None
+    # APCP is kg m^-2 == mm; the shared core differences and clips tiny
+    # negative subtraction noise (crop commutes with the elementwise math).
+    diff = daily_from_cumulative(cur, prev)
 
     cropped, kept_lats, kept_lons = normalize_and_crop(diff, lats, lons)
-    # APCP is kg m^-2 == mm; clip tiny negative noise from subtraction.
-    np.clip(cropped, 0.0, None, out=cropped)
 
     npy_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(npy_path, cropped)

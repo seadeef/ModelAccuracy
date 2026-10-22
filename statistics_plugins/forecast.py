@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from statistics_plugins.base import StatisticSpec
+from statistics_plugins.base import StatisticDefinition, StatisticSpec, StorageDescriptor
 
 
-class ForecastPlugin:
+def forecast_definition() -> StatisticDefinition:
     """Registry entry for the raw GFS precipitation forecast.
 
     This plugin is not used by compute_stats.py (no observation comparison).
@@ -11,19 +11,13 @@ class ForecastPlugin:
     via the shared registry.
     """
 
-    spec = StatisticSpec(
+    return StatisticDefinition(StatisticSpec(
         name="forecast",
         label="Forecast",
         units="mm",
         render_field="precip",
         colormap="sequential",
-    )
-
-    def init_accumulator(self, shape):
-        raise NotImplementedError("Forecast plugin is display-only")
-
-    def update(self, *args, **kwargs):
-        raise NotImplementedError("Forecast plugin is display-only")
-
-    def finalize(self, *args, **kwargs):
-        raise NotImplementedError("Forecast plugin is display-only")
+        scope="display", axis="none", periods=(),
+        storage=StorageDescriptor(kind="display"),
+        map_support=True, winner_support=False,
+    ))

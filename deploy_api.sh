@@ -15,6 +15,7 @@
 #   AWS_REGION             default us-west-1
 #   AWS_PROFILE            optional
 #   PYTHON_RUNTIME_VERSION default 3.12 — MUST match the stack's PythonRuntime
+#   SKIP_PUSH=1            build and validate the zip locally; do not call AWS
 #   SKIP_SMOKE=1           skip the post-deploy /health check
 #
 # Usage:
@@ -24,22 +25,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
-
-if [[ -f "$ROOT/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$ROOT/.env"
-  set +a
-fi
-
-AWS_REGION="${AWS_REGION:-us-west-1}"
-STACK_NAME="${STACK_NAME:-raincheck}"
+source "$ROOT/deploy_common.sh"
+deploy_init "$ROOT"
 FN_NAME="${LAMBDA_FUNCTION_NAME:-${STACK_NAME}-api}"
 PY_VER="${PYTHON_RUNTIME_VERSION:-3.12}"
-if [[ -n "${AWS_PROFILE:-}" ]]; then
-  export AWS_PROFILE
-  echo "==> Using AWS_PROFILE=${AWS_PROFILE}"
-fi
 
 BUILD_DIR="$ROOT/build/lambda"
 PKG_DIR="$BUILD_DIR/package"
@@ -82,10 +71,17 @@ echo "==> zipping"
 (cd "$PKG_DIR" && zip -qr "$ZIP_PATH" .)
 ZIP_MB=$(du -m "$ZIP_PATH" | cut -f1)
 echo "==> ${ZIP_PATH} (${ZIP_MB} MB)"
+zip -T "$ZIP_PATH" >/dev/null
+echo "==> zip integrity OK"
 if (( ZIP_MB > 45 )); then
   echo "ERROR: zip exceeds the ~50 MB direct-upload limit. Trim dependencies" >&2
   echo "       (requirements.lambda.txt) or switch update-function-code to --s3-bucket." >&2
   exit 1
+fi
+
+if [[ -n "${SKIP_PUSH:-}" ]]; then
+  echo "==> SKIP_PUSH set — package built locally; not updating Lambda"
+  exit 0
 fi
 
 echo "==> update-function-code ${FN_NAME}"

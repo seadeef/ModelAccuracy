@@ -42,6 +42,7 @@ _this_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_this_dir.parent))
 sys.path.insert(0, str(_this_dir))
 
+from accumulation import daily_from_cumulative
 from base import BaseDownloader, grib_first_field, normalize_and_crop
 from forecast_variables import kelvin_to_celsius, rh_from_dewpoint, wind_speed
 
@@ -66,8 +67,14 @@ def _save_grid(output_dir: Path, kept_lats, kept_lons) -> None:
         np.save(glon, kept_lons)
 
 
-def _convert_grib_to_npy(grib_path: Path, prev_grib_path: Path | None, npy_path: Path, output_dir: Path) -> None:
-    """Compute tp(fh) - tp(fh-24), crop to CONUS, save as .npy. cfgrib is not thread-safe."""
+def _convert_grib_to_npy(grib_path: Path, prev_grib_path: Path | None, npy_path: Path, output_dir: Path,
+                         daily_fn=daily_from_cumulative) -> None:
+    """Compute tp(fh) - tp(fh-24), crop to CONUS, save as .npy. cfgrib is not thread-safe.
+
+    ``daily_fn`` is the accumulation core turning (cur, prev) cumulative fields
+    into a daily mm total — AIFS tp is kg m^-2 == mm (daily_from_cumulative);
+    the IFS control subclass passes the meters variant.
+    """
     import numpy as np
 
     if npy_path.exists():
@@ -76,14 +83,14 @@ def _convert_grib_to_npy(grib_path: Path, prev_grib_path: Path | None, npy_path:
     cur, lats, lons = grib_first_field(grib_path)
     if prev_grib_path is not None and prev_grib_path.exists():
         prev, _, _ = grib_first_field(prev_grib_path)
-        diff = cur - prev
     else:
         # No predecessor (e.g. f24 with no f0) — treat tp as a 24h delta from 0.
-        diff = cur
+        prev = None
+    # The shared core differences and clips tiny negative noise (crop commutes
+    # with the elementwise math).
+    diff = daily_fn(cur, prev)
 
     cropped, kept_lats, kept_lons = normalize_and_crop(diff, lats, lons)
-    # AIFS tp units are kg m^-2 == mm; just clip tiny negative noise.
-    np.clip(cropped, 0.0, None, out=cropped)
 
     npy_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(npy_path, cropped)
@@ -139,6 +146,13 @@ class DownloadTask:
 
 
 class AIFSDownloaderParallel(BaseDownloader):
+    # Subclass hooks (see ifs_downloader.IFSControlDownloaderParallel): the
+    # accumulation core for tp → daily mm, the archive's first available init,
+    # and the name used in progress banners.
+    DAILY_FN = staticmethod(daily_from_cumulative)
+    FIRST_DATE = AIFS_FIRST_DATE
+    SOURCE_NAME = "AIFS (ECMWF)"
+
     def __init__(
         self,
         output_dir: str = "model_data/aifs",
@@ -311,7 +325,8 @@ class AIFSDownloaderParallel(BaseDownloader):
             kind, npy_out = item[0], item[1]
             try:
                 if kind == "precip":
-                    _convert_grib_to_npy(item[2], item[3], npy_out, self.output_dir)
+                    _convert_grib_to_npy(item[2], item[3], npy_out, self.output_dir,
+                                         daily_fn=self.DAILY_FN)
                 elif kind == "temp":
                     _convert_temp_to_npy(item[2], npy_out, self.output_dir)
                 elif kind == "wind":
@@ -339,10 +354,10 @@ class AIFSDownloaderParallel(BaseDownloader):
     # ── Public download interface ───────────────────────────────────
 
     def _download(self, start: datetime, end: datetime, *, forecast_hours=None, level: str = "surface"):
-        # Clip to AIFS archive availability.
-        if start < AIFS_FIRST_DATE:
-            print(f"AIFS archive starts {AIFS_FIRST_DATE.date()}; clipping start.")
-            start = AIFS_FIRST_DATE
+        # Clip to archive availability.
+        if start < self.FIRST_DATE:
+            print(f"{self.SOURCE_NAME} archive starts {self.FIRST_DATE.date()}; clipping start.")
+            start = self.FIRST_DATE
         cycle = AIFS_CYCLE
 
         init_dates: list[datetime] = []
@@ -375,7 +390,7 @@ class AIFSDownloaderParallel(BaseDownloader):
                         tasks.append(DownloadTask(d, cycle, fh, param))
 
         print("\n" + "=" * 70)
-        print("Parallel AIFS (ECMWF) download")
+        print(f"Parallel {self.SOURCE_NAME} download")
         print(f"Period: {start.date()} to {end.date()} | Daily")
         print(f"Cycle: {cycle:02d}z | Lead 1-{AIFS_MAX_LEAD_H // 24} days")
         print(f"tp fhours per init: {tp_fhours}")

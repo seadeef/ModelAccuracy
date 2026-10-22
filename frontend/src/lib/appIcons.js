@@ -19,6 +19,10 @@ export const drawToolGlyph = {
   military: '<path d="M8 1.8l5 1.9v3.6c0 3.3-2.1 5.8-5 7-2.9-1.2-5-3.7-5-7V3.7z"/>',
 };
 
+/** Storm (cloud + lightning bolt) for the AR-mode toggle; parent fill="none" stroke="currentColor" stroke-width="1.3" */
+export const glyphStorm =
+  '<path d="M4.8 9.4a2.4 2.4 0 0 1-.3-4.8 3.3 3.3 0 0 1 6.4-.8 2.5 2.5 0 0 1 .2 5"/><path d="M8.9 8.2l-3.1 3.7h2.2l-1 2.9 3.4-4H8.2z" fill="currentColor" stroke="none"/>';
+
 /** Map toolbar download; parent stroke-width="1.5" */
 export const glyphDownloadMap = '<path d="M2 10v3h12v-3"/><path d="M8 2v8M5 7l3 3 3-3"/>';
 

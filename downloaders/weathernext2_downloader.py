@@ -58,6 +58,7 @@ _this_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_this_dir.parent))
 sys.path.insert(0, str(_this_dir))
 
+from accumulation import daily_from_buckets_meters
 from base import BaseDownloader
 from forecast_variables import kelvin_to_celsius, rh_from_specific_humidity
 from model_registry import US_CROP_BOUNDS
@@ -334,10 +335,10 @@ class WeatherNext2DownloaderParallel(BaseDownloader):
         _save_grid(self.output_dir, kept_lats, kept_lons)
 
         for k, fh in enumerate(daily_fhours):
-            # precip: sum the four 6h buckets of this day, m → mm, clip noise.
+            # precip: the shared core sums the day's four 6h buckets, m → mm,
+            # clips noise (to_grid reorders only — commutes with the math).
             p_idxs = _precip_time_indices(fh)
-            precip = to_grid(precip_all[p_idxs].sum(axis=0)) * 1000.0
-            np.clip(precip, 0.0, None, out=precip)
+            precip = to_grid(daily_from_buckets_meters(precip_all[p_idxs]))
             np.save(init_dir / f"f{fh:03d}_surface.npy", precip)
 
             # temp: K → °C ; wind: direct m/s.

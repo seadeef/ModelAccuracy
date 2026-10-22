@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
 import json
 import time
 from collections import OrderedDict
@@ -19,7 +20,8 @@ from statistics_plugins.consistency import (
     DEFAULT_THRESHOLD_MM,
     combo_tag,
 )
-from statistics_plugins.registry import CONSISTENCY_STAT_NAMES, STATISTICS_BY_NAME
+from statistics_plugins.registry import STATISTICS_BY_NAME
+from statistics_plugins.registry import EPISODE_CATALOG_FILENAME
 
 # ---------------------------------------------------------------------------
 # In-process caches — keyed so that S3 round-trips are skipped entirely on
@@ -308,7 +310,16 @@ def _get_bin_cell(
 # so monthly queries fall through to no_data.
 # ---------------------------------------------------------------------------
 
-_CONSISTENCY_BIN_DTYPES = {"jumpiness": np.float16, "convergence": np.float32}
+def _packed_stat_names() -> set[str]:
+    """Packed consistency stats with per-lead regional entries.
+
+    Filtered to scope=="region": revision_efficiency is also packed_grid but
+    scope=="region_pooled" — a single pooled scalar served only by
+    ``revision_efficiency_for_region``, never as per-lead consistency entries.
+    """
+    return {name for name, entry in STATISTICS_BY_NAME.items()
+            if entry.spec.storage.kind == "packed_grid"
+            and entry.spec.scope == "region"}
 
 
 def _consistency_bin_relative_path(
@@ -322,16 +333,23 @@ def _consistency_bin_relative_path(
     threshold: float,
     scale: int,
 ) -> Path:
-    path = Path("model_data") / model / stat_name
-    if stat_name == "jumpiness":
-        # threshold/scale are whitelisted in request_models (VALID_THRESHOLDS/
-        # VALID_SCALES), so the tag can only name a computed combination.
+    spec = STATISTICS_BY_NAME[stat_name].spec
+    # The export directory is the first segment of the storage path template,
+    # not the statistic name: revision_efficiency's planes live under
+    # ``revision/`` (jumpiness/convergence match their own names).
+    path = Path("model_data") / model / spec.storage.path_template.split("/", 1)[0]
+    if spec.axis == "lead_pair" and "thresholds_mm" in spec.parameters:
+        # Only the threshold/scale-parameterized stat (jumpiness) has combo
+        # subdirectories; revision planes share the lead_pair axis but have a
+        # single un-tagged tree. threshold/scale are whitelisted in
+        # request_models (VALID_THRESHOLDS/VALID_SCALES), so the tag can only
+        # name a computed combination.
         path = path / combo_tag(threshold, scale)
     if period == "monthly" and month is not None:
         path = path / "monthly" / month
     elif period == "seasonal" and season is not None:
         path = path / "seasonal" / season
-    prefix = "pair" if stat_name == "jumpiness" else "lead"
+    prefix = "pair" if spec.axis == "lead_pair" else "lead"
     return path / f"{prefix}_{lead_key}.bin"
 
 
@@ -359,7 +377,7 @@ def _get_consistency_bin(
         threshold=threshold, scale=scale,
     ))
     raw_bytes = store.read_bytes(relative_path)
-    dtype = _CONSISTENCY_BIN_DTYPES[stat_name]
+    dtype = np.dtype(STATISTICS_BY_NAME[stat_name].spec.storage.export_dtype)
     flat = np.frombuffer(raw_bytes, dtype=dtype).astype(np.float32)
     if flat.size % 2:
         raise OSError(f"Corrupt consistency bin: {relative_path}")
@@ -393,6 +411,34 @@ def _read_consistency_bin_or_none(
         return None
 
 
+def _pooled_num_den(
+    planes: np.ndarray,
+    *,
+    mask: np.ndarray | None = None,
+    flat_idx: int | None = None,
+) -> tuple[float, float] | None:
+    """Region-summed (numerator, denominator) from packed planes.
+
+    None when the region is empty/off-grid, either pooled term is non-finite,
+    or the pooled denominator is <= 0 (the ratio is undefined — missing, not
+    zero). Shared by the finalized consistency values and the raw MSE pooling
+    of ``revision_efficiency_for_region``.
+    """
+    if flat_idx is not None:
+        if flat_idx >= planes.shape[1]:
+            return None
+        num = float(planes[0, flat_idx])
+        den = float(planes[1, flat_idx])
+    else:
+        if mask is None or mask.size != planes.shape[1] or not np.any(mask):
+            return None
+        num = float(planes[0][mask].sum(dtype=np.float64))
+        den = float(planes[1][mask].sum(dtype=np.float64))
+    if not np.isfinite(num) or not np.isfinite(den) or den <= 0.0:
+        return None
+    return num, den
+
+
 def _consistency_value(
     stat_name: str,
     planes: np.ndarray,
@@ -407,24 +453,210 @@ def _consistency_value(
     region over the pooled dates — undefined, per the statistic's definition
     (missing, not zero). Convergence is pooled RMSE sqrt(Σsse/Σcount).
     """
-    if flat_idx is not None:
-        if flat_idx >= planes.shape[1]:
-            return None
-        num = float(planes[0, flat_idx])
-        den = float(planes[1, flat_idx])
-    else:
-        if mask is None or mask.size != planes.shape[1] or not np.any(mask):
-            return None
-        num = float(planes[0][mask].sum(dtype=np.float64))
-        den = float(planes[1][mask].sum(dtype=np.float64))
-    if not np.isfinite(num) or not np.isfinite(den) or den <= 0.0:
+    pooled = _pooled_num_den(planes, mask=mask, flat_idx=flat_idx)
+    if pooled is None:
         return None
-    if stat_name == "jumpiness":
-        return num / den
-    return float(np.sqrt(num / den))
+    num, den = pooled
+    finalize = STATISTICS_BY_NAME[stat_name].spec.storage.finalize
+    ratio = num / den
+    if finalize == "sqrt_ratio":
+        return float(np.sqrt(ratio))
+    if finalize == "one_minus_ratio":
+        return float(1.0 - ratio)
+    return float(ratio)
 
 
 _consistency_meta_cache: dict[tuple[str, str], dict | None] = {}
+
+
+_basin_episode_cache = _BoundedLRU(16)
+
+
+class ScopesNotComputedError(LookupError):
+    """episodes.json predates schema v3: no per-basin ``scopes`` block."""
+
+
+# HUC6 is the (only) basin level the episode catalog is computed for.
+EPISODE_HUC_LEVEL = 6
+
+# Pooled scope keys, in display order (CONTRACT §0/§6).
+EPISODE_SCOPES = ("ar_all", "non_ar", "all_days")
+
+_EPISODE_METADATA_KEYS = (
+    "id", "start_date", "end_date", "active_days",
+    "peak_basin_area_fraction", "forecast_dates",
+)
+
+
+# Episode catalogs are computed per HUC2 region. California (18) keeps the
+# original ``episodes.json`` name; every other region is ``episodes_huc{NN}.json``
+# (mirrors ``stats_pipeline.episodes.episode_catalog_filename``, not imported so
+# the Lambda package stays free of the offline pipeline).
+CALIFORNIA_HUC2 = "18"
+
+
+def episode_catalog_filename(huc2: str) -> str:
+    huc2 = str(huc2)
+    if huc2 == CALIFORNIA_HUC2:
+        return EPISODE_CATALOG_FILENAME
+    stem, ext = EPISODE_CATALOG_FILENAME.rsplit(".", 1)
+    return f"{stem}_huc{huc2}.{ext}"
+
+
+def huc2_of(huc: str | None) -> str:
+    """HUC2 region prefix of a HUC6 code (California when absent)."""
+    return str(huc)[:2] if huc else CALIFORNIA_HUC2
+
+
+def _basin_episodes(store: StaticStore, model: str, huc2: str = CALIFORNIA_HUC2) -> dict:
+    key = (store.cache_key, model, str(huc2))
+
+    def load() -> dict:
+        rel = str(Path("model_data") / model / episode_catalog_filename(huc2))
+        return json.loads(store.read_text(rel))
+
+    return _basin_episode_cache.get_or_compute(key, load)
+
+
+def _episode_metadata(episode: dict) -> dict:
+    """Display metadata for one episode — never its statistics values.
+
+    ``cluster_id`` (v3: the bootstrap resampling unit, CONTRACT §0) rides
+    along; it is None for a pre-v3 catalog rather than fabricated.
+    """
+    meta = {key: episode[key] for key in _EPISODE_METADATA_KEYS}
+    meta["cluster_id"] = episode.get("cluster_id")
+    return meta
+
+
+def _scopes_available(basin: dict) -> list[str]:
+    """Pooled scopes computed for this basin ([] on a pre-v3 catalog)."""
+    scopes = basin.get("scopes") or {}
+    return [scope for scope in EPISODE_SCOPES if scope in scopes]
+
+
+def episode_catalog_for_huc(
+    store: StaticStore,
+    model: str,
+    huc: str,
+) -> dict:
+    """Return metadata only for a basin's canonical episode catalog."""
+    data = _basin_episodes(store, model, huc2_of(huc))
+    basin = data.get("basins", {}).get(huc)
+    if basin is None:
+        raise KeyError(f"HUC6 {huc} is not present in the basin episode catalog")
+    base = {
+        "schema_version": data["schema_version"],
+        "model": model,
+        "huc": huc,
+        "name": basin["name"],
+        "lead_min": data["lead_min"],
+        "lead_max": data["lead_max"],
+        "lock_in_fraction": data["lock_in_fraction"],
+        "minimum_basin_area_fraction": data.get("minimum_basin_area_fraction"),
+    }
+    base["episodes"] = [_episode_metadata(episode) for episode in basin["episodes"]]
+    base["episode_count"] = len(base["episodes"])
+    base["scopes_available"] = _scopes_available(basin)
+    return base
+
+
+def episode_catalog_all_basins(
+    store: StaticStore, model: str, huc2: str = CALIFORNIA_HUC2,
+) -> dict:
+    """All-basin episode metadata listing (GET /api/ar/episodes without huc).
+
+    Shape per CONTRACT §6: ``{model, huc_level: 6, basins: [{huc, name,
+    episode_count, episodes: [metadata-only entries]}]}`` — supports
+    episode-first entry into AR mode before a basin is chosen. Statistics
+    values are withheld here exactly as in the per-basin catalog.
+    """
+    data = _basin_episodes(store, model, huc2)
+    basins_out = []
+    for huc, basin in sorted(data.get("basins", {}).items()):
+        episodes = [_episode_metadata(episode) for episode in basin.get("episodes", [])]
+        basins_out.append({
+            "huc": huc,
+            "name": basin["name"],
+            "episode_count": len(episodes),
+            "episodes": episodes,
+        })
+    return {
+        "model": model,
+        "huc2": str(huc2),
+        "huc_level": EPISODE_HUC_LEVEL,
+        "basins": basins_out,
+    }
+
+
+def episode_statistics(
+    store: StaticStore, model: str, huc: str, episode_id: str,
+    stat_names: list[str],
+) -> dict:
+    data = _basin_episodes(store, model, huc2_of(huc))
+    basin = data.get("basins", {}).get(huc)
+    if basin is None:
+        raise KeyError(f"HUC6 {huc} is not present in the basin episode catalog")
+    episode = next((item for item in basin["episodes"] if item["id"] == episode_id), None)
+    if episode is None:
+        raise KeyError(f"AR episode {episode_id} is not available for HUC6 {huc}")
+    return {
+        name: {
+            **episode[name],
+            "units": STATISTICS_BY_NAME[name].spec.units,
+            "no_data": episode[name].get("value") is None,
+        }
+        for name in stat_names
+    }
+
+
+def scope_statistics(
+    store: StaticStore, model: str, huc: str, scope: str,
+    stat_names: list[str],
+) -> dict:
+    """Pooled scope statistics (ar_all / non_ar) from episodes.json v3.
+
+    The per-statistic objects pass through verbatim (value/value_ci/clusters/…
+    per CONTRACT §3) with ``units`` and ``no_data`` added — same mechanics as
+    ``episode_statistics``. A catalog without a ``scopes`` block (schema v2)
+    raises :class:`ScopesNotComputedError`, which the service maps to a 404
+    telling the operator to rerun the episodes stage.
+    """
+    data = _basin_episodes(store, model, huc2_of(huc))
+    basin = data.get("basins", {}).get(huc)
+    if basin is None:
+        raise KeyError(f"HUC6 {huc} is not present in the basin episode catalog")
+    scopes = basin.get("scopes")
+    if not scopes:
+        raise ScopesNotComputedError(
+            "pooled AR scopes not computed; rerun compute_stats.py --only episodes"
+        )
+    block = scopes.get(scope)
+    if block is None:
+        raise KeyError(f"Scope {scope!r} is not available for HUC6 {huc}")
+    result = {}
+    for name in stat_names:
+        entry = block.get(name)
+        if entry is None:
+            raise KeyError(f"Statistic {name!r} is not present in the {scope!r} scope for HUC6 {huc}")
+        result[name] = {
+            **entry,
+            "units": STATISTICS_BY_NAME[name].spec.units,
+            "no_data": entry.get("value") is None,
+        }
+    return result
+
+
+def _consistency_meta(store: StaticStore, model: str) -> dict | None:
+    """Cached consistency_meta.json (None when absent — older exports)."""
+    key = (store.cache_key, model)
+    if key not in _consistency_meta_cache:
+        try:
+            text = store.read_text(str(Path("model_data") / model / "consistency_meta.json"))
+            _consistency_meta_cache[key] = json.loads(text)
+        except (FileNotFoundError, OSError, ValueError):
+            _consistency_meta_cache[key] = None
+    return _consistency_meta_cache[key]
 
 
 def _consistency_dates(
@@ -437,14 +669,7 @@ def _consistency_dates(
     only valid over identical valid-date sets — the count makes a mismatch
     visible. None when the meta file is absent (older exports).
     """
-    key = (store.cache_key, model)
-    if key not in _consistency_meta_cache:
-        try:
-            text = store.read_text(str(Path("model_data") / model / "consistency_meta.json"))
-            _consistency_meta_cache[key] = json.loads(text)
-        except (FileNotFoundError, OSError, ValueError):
-            _consistency_meta_cache[key] = None
-    meta = _consistency_meta_cache[key]
+    meta = _consistency_meta(store, model)
     if not meta:
         return None
     counts = meta.get("date_counts", {})
@@ -887,6 +1112,134 @@ def _masked_mean(values: np.ndarray, mask: np.ndarray) -> float | None:
     return float(finite.mean())
 
 
+def _point_flat_idx(
+    lats: np.ndarray, lons: np.ndarray, n_lon: int, region: dict,
+) -> int | None:
+    """Nearest-cell flat index for a point region; None when the click is
+    off-grid (more than ~one grid step from the nearest cell center on either
+    axis) — honest no-data instead of reporting the nearest edge cell."""
+    lon = float(region["coordinates"][0])
+    lat = float(region["coordinates"][1])
+    lat_idx = int(np.argmin(np.abs(lats - lat)))
+    lon_idx = int(np.argmin(np.abs(lons - lon)))
+    lat_step = float(abs(lats[1] - lats[0])) if lats.size > 1 else float("inf")
+    lon_step = float(abs(lons[1] - lons[0])) if lons.size > 1 else float("inf")
+    if (abs(float(lats[lat_idx]) - lat) > lat_step
+            or abs(float(lons[lon_idx]) - lon) > lon_step):
+        return None
+    return lat_idx * n_lon + lon_idx
+
+
+def revision_efficiency_for_region(
+    *,
+    static_root: Path | None = None,
+    store: StaticStore | None = None,
+    model: str,
+    region: dict,
+    period: str = "yearly",
+    season: str | None = None,
+) -> dict[str, object]:
+    """Grid-pooled revision efficiency R over a region (CONTRACT §5).
+
+    numer = Σ_pairs (Σ_mask rev_sse / Σ_mask rev_cnt) — pooled mean squared
+    revision per run pair, summed over pairs lead_min..lead_max-1 from the
+    ``revision/`` packed planes.
+    denom = MSE(lead_max) − MSE(lead_min), each MSE the pooled Σ_mask sse /
+    Σ_mask cnt from the convergence planes (MSE, not the finalized RMSE).
+    R = numer/denom. denom <= 0 → value None + ``skill_gain_nonpositive``.
+    Any missing bin, empty/off-grid region, or invalid pooled term → explicit
+    no-data — a partial pooling is never reported as the region's value.
+    No CI: there is no per-date data online for the gridded planes.
+
+    ``dates`` is the pooled valid-date count from consistency_meta.json (the
+    revision planes are accumulated over the same scorable-date set as the
+    consistency stats); ``definition`` marks the value as grid-pooled so it is
+    never conflated with the basin-history R of the episode catalog.
+    """
+    resolved_store = store or LocalStaticStore(static_root or default_static_site_root())
+    entry: dict[str, object] = {
+        "value": None,
+        "units": STATISTICS_BY_NAME["revision_efficiency"].spec.units,
+        "no_data": True,
+        "dates": _consistency_dates(resolved_store, model, period, None, season),
+        "definition": "grid-pooled",
+    }
+
+    # Lead range: prefer consistency_meta.json (describes the data actually on
+    # disk); fall back to the model registry for older exports without meta.
+    meta = _consistency_meta(resolved_store, model) or {}
+    config = MODEL_REGISTRY.get(model)
+    lead_min = meta.get("lead_days_min")
+    lead_max = meta.get("lead_days_max")
+    if lead_min is None and config is not None:
+        lead_min = config.lead_days_min
+    if lead_max is None and config is not None:
+        lead_max = config.lead_days_max
+    if lead_min is None or lead_max is None or int(lead_max) - int(lead_min) < 1:
+        return entry
+    lead_min, lead_max = int(lead_min), int(lead_max)
+
+    lats, lons, n_lat, n_lon = _get_grid(resolved_store, model)
+    mask: np.ndarray | None = None
+    flat_idx: int | None = None
+    if region.get("type") == "point":
+        flat_idx = _point_flat_idx(lats, lons, n_lon, region)
+        if flat_idx is None:
+            return entry
+    else:
+        mask = _build_region_mask(lats, lons, n_lat, n_lon, region)
+        if not np.any(mask):
+            return entry
+
+    # Fan out the bin reads on the leaf executor (pure reads — pool invariant
+    # holds). threshold/scale are irrelevant here (neither stat is combo-
+    # tagged) but the shared read path requires them; pass the defaults.
+    tasks = {("revision_efficiency", str(pair)) for pair in range(lead_min, lead_max)}
+    tasks |= {("convergence", str(lead_min)), ("convergence", str(lead_max))}
+    planes_by_key: dict[tuple[str, str], np.ndarray | None] = {}
+    future_to_key = {
+        _EXECUTOR.submit(
+            _read_consistency_bin_or_none,
+            resolved_store, model, stat_name, lead_key,
+            period=period, month=None, season=season,
+            threshold=DEFAULT_THRESHOLD_MM, scale=DEFAULT_SCALE_KM,
+        ): (stat_name, lead_key)
+        for stat_name, lead_key in tasks
+    }
+    for fut in as_completed(future_to_key):
+        planes_by_key[future_to_key[fut]] = fut.result()
+
+    numer = 0.0
+    for pair in range(lead_min, lead_max):
+        planes = planes_by_key.get(("revision_efficiency", str(pair)))
+        if planes is None:
+            return entry
+        pooled = _pooled_num_den(planes, mask=mask, flat_idx=flat_idx)
+        if pooled is None:
+            return entry
+        rev_sse, rev_cnt = pooled
+        numer += rev_sse / rev_cnt
+
+    mse: dict[int, float] = {}
+    for lead in (lead_min, lead_max):
+        planes = planes_by_key.get(("convergence", str(lead)))
+        if planes is None:
+            return entry
+        pooled = _pooled_num_den(planes, mask=mask, flat_idx=flat_idx)
+        if pooled is None:
+            return entry
+        sse, cnt = pooled
+        mse[lead] = sse / cnt
+
+    denom = mse[lead_max] - mse[lead_min]
+    if denom <= 0.0:
+        entry["skill_gain_nonpositive"] = True
+        return entry
+    entry["value"] = float(numer / denom)
+    entry["no_data"] = False
+    return entry
+
+
 def stats_for_region(
     *,
     static_root: Path | None = None,
@@ -902,11 +1255,13 @@ def stats_for_region(
     scale: int | None = None,
 ) -> dict[str, dict[str, float | None | str | bool]]:
     lead_key = str(lead)
-    stat_names = stat_names or list(STATISTICS_BY_NAME)
+    stat_names = stat_names or [name for name, entry in STATISTICS_BY_NAME.items()
+                                if entry.spec.scope == "region"]
     # Consistency stats aggregate as ratios of region-summed accumulator
     # planes, so they take a separate read path from the per-cell-mean stats.
-    consistency_names = [s for s in stat_names if s in CONSISTENCY_STAT_NAMES]
-    stat_names = [s for s in stat_names if s not in CONSISTENCY_STAT_NAMES]
+    packed_names = _packed_stat_names()
+    consistency_names = [s for s in stat_names if s in packed_names]
+    stat_names = [s for s in stat_names if s not in packed_names]
     threshold = DEFAULT_THRESHOLD_MM if threshold is None else float(threshold)
     scale = DEFAULT_SCALE_KM if scale is None else int(scale)
     resolved_store = store or LocalStaticStore(static_root or default_static_site_root())
@@ -915,20 +1270,12 @@ def stats_for_region(
     result: dict[str, dict[str, float | None | str | bool]] = {}
 
     if region_type == "point":
-        lon = float(region["coordinates"][0])
-        lat = float(region["coordinates"][1])
-        lat_idx = int(np.argmin(np.abs(lats - lat)))
-        lon_idx = int(np.argmin(np.abs(lons - lon)))
-        # Honest no-data for an off-grid click: if the nearest cell center is more
-        # than ~one grid step away on either axis, the point isn't inside any cell,
-        # so don't report that edge cell as though it were the point's value.
-        lat_step = float(abs(lats[1] - lats[0])) if lats.size > 1 else float("inf")
-        lon_step = float(abs(lons[1] - lons[0])) if lons.size > 1 else float("inf")
-        if (abs(float(lats[lat_idx]) - lat) > lat_step
-                or abs(float(lons[lon_idx]) - lon) > lon_step):
+        # Honest no-data for an off-grid click (see _point_flat_idx): don't
+        # report the nearest edge cell as though it were the point's value.
+        flat_idx = _point_flat_idx(lats, lons, n_lon, region)
+        if flat_idx is None:
             return {stat_name: _no_data_entry(stat_name)
                     for stat_name in stat_names + consistency_names}
-        flat_idx = lat_idx * n_lon + lon_idx
         # One cell needed — the cached full bin is indexed, not the whole grid re-read.
         cells = _cells_for_stats_parallel(
             resolved_store,
@@ -1002,12 +1349,10 @@ def stats_for_region(
 
 def _winner_metric_label(stat_name: str) -> str:
     """Human-readable description of how models are ranked for this statistic."""
-    if stat_name == "rb":
-        # O5: RB is signed (near zero is best), so rank by |regional signed-mean|
-        # to match the signed mean shown in the panel (not the mean of per-cell
-        # |rb|).
+    mode = STATISTICS_BY_NAME[stat_name].spec.winner_mode
+    if mode == "absolute_lower":
         return "region_abs_mean_value_lower_better"
-    if stat_name == "cc":
+    if mode == "higher":
         return "region_mean_value_higher_better"
     return "region_mean_value_lower_better"
 
@@ -1016,9 +1361,10 @@ def _loss_from_value(v: float, stat_name: str) -> float | None:
     """Per-cell loss (lower is better): abs for signed RB, negated for CC, else identity."""
     if not np.isfinite(v):
         return None
-    if stat_name == "rb":
+    mode = STATISTICS_BY_NAME[stat_name].spec.winner_mode
+    if mode == "absolute_lower":
         return float(abs(v))
-    if stat_name == "cc":
+    if mode == "higher":
         return float(-v)
     return float(v)
 
@@ -1045,9 +1391,10 @@ def _region_loss_scalar(
     finite = masked[np.isfinite(masked)]
     if finite.size == 0:
         return None
-    if stat_name == "rb":
+    mode = STATISTICS_BY_NAME[stat_name].spec.winner_mode
+    if mode == "absolute_lower":
         return float(abs(np.mean(finite)))
-    if stat_name == "cc":
+    if mode == "higher":
         return float(-np.mean(finite))
     return float(np.mean(finite))
 

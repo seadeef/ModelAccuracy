@@ -1,4 +1,11 @@
 import { STATIC_BASE, MONTH_NAMES, SEASON_NAMES, TILE_IMAGE_BOUNDS_WGS84 } from './constants.js';
+import {
+  AR_FOOTPRINT_FILL_COLOR,
+  AR_FOOTPRINT_FILL_OPACITY,
+  AR_FOOTPRINT_OUTLINE_COLOR,
+  AR_FOOTPRINT_OUTLINE_OPACITY,
+  AR_FOOTPRINT_OUTLINE_WIDTH,
+} from './atmosphericRiverMapLayer.js';
 
 function rangeJsonUrl(model, statistic, period, month, season) {
   const b = `${STATIC_BASE}/ranges/${model}/${statistic}`;
@@ -71,6 +78,10 @@ function drawColorBar(ctx, x, y, w, h, colormap) {
 /**
  * Build a titled PNG (map + legend) using the overlay already shown on the map
  * (browser cache / decoded pixels) and static range JSON from export_static.
+ *
+ * `arFootprints` (optional GeoJSON FeatureCollection) draws the AR-mode
+ * footprint polygons over the raster with the exact styling the on-map layer
+ * uses; `arFrameLabel` (optional string) is appended to the title line.
  */
 export async function exportMapImage({
   overlayUrl,
@@ -84,6 +95,8 @@ export async function exportMapImage({
   models,
   statisticsMeta,
   region,
+  arFootprints = null,
+  arFrameLabel = '',
 }) {
   const src = overlayUrl || fallbackTileUrl;
   if (!src) throw new Error('No tile URL for export');
@@ -124,7 +137,8 @@ export async function exportMapImage({
     periodLabel = SEASON_NAMES[season] ? `${SEASON_NAMES[season]} (${season.toUpperCase()})` : season.toUpperCase();
   }
 
-  const title = `${modelLabel} ${statLabel} (${units})  \u2014  ${leadLabel}  \u2014  ${periodLabel}${buildBoundaryTitleSuffix(region)}`;
+  const arTitleSuffix = arFrameLabel ? `  \u2014  ${arFrameLabel}` : '';
+  const title = `${modelLabel} ${statLabel} (${units})  \u2014  ${leadLabel}  \u2014  ${periodLabel}${buildBoundaryTitleSuffix(region)}${arTitleSuffix}`;
 
   const MIN_IMG_WIDTH = 800;
   const TITLE_H = 48;
@@ -207,6 +221,23 @@ export async function exportMapImage({
     ];
   };
 
+  // Trace every ring of a Polygon/MultiPolygon into the current path
+  // (caller begins the path; even-odd fill/clip handles holes).
+  const traceGeometryPath = (geometry) => {
+    for (const poly of geometryParts(geometry)) {
+      for (const ring of poly) {
+        if (!Array.isArray(ring) || ring.length < 3) continue;
+        for (let i = 0; i < ring.length; i++) {
+          const [lng, lat] = ring[i];
+          const [px, py] = lngLatToCanvas(lng, lat);
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+        ctx.closePath();
+      }
+    }
+  };
+
   ctx.fillStyle = 'rgb(240,240,240)';
   ctx.fillRect(mapOffsetX, mapOffsetY, scaledW, scaledH);
   ctx.imageSmoothingEnabled = scale > 1;
@@ -216,45 +247,54 @@ export async function exportMapImage({
     ctx.save();
     // Build a clip path from the boundary polygon(s); even-odd handles holes.
     ctx.beginPath();
-    for (const poly of geometryParts(clipGeometry)) {
-      for (const ring of poly) {
-        if (!Array.isArray(ring) || ring.length < 3) continue;
-        for (let i = 0; i < ring.length; i++) {
-          const [lng, lat] = ring[i];
-          const [px, py] = lngLatToCanvas(lng, lat);
-          if (i === 0) ctx.moveTo(px, py);
-          else ctx.lineTo(px, py);
-        }
-        ctx.closePath();
-      }
-    }
+    traceGeometryPath(clipGeometry);
     ctx.clip('evenodd');
     ctx.drawImage(tileImg, srcX, srcY, srcW, srcH, mapOffsetX, mapOffsetY, scaledW, scaledH);
     ctx.restore();
+  } else {
+    ctx.drawImage(tileImg, srcX, srcY, srcW, srcH, mapOffsetX, mapOffsetY, scaledW, scaledH);
+  }
 
-    // Outline the admin shape so the boundary is legible against the white background.
+  // AR footprints over the raster (and under the boundary outline / legend),
+  // styled exactly like the on-map layer and clipped the same way the raster is.
+  if (arFootprints?.features?.length) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(mapOffsetX, mapOffsetY, scaledW, scaledH);
+    ctx.clip();
+    if (clipGeometry) {
+      ctx.beginPath();
+      traceGeometryPath(clipGeometry);
+      ctx.clip('evenodd');
+    }
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    for (const feat of arFootprints.features) {
+      ctx.beginPath();
+      traceGeometryPath(feat?.geometry);
+      ctx.globalAlpha = AR_FOOTPRINT_FILL_OPACITY;
+      ctx.fillStyle = AR_FOOTPRINT_FILL_COLOR;
+      ctx.fill('evenodd');
+      ctx.globalAlpha = AR_FOOTPRINT_OUTLINE_OPACITY;
+      ctx.strokeStyle = AR_FOOTPRINT_OUTLINE_COLOR;
+      ctx.lineWidth = AR_FOOTPRINT_OUTLINE_WIDTH;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  if (clipGeometry) {
+    // Outline the boundary shape (above the footprints) so it is legible
+    // against the white background.
     ctx.save();
     ctx.lineJoin = 'round';
     ctx.lineCap = 'round';
     ctx.strokeStyle = 'rgba(40,40,40,0.85)';
     ctx.lineWidth = 1.4;
-    for (const poly of geometryParts(clipGeometry)) {
-      for (const ring of poly) {
-        if (!Array.isArray(ring) || ring.length < 3) continue;
-        ctx.beginPath();
-        for (let i = 0; i < ring.length; i++) {
-          const [lng, lat] = ring[i];
-          const [px, py] = lngLatToCanvas(lng, lat);
-          if (i === 0) ctx.moveTo(px, py);
-          else ctx.lineTo(px, py);
-        }
-        ctx.closePath();
-        ctx.stroke();
-      }
-    }
+    ctx.beginPath();
+    traceGeometryPath(clipGeometry);
+    ctx.stroke();
     ctx.restore();
-  } else {
-    ctx.drawImage(tileImg, srcX, srcY, srcW, srcH, mapOffsetX, mapOffsetY, scaledW, scaledH);
   }
 
   ctx.beginPath();

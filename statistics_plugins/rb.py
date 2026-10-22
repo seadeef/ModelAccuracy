@@ -21,6 +21,7 @@ class RBPlugin:
         units="%",
         render_field="value",
         colormap="diverging_reversed",
+        winner_mode="absolute_lower",
     )
 
     def init_accumulator(self, shape: tuple[int, int]) -> dict[str, np.ndarray]:

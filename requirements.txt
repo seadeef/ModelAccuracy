@@ -23,6 +23,7 @@ fsspec==2026.4.0
 gcsfs==2026.4.0
 zarr>=3.0.0
 h5py>=3.10.0
+h5netcdf>=1.3.0
 Pillow>=10.0.0
 
 # Build-time only (load_boundaries.py --wbd — not imported at API runtime)

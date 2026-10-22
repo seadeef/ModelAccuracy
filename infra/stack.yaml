@@ -229,11 +229,11 @@ Resources:
             Statement:
               - Sid: ReadStaticData
                 Effect: Allow
-                Action: [s3:GetObject]
+                Action: ['s3:GetObject']
                 Resource: !Sub '${StaticBucket.Arn}/*'
               - Sid: ListStaticData
                 Effect: Allow
-                Action: [s3:ListBucket]
+                Action: ['s3:ListBucket']
                 Resource: !GetAtt StaticBucket.Arn
               - Sid: UserItems
                 Effect: Allow
@@ -299,6 +299,17 @@ Resources:
       Action: lambda:InvokeFunctionUrl
       Principal: '*'
       FunctionUrlAuthType: NONE
+
+  # New Function URLs require both resource-policy statements (AWS rollout
+  # began October 2025). Restrict the broader InvokeFunction action so it is
+  # usable only through this function's URL.
+  ApiFunctionUrlInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: '*'
+      InvokedViaFunctionUrl: true
 
   WarmRule:
     Type: AWS::Events::Rule

@@ -16,6 +16,7 @@ export const STAT_COLORS = {
   rb:    '#e0a4ff',   // lavender (inherited from the Bias stat it replaced)
   jumpiness:   '#8b93ff',  // periwinkle (consistency: run-to-run J)
   convergence: '#e392cf',  // orchid (consistency: RMSE-to-truth by lead)
+  revision_efficiency: '#9d7bff',  // violet (consistency: revision/skill-gain ratio R)
 };
 
 export function statColor(key) {

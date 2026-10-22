@@ -1,8 +1,14 @@
 <script>
   import { ui } from '../state.svelte.js';
   import { authSession } from '../authSession.svelte.js';
-  import { drawToolGlyph, glyphSave, glyphLoad } from '../appIcons.js';
+  import { drawToolGlyph, glyphSave, glyphLoad, glyphStorm } from '../appIcons.js';
   import { saveRegion, listSavedRegions } from '../api.js';
+  import { transitionAnalysisMode } from '../modeController.js';
+
+  const arModeActive = $derived(ui.mode === 'atmospheric-rivers');
+  function toggleArMode() {
+    transitionAnalysisMode(arModeActive ? 'accuracy' : 'atmospheric-rivers');
+  }
 
   function selectTool(tool) {
     if (ui.activeTool === tool) {
@@ -135,11 +141,15 @@
 <svelte:window onclick={handleClickOutside} />
 
 <div class="toolbar">
+  <!-- AR mode's only entry point is clicking a precomputed basin on the map, so
+       the free-form area / admin selection tools are DISABLED (not hidden) while
+       it is active — the toolbar keeps its shape and the AR button its place. -->
   {#each drawTools as tool}
     <button
       class="tool-btn"
-      class:active={ui.activeTool === tool.id}
-      title={toolTitle(tool)}
+      class:active={!arModeActive && ui.activeTool === tool.id}
+      disabled={arModeActive}
+      title={arModeActive ? `${tool.label} — unavailable in AR mode` : toolTitle(tool)}
       onclick={() => selectTool(tool.id)}
     >
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
@@ -153,8 +163,9 @@
   {#each adminTools as tool}
     <button
       class="tool-btn"
-      class:active={ui.activeTool === tool.id}
-      title={toolTitle(tool)}
+      class:active={!arModeActive && ui.activeTool === tool.id}
+      disabled={arModeActive}
+      title={arModeActive ? `${tool.label} — unavailable in AR mode` : toolTitle(tool)}
       onclick={() => selectTool(tool.id)}
     >
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
@@ -162,6 +173,22 @@
       </svg>
     </button>
   {/each}
+
+  <div class="toolbar-sep" aria-hidden="true"></div>
+
+  <button
+    class="tool-btn tool-btn--ar"
+    class:active={arModeActive}
+    title={arModeActive
+      ? 'Atmospheric-river mode — click to return to Explore'
+      : 'Atmospheric-river mode — show AR footprints and episode/AR-day scoring for California basins'}
+    aria-pressed={arModeActive}
+    onclick={toggleArMode}
+  >
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
+      {@html glyphStorm}
+    </svg>
+  </button>
 
   {#if isLoggedIn}
     <div class="toolbar-sep" aria-hidden="true"></div>
@@ -289,10 +316,23 @@
     border-color: rgba(110, 181, 255, 0.2);
     box-shadow: 0 0 8px rgba(110, 181, 255, 0.1);
   }
-  .tool-btn:hover:not(.active) {
+  .tool-btn:hover:not(.active):not(:disabled) {
     background: var(--hover-bg);
     color: var(--text-primary);
     border-color: var(--panel-border);
+  }
+  .tool-btn:disabled {
+    opacity: 0.32;
+    cursor: default;
+  }
+
+  /* AR mode is a presentation mode, not a selection tool — tint its active
+     state storm-violet so it reads distinctly from the blue tool selection. */
+  .tool-btn--ar.active {
+    background: rgba(150, 130, 255, 0.14);
+    color: #b9a6ff;
+    border-color: rgba(150, 130, 255, 0.28);
+    box-shadow: 0 0 8px rgba(150, 130, 255, 0.12);
   }
 
   .save-wrap, .load-wrap {

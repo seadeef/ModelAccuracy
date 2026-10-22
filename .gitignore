@@ -23,6 +23,7 @@ boundary_data/
 prism_data/
 stats_output/
 tiles_output/
+target_ar_data/
 static_export/
 
 # Secrets
@@ -35,3 +36,7 @@ static_export/
 *.swo
 .claude
 .cursor
+
+
+# Sweep run logs
+sweep_logs/

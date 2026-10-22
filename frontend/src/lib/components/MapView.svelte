@@ -2,9 +2,10 @@
   import { onMount, onDestroy } from 'svelte';
   import maplibregl from 'maplibre-gl';
   import 'maplibre-gl/dist/maplibre-gl.css';
-  import { appConfig, ui, accuracyStatKeys, isConsistencyStat } from '../state.svelte.js';
+  import { appConfig, ui, isConsistencyStat } from '../state.svelte.js';
   import { FALLBACK_STYLE_URL, TILE_IMAGE_BOUNDS_WGS84, STATIC_BASE } from '../constants.js';
-  import { fetchConfig } from '../api.js';
+  import { fetchAtmosphericRiverFrame, fetchArEpisodes } from '../api.js';
+  import { createAtmosphericRiverMapLayer } from '../atmosphericRiverMapLayer.js';
   import {
     tileUrl, preloadLeads, clearLeadImages, getLeadImage,
     compositeToDataUrlCached, getModelLeadBounds,
@@ -27,6 +28,7 @@
     hasChildren,
     nextHucLevel,
     buildPendingFromFeature,
+    resolveHucRegion,
   } from '../hucSelection.js';
   import { loadMilitaryGeo, militaryPointsFc } from '../militarySelection.js';
 
@@ -36,12 +38,15 @@
   const sourceId = 'bias-source';
   const layerId = 'bias-layer';
 
+  const atmosphericRiverLayer = createAtmosphericRiverMapLayer(fetchAtmosphericRiverFrame);
+
   /** Spacing between `updateImage` calls so rapid scrubbing does not abort every in-flight load (MapLibre AbortError). */
   const OVERLAY_UPDATE_MIN_MS = 56;
 
   let mapContainer;
   let map = null;
   let initialLoad = true;
+  let resizeObserver = null;
 
   function mapStyleUrl() {
     if (!appConfig.maptilerApiKey) return FALLBACK_STYLE_URL;
@@ -247,6 +252,11 @@
     loadTilesetInterp(ui.statistic, frac);
   }
 
+  // Mode is presentation-only (see modeController.js): switching between Explore
+  // and AR mode never resets the raster, lead cache, or selection. The AR
+  // footprint layer add/clear is handled reactively by the ui.mode/ui.arFramePath
+  // $effect below, so there is no imperative mode-change hook anymore.
+
   export function flyToLocation(data) {
     if (!map) return;
     const type = data.feature_type || '';
@@ -303,6 +313,17 @@
    * boundaries (e.g. all HUC2s) stay on-screen alongside the deepened region.
    */
   let wbdAccum = new Map();
+
+  /**
+   * AR-mode basin picker: the entry point in atmospheric-river mode is to click
+   * one of the precomputed HUC6 basins, highlighted with the same boundary
+   * layer the watershed selector uses. `arBasinFc` is the FeatureCollection of
+   * only those basins that have AR statistics for `arBasinModel`; rebuilt when
+   * the model changes (precomputed coverage is per-model).
+   */
+  let arBasinFc = null;
+  let arBasinModel = null;
+  let arBasinGen = 0;
 
   const boundaryHover = createBoundaryHoverHandlers(() => map, {
     sourceId: boundarySourceId,
@@ -393,6 +414,7 @@
       hoveredIdRef: boundaryHoveredRef,
       onClick: boundaryModeLoaded === 'watershed-drill' ? handleWbdClick
         : boundaryModeLoaded === 'military' ? handleMilitaryClick
+        : boundaryModeLoaded === 'ar-basins' ? handleArBasinClick
         : handleAdminClick,
       onHoverEnter: boundaryHover.onHoverEnter,
       onHoverLeave: boundaryHover.onHoverLeave,
@@ -655,11 +677,19 @@
     if (!f) return;
     const pending = buildPendingFromFeature(f, wbdGeoCache);
     if (!pending.huc) return;
+    // HUC6 is the AR analysis grain: in AR mode the drill auto-finalizes as soon
+    // as the pending unit reaches level 6 instead of descending deeper (Explore
+    // mode keeps the full HUC8/10/12 drill).
+    const arGrain = ui.mode === 'atmospheric-rivers';
     wbdPending = pending;
     ui.wbdDrillPath = [...ui.wbdDrillPath, pending.name || pending.huc];
     // The user has engaged the watershed tool — drop the center guide hint
     // (matches the state/county tools, which clear it on their first click).
     ui.hasUsedAreaDrawTool = true;
+    if (arGrain && pending.level >= 6) {
+      finalizeWbd(pending);
+      return;
+    }
     await ensureWbdIndex();
     // Pull this HUC2's descendant metadata AND prefetch its immediate children in
     // parallel: the pass-through loop needs hasChildren (from the subtree) and, for
@@ -691,6 +721,12 @@
       if (!children || children.length !== 1) break; // load failed/superseded, or a real split
       const only = children[0];
       const onlyHuc = String(only.properties?.huc ?? only.id ?? '');
+      if (arGrain && onlyHuc.length >= 6) {
+        // AR grain: the lone descendant is (at least) a HUC6 coextensive with
+        // the clicked unit — select it directly instead of descending further.
+        finalizeWbd(buildPendingFromFeature(only, wbdGeoCache));
+        return;
+      }
       if (!hasChildren(onlyHuc)) {
         // Sole descendant is a leaf with the clicked unit's extent — just select it.
         finalizeWbd(pending);
@@ -706,6 +742,112 @@
     if (boundaryModeLoaded !== 'watershed-drill') {
       teardownBoundarySelectionLayer();
       await startWbdDrill();
+    }
+  }
+
+  // ── AR-mode basin picker ────────────────────────────────────────────
+  /**
+   * FeatureCollection of the precomputed HUC6 basins for `model` (the ones the
+   * AR-episode catalog reports statistics for). Geometry is resolved through the
+   * same WBD chunks the watershed drill loads, so a picked basin is byte-for-byte
+   * the region a map drill would produce. Cached per model.
+   */
+  async function buildArBasinFc(model) {
+    if (arBasinFc && arBasinModel === model) return arBasinFc;
+    let catalog;
+    try {
+      catalog = await fetchArEpisodes({ model });
+    } catch {
+      return null;
+    }
+    const basins = catalog?.basins ?? [];
+    const features = (await Promise.all(
+      basins.map(async (b) => {
+        const code = String(b?.huc ?? '');
+        if (code.length !== 6) return null;
+        try {
+          const region = await resolveHucRegion(code);
+          if (!region?.geometry) return null;
+          return {
+            type: 'Feature',
+            id: code,
+            properties: { huc: code, level: 6, name: region.name || b.name || '' },
+            geometry: region.geometry,
+          };
+        } catch {
+          return null;
+        }
+      }),
+    )).filter(Boolean);
+    arBasinFc = { type: 'FeatureCollection', features };
+    arBasinModel = model;
+    return arBasinFc;
+  }
+
+  function handleArBasinClick(e) {
+    const f = e.features?.[0];
+    if (!f) return;
+    const code = String(f.properties?.huc ?? f.id ?? '');
+    // MapLibre hands back a tile-clipped geometry fragment; look the full basin
+    // up from the cached collection so the region/dim-mask cover the whole basin.
+    const full = arBasinFc?.features?.find((x) => String(x.id) === code);
+    const geometry = full?.geometry || f.geometry;
+    const bounds = geomBboxFromRegion(geometry);
+    ui.selectedRegion = {
+      type: 'huc',
+      huc: code,
+      level: 6,
+      name: full?.properties?.name || f.properties?.name || '',
+      bounds,
+      geometry,
+    };
+    ui.hasUsedAreaDrawTool = true;
+    teardownBoundarySelectionLayer();
+    if (Array.isArray(bounds) && bounds.every(Number.isFinite)) {
+      map.fitBounds(
+        [[bounds[0], bounds[1]], [bounds[2], bounds[3]]],
+        { padding: 60, maxZoom: 9, duration: 700 },
+      );
+    }
+  }
+
+  async function setupArBasinLayer(model) {
+    if (!map) return;
+    if (ui.selectedRegion?.type === 'huc') return;
+    const gen = ++arBasinGen;
+    const fc = await buildArBasinFc(model);
+    // Superseded (model changed / region picked / left AR mode) while resolving.
+    if (gen !== arBasinGen || !map || ui.mode !== 'atmospheric-rivers'
+        || ui.selectedRegion?.type === 'huc') {
+      return;
+    }
+    teardownBoundarySelectionLayer();
+    if (!fc || !fc.features.length) {
+      boundaryModeLoaded = null;
+      return;
+    }
+    setupBoundaryLayer(map, {
+      sourceId: boundarySourceId,
+      fillLayerId: boundaryFillLayerId,
+      outlineLayerId: boundaryOutlineLayerId,
+      data: fc,
+      dimLayerId,
+      drawFillLayerId,
+      onClick: handleArBasinClick,
+      onHoverEnter: boundaryHover.onHoverEnter,
+      onHoverLeave: boundaryHover.onHoverLeave,
+    });
+    boundaryModeLoaded = 'ar-basins';
+    // Frame the CA basins so the highlighted picker targets are visible.
+    const union = fc.features.reduce((acc, feat) => {
+      const b = geomBboxFromRegion(feat.geometry);
+      if (!acc) return b;
+      return [Math.min(acc[0], b[0]), Math.min(acc[1], b[1]),
+        Math.max(acc[2], b[2]), Math.max(acc[3], b[3])];
+    }, null);
+    if (union && union.every(Number.isFinite)) {
+      map.fitBounds([[union[0], union[1]], [union[2], union[3]]],
+        { padding: 60, maxZoom: 8, duration: 700 });
     }
   }
 
@@ -1224,6 +1366,7 @@
   // no dep is tracked, and later button clicks never re-run this effect.
   $effect(() => {
     const tool = ui.activeTool;
+    const mode = ui.mode;
     if (!map) return;
     const canvas = map.getCanvas();
     if (tool) {
@@ -1232,6 +1375,10 @@
     } else {
       canvas.style.cursor = '';
     }
+    // In AR mode the map's boundary layer is the precomputed-basin picker, driven
+    // solely by the AR-basin effect below; the draw/admin/watershed tools do not
+    // manage boundary selection here (mode is tracked so this re-runs on switch).
+    if (mode === 'atmospheric-rivers') return;
     if (tool === 'state' || tool === 'county') {
       if (boundaryModeLoaded !== tool) {
         teardownBoundarySelectionLayer();
@@ -1254,6 +1401,26 @@
       teardownBoundarySelectionLayer();
       if (wbdLoadAbort) wbdLoadAbort.abort();
       resetWbdDrill();
+    }
+  });
+
+  // AR-mode basin picker: show the precomputed HUC6 basins as the entry point
+  // whenever AR mode is active and no basin is selected yet; tear it down on
+  // leaving AR mode or once a basin is picked. Rebuilds when the model changes
+  // (precomputed coverage is per-model).
+  $effect(() => {
+    const mode = ui.mode;
+    const model = ui.model;
+    const region = ui.selectedRegion;
+    if (!map) return;
+    const wantPicker = mode === 'atmospheric-rivers' && region?.type !== 'huc';
+    if (wantPicker) {
+      if (boundaryModeLoaded !== 'ar-basins' || arBasinModel !== model) {
+        void setupArBasinLayer(model);
+      }
+    } else if (boundaryModeLoaded === 'ar-basins') {
+      arBasinGen += 1; // supersede any in-flight setup
+      teardownBoundarySelectionLayer();
     }
   });
 
@@ -1285,55 +1452,27 @@
     applyLayerState();
   });
 
-  onMount(async () => {
-    // Fetch config FIRST, then create map — same sequence as original code
-    try {
-      const data = await fetchConfig();
-
-      if (Array.isArray(data.models) && data.models.length > 0) {
-        appConfig.models = data.models;
-      }
-      if (typeof data.default_model === 'string') {
-        appConfig.defaultModel = data.default_model;
-      }
-      if (Array.isArray(data.statistics) && data.statistics.length > 0) {
-        appConfig.statistics = data.statistics;
-      }
-      if (typeof data.default_statistic === 'string') {
-        appConfig.defaultStatistic = data.default_statistic;
-      }
-      if (typeof data.maptiler_api_key === 'string') {
-        appConfig.maptilerApiKey = data.maptiler_api_key;
-      }
-      if (data.consistency && typeof data.consistency === 'object') {
-        appConfig.consistency = { ...appConfig.consistency, ...data.consistency };
-        ui.consistencyThreshold = appConfig.consistency.default_threshold_mm;
-        ui.consistencyScale = appConfig.consistency.default_scale_km;
-      }
-      ui.model = appConfig.defaultModel;
-      {
-        const accKeys = accuracyStatKeys();
-        let stat = appConfig.defaultStatistic;
-        if (!accKeys.includes(stat)) {
-          stat = accKeys[0] || 'nmad';
-        }
-        ui.statistic = stat;
-      }
-      ui.period = 'yearly';
-      ui.activeTool = 'point';
-
-      const { min } = getModelLeadBounds(appConfig.models, ui.model);
-      ui.leadFractional = min;
-    } catch (err) {
-      console.warn('[status] Failed to load config', err);
+  $effect(() => {
+    const mode = ui.mode;
+    const path = ui.arFramePath;
+    if (!map) return;
+    if (mode !== 'atmospheric-rivers' || !path) {
+      atmosphericRiverLayer.clear(map);
+      return;
     }
+    atmosphericRiverLayer.replace(map, path, { dimLayerId, drawFillLayerId })
+      .catch((err) => {
+        if (err?.name !== 'AbortError') console.warn('[status] Failed to load atmospheric-river frame', err);
+      });
+  });
 
-    // NOW create the map — config is loaded, style URL will be correct
+  onMount(async () => {
     map = new maplibregl.Map({
       container: mapContainer,
       style: mapStyleUrl(),
       center: [-98.5, 39.8],
       zoom: 3,
+      attributionControl: { compact: true },
     });
     map.on('error', (e) => {
       const err = e.error;
@@ -1342,6 +1481,7 @@
       const msg = String(err.message || '');
       if (/abort/i.test(msg)) return;
     });
+    if (import.meta.env.DEV) window.__rcMap = map; // capture/automation hook (dev only)
     map.on('load', () => {
       if (!appConfig.maptilerApiKey) {
         console.log('[status] Using fallback basemap; set MAPTILER_API_KEY for MapTiler.');
@@ -1372,6 +1512,9 @@
     coarseMql.addEventListener('change', coarseMqlHandler);
 
     map.on('click', (event) => {
+      // AR mode's only map interaction is the precomputed-basin picker (its own
+      // fill-layer click handler); the draw tools never create a region here.
+      if (ui.mode === 'atmospheric-rivers') return;
       if (ui.activeTool) handleDrawClick(event);
     });
 
@@ -1391,14 +1534,24 @@
     }
     map.on('move', refreshDimOnViewChange);
     map.on('resize', refreshDimOnViewChange);
+
+    // The dashboard resizes the map container (full screen ↔ one column);
+    // MapLibre only tracks window resizes on its own.
+    if (typeof ResizeObserver !== 'undefined' && mapContainer) {
+      resizeObserver = new ResizeObserver(() => { map?.resize(); });
+      resizeObserver.observe(mapContainer);
+    }
   });
 
   onDestroy(() => {
+    resizeObserver?.disconnect();
+    resizeObserver = null;
     if (coarseMql && coarseMqlHandler) {
       coarseMql.removeEventListener('change', coarseMqlHandler);
     }
     document.removeEventListener('keydown', handleKeyDown);
     stopPinPulse();
+    atmosphericRiverLayer.clear(map);
     clearOverlayApplySchedule();
     if (map) {
       map.remove();

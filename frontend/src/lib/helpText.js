@@ -12,7 +12,7 @@ const STATISTIC_HELP = {
     + 'date, at the chosen precip threshold (mm/day) and neighborhood scale (km). '
     + '0 = consecutive runs agree; →1 = complete flip. The value at lead L compares '
     + 'the runs issued at leads L+1 and L. Low J alone is ambiguous (early skill or '
-    + 'frozen hedging) — read it jointly with Convergence RMSE via the lock-in gap. '
+    + 'frozen hedging) — read it jointly with Convergence RMSE. '
     + 'Compare models only on identical threshold/scale/region/period slices.',
   convergence:
     'Convergence-to-truth: RMSE vs observed (PRISM) precip at each lead, pooled over '

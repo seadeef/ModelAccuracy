@@ -8,10 +8,13 @@
 # and the EventBridge warm ping. Safe to re-run any time; unchanged stacks are
 # a no-op.
 #
-# Moving to a new region or account is exactly this:
+# For a complete first-time or repeat application deploy, use ./deploy.sh.
+# Running this infrastructure layer by itself is useful when changing only the
+# stack. Moving to a new region or account manually is:
 #   1. point AWS_PROFILE / AWS_REGION (env or .env) at the target
 #   2. ./deploy_infra.sh
-#   3. paste the printed block into .env
+#   3. paste the printed block into .env (./deploy.sh does this propagation
+#      in-process instead)
 #   4. ./deploy_api.sh && ./deploy_static.sh && ./deploy_frontend.sh
 #
 # The origin-verify secret (CloudFront → Lambda shared header) is generated
@@ -55,21 +58,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
-
-if [[ -f "$ROOT/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$ROOT/.env"
-  set +a
-fi
-
-AWS_REGION="${AWS_REGION:-us-west-1}"
-STACK_NAME="${STACK_NAME:-raincheck}"
+source "$ROOT/deploy_common.sh"
+deploy_init "$ROOT"
 TEMPLATE="$ROOT/infra/stack.yaml"
-if [[ -n "${AWS_PROFILE:-}" ]]; then
-  export AWS_PROFILE
-  echo "==> Using AWS_PROFILE=${AWS_PROFILE}"
-fi
 echo "==> Stack ${STACK_NAME} in ${AWS_REGION}"
 
 if [[ ! "$STACK_NAME" =~ ^[a-z][a-z0-9-]*$ ]]; then

@@ -13,7 +13,7 @@
 # The synced subtrees and who reads them:
 #
 #   Browser (via CloudFront, cache headers set here):
-#     config.json, tiles/, ranges/          mutable  (300s must-revalidate)
+#     config.json, tiles/, ranges/, ar/     mutable  (300s must-revalidate)
 #     zip/, admin/, wbd/ map assets,
 #       military/sites.geojson              immutable (1yr)
 #     forecast/forecast_calendar.json       mutable
@@ -49,17 +49,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
+source "$ROOT/deploy_common.sh"
+deploy_init "$ROOT"
 
 if [[ $# -gt 0 ]]; then
   echo "ERROR: $0 takes no arguments (got: $*)" >&2
   exit 2
-fi
-
-if [[ -f "$ROOT/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$ROOT/.env"
-  set +a
 fi
 
 if [[ -z "${DATA_S3_URI:-}" ]]; then
@@ -90,12 +85,6 @@ else
   FORECAST_PREFIX="forecast"
 fi
 
-AWS_REGION="${AWS_REGION:-us-west-1}"
-if [[ -n "${AWS_PROFILE:-}" ]]; then
-  export AWS_PROFILE
-  echo "==> Using AWS_PROFILE=${AWS_PROFILE}"
-fi
-
 SITE="$ROOT/static_export"
 # Flat layout: browser data assets live at the static_export root, uploaded to the
 # S3 bucket root (keys mirror the local layout → served from the site root, e.g.
@@ -117,6 +106,10 @@ build() {
   # files keep their mtime and the `aws s3 sync` calls below skip them.
   echo "==> Downloading latest forecast (download.py --forecast)"
   python3 download.py --forecast
+  echo "==> Checking canonical tARget dataset (download.py --ar)"
+  python3 download.py --ar
+  echo "==> Refreshing AR episode statistics and basin dependencies"
+  python3 compute_stats.py --only episodes
   echo "==> Rebuilding static export (export_static.py --static)"
   python3 export_static.py --static
   echo "==> Rebuilding model data (export_static.py --data)"
@@ -145,6 +138,15 @@ sync_static() {
         --cache-control "$CC_IMMUTABLE"
     fi
   done
+
+  # tARget v4 frames are date-addressed but may be extended as new source files
+  # are ingested, so publish them with the mutable data cache policy.
+  if [[ -d "$STATIC_SRC/ar" ]]; then
+    echo "==> Sync $dest/ar/ ($CC_MUTABLE)"
+    aws s3 sync "$STATIC_SRC/ar" "$dest/ar" \
+      --region "$AWS_REGION" --delete \
+      --cache-control "$CC_MUTABLE"
+  fi
 
   # Mutable (refreshed each stats rerun).
   for sub in tiles ranges; do
@@ -249,7 +251,7 @@ if [[ -z "${SKIP_INVALIDATE:-}" ]]; then
   echo "==> CloudFront invalidation ($CLOUDFRONT_DISTRIBUTION_ID): mutable data paths"
   aws cloudfront create-invalidation \
     --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
-    --paths "/config.json" "/tiles/*" "/ranges/*" "/forecast/forecast_calendar.json" \
+    --paths "/config.json" "/tiles/*" "/ranges/*" "/ar/*" "/forecast/forecast_calendar.json" \
     --query 'Invalidation.{Id:Id,Status:Status}' --output table
 else
   echo "==> SKIP_INVALIDATE set — not invalidating CloudFront"

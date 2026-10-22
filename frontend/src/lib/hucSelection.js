@@ -163,6 +163,46 @@ export function buildPendingFromFeature(feature, fc) {
   };
 }
 
+/**
+ * Resolve a HUC id (any even level present in the WBD data, primarily 6) to a
+ * finalized region object — the exact shape MapView's finalizeWbd produces — so
+ * an AR-mode basin picked from the precomputed-basin map layer matches a region
+ * produced by the interactive watershed drill. Loads whatever index/subtree/
+ * topology chunks are needed. Throws with a clear message when the id is
+ * malformed or absent from the published WBD data.
+ *
+ * @param {string} huc
+ * @returns {Promise<{type:'huc', huc:string, level:number, name:string, bounds:number[], geometry:object}>}
+ */
+export async function resolveHucRegion(huc) {
+  const code = String(huc ?? '').trim();
+  if (!/^\d{2,12}$/.test(code) || code.length % 2 !== 0) {
+    throw new Error(`Invalid HUC id "${huc}": expected an even-length numeric code (2–12 digits)`);
+  }
+  const level = code.length;
+  await loadWbdIndex();
+  if (level > 2) await ensureHucSubtree(code);
+
+  // Geometry lives in huc2.topojson for level 2, otherwise in the parent unit's
+  // children file — the same chunks the interactive drill loads.
+  const fc = level === 2
+    ? await loadHuc2Geo()
+    : await loadHucChildren(code.slice(0, level - 2), level);
+  const feature = fc?.features?.find((f) => String(f.id) === code);
+  if (!feature) {
+    throw new Error(`HUC ${code} not found in the published WBD data`);
+  }
+  const pending = buildPendingFromFeature(feature, fc);
+  return {
+    type: 'huc',
+    huc: pending.huc,
+    level: pending.level ?? level,
+    name: pending.name || wbdUnitMeta(code)?.name || '',
+    bounds: pending.bounds,
+    geometry: pending.geometry,
+  };
+}
+
 export function clearWbdCaches() {
   indexCache.data = null;
   indexCache.promise = null;

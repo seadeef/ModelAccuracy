@@ -6,6 +6,13 @@
 export const SELECTION_COLOR = '#ffb020';
 export const BOUNDARY_FILL_COLOR = SELECTION_COLOR;
 export const BOUNDARY_OUTLINE_COLOR = SELECTION_COLOR;
+/** Resting-state paint values, exported so the canvas map export (exportMapImage)
+ *  can draw AR footprints with exactly the styling setupBoundaryLayer puts on-map. */
+export const BOUNDARY_FILL_OPACITY = 0.08;
+export const BOUNDARY_FILL_OPACITY_HOVER = 0.32;
+export const BOUNDARY_OUTLINE_WIDTH = 1.2;
+export const BOUNDARY_OUTLINE_WIDTH_HOVER = 2.4;
+export const BOUNDARY_OUTLINE_OPACITY = 0.9;
 
 /** [west, south, east, north] from a GeoJSON Polygon / MultiPolygon. */
 export function geomBbox(geom) {
@@ -66,8 +73,8 @@ export function setupBoundaryLayer(
         'fill-color': BOUNDARY_FILL_COLOR,
         'fill-opacity': [
           'case',
-          ['boolean', ['feature-state', 'hover'], false], 0.32,
-          0.08,
+          ['boolean', ['feature-state', 'hover'], false], BOUNDARY_FILL_OPACITY_HOVER,
+          BOUNDARY_FILL_OPACITY,
         ],
       },
     }, fillBefore);
@@ -79,10 +86,10 @@ export function setupBoundaryLayer(
         'line-color': BOUNDARY_OUTLINE_COLOR,
         'line-width': [
           'case',
-          ['boolean', ['feature-state', 'hover'], false], 2.4,
-          1.2,
+          ['boolean', ['feature-state', 'hover'], false], BOUNDARY_OUTLINE_WIDTH_HOVER,
+          BOUNDARY_OUTLINE_WIDTH,
         ],
-        'line-opacity': 0.9,
+        'line-opacity': BOUNDARY_OUTLINE_OPACITY,
       },
     }, outlineBefore);
     if (onClick) map.on('click', fillLayerId, onClick);

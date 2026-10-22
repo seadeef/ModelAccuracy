@@ -5,6 +5,7 @@ import re
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from statistics_plugins.consistency import JUMPINESS_SCALES_KM, JUMPINESS_THRESHOLDS_MM
+from statistics_plugins.registry import EPISODE_CONTEXT_STATS
 
 
 def _reject_non_digit_lead(v):
@@ -21,7 +22,13 @@ VALID_ADMIN_LEVELS = {"state", "county"}
 MILITARY_SITE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,99}$")
 VALID_HUC_LEVELS = {2, 4, 6, 8, 10, 12, 14, 16}
 VALID_PERIODS = {"yearly", "monthly", "seasonal"}
+# Grid-pooled revision efficiency: the revision planes are exported for
+# yearly + seasonal only (monthly is not computed → validation error, not
+# silent no-data).
+VALID_REVISION_PERIODS = {"yearly", "seasonal"}
 VALID_SEASONS = {"djf", "mam", "jja", "son"}
+# Pooled AR scope keys servable through the episode context (CONTRACT §0).
+VALID_EPISODE_SCOPES = {"ar_all", "non_ar", "all_days"}
 VALID_MONTHS = {f"{m:02d}" for m in range(1, 13)}
 # Jumpiness parameters are whitelisted because they select pre-computed bin
 # paths (like month/season above): only the exact computed combinations exist.
@@ -111,6 +118,38 @@ class StatsRegion(BaseModel):
         if self.type == "military":
             if not self.site or not MILITARY_SITE_RE.match(str(self.site)):
                 raise ValueError("region.site must be a lowercase site key (letters/digits/hyphens)")
+
+        return self
+
+
+class ArEpisodeContext(BaseModel):
+    """Episode-context selector: one basin episode OR one pooled scope.
+
+    Exactly one of ``episodeId`` (a single catalogued AR episode) and
+    ``scope`` ("ar_all" / "non_ar" / "all_days" pooled date populations,
+    CONTRACT §6) must
+    be provided; both share the same HUC6 basin rules.
+    """
+
+    type: str = "ar_episode"
+    huc: str
+    episodeId: str | None = None
+    scope: str | None = None
+
+    @model_validator(mode="after")
+    def validate_context(self) -> "ArEpisodeContext":
+        if self.type != "ar_episode":
+            raise ValueError("context.type must be ar_episode")
+        if not self.huc.isdigit() or len(self.huc) != 6:
+            raise ValueError("context.huc must be a HUC6 code")
+        if (self.episodeId is None) == (self.scope is None):
+            raise ValueError("context requires exactly one of episodeId or scope")
+        if self.episodeId is not None and (
+                not self.episodeId.startswith(f"{self.huc}-")
+                or not re.fullmatch(r"\d{6}-\d{8}-\d{8}", self.episodeId)):
+            raise ValueError("context.episodeId must belong to huc and use HUC6-YYYYMMDD-YYYYMMDD")
+        if self.scope is not None and self.scope not in VALID_EPISODE_SCOPES:
+            raise ValueError(f"context.scope must be one of {sorted(VALID_EPISODE_SCOPES)}")
         return self
 
 
@@ -120,7 +159,8 @@ class StatsQueryRequest(BaseModel):
     lead: int | None = Field(default=None, ge=0, le=MAX_LEAD_DAYS)
     minLead: int | None = Field(default=None, ge=0, le=MAX_LEAD_DAYS)
     maxLead: int | None = Field(default=None, ge=0, le=MAX_LEAD_DAYS)
-    region: StatsRegion
+    region: StatsRegion | None = None
+    context: ArEpisodeContext | None = None
     period: str = "yearly"
     month: str | None = None
     season: str | None = None
@@ -134,6 +174,23 @@ class StatsQueryRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_request(self) -> "StatsQueryRequest":
+        if self.context is not None:
+            if self.region is not None:
+                raise ValueError("episode-context queries do not accept region geometry")
+            if not self.statistics:
+                raise ValueError("episode-context queries require statistics")
+            # Validated against registry.EPISODE_CONTEXT_STATS, not spec.scope:
+            # revision_efficiency's spec is scope="region_pooled" (it also has a
+            # grid-pooled regional surface) yet is servable in this context.
+            invalid_scope = [name for name in self.statistics
+                             if name not in EPISODE_CONTEXT_STATS]
+            if invalid_scope:
+                raise ValueError(f"statistics are not servable in an episode context: {invalid_scope}")
+            if any(value is not None for value in (self.lead, self.minLead, self.maxLead)):
+                raise ValueError("episode-context queries do not accept lead fields")
+            return self
+        if self.region is None:
+            raise ValueError("region is required for regional statistics")
         if self.period not in VALID_PERIODS:
             raise ValueError("period must be yearly, monthly, or seasonal")
         _validate_month_season(self.month, self.season)
@@ -170,6 +227,30 @@ class LeadWinnersRequest(BaseModel):
         _validate_month_season(self.month, self.season)
         if self.minLead > self.maxLead:
             raise ValueError("minLead must be <= maxLead")
+        return self
+
+
+class RevisionEfficiencyRequest(BaseModel):
+    """Grid-pooled revision efficiency R for a region (CONTRACT §5/§6).
+
+    Region rules are identical to /api/stats (StatsRegion). Periods are
+    yearly | seasonal only — the revision planes are not exported monthly, so
+    monthly is a validation error rather than silent no-data.
+    """
+
+    model: str | None = None
+    region: StatsRegion
+    period: str = "yearly"
+    season: str | None = None
+
+    @model_validator(mode="after")
+    def validate_revision(self) -> "RevisionEfficiencyRequest":
+        if self.period not in VALID_REVISION_PERIODS:
+            raise ValueError(
+                "period must be yearly or seasonal for revision efficiency "
+                "(monthly revision planes are not computed)"
+            )
+        _validate_month_season(None, self.season)
         return self
 
 

@@ -41,6 +41,9 @@ Reads from stats_output/ and tiles_output/, writes to static_export/:
         military/
             boundaries.json     (backend region masks — S3-read by the Lambda)
             sites.geojson       (frontend map layer)
+        ar/
+            manifest.json       (tARget v4 6-hour frame index)
+            frames/*.geojson    (visualization-only AR footprints for one valid time)
 
 URL scheme: every browser-fetched data file is served from the site root mirroring
 this layout (e.g. ``/config.json``, ``/wbd/index.json``, ``/model_data/…``); the SPA
@@ -54,10 +57,12 @@ Build modes (at most one; omit all for a full export):
 
 * ``--static`` — the S3 site tree: ``zip/``, admin/wbd/military (map TopoJSON/GeoJSON
   **and** the backend polygon chunks / ``boundaries.json`` the Lambda reads from S3),
-  ``config.json``, ``tiles/``, ``ranges/``, and ``forecast/`` (bins + ``forecast_calendar.json``).
+  ``config.json``, ``tiles/``, ``ranges/``, ``forecast/`` (bins + ``forecast_calendar.json``),
+  and ``ar/`` when tARget input is configured.
 * ``--data`` — only ``static_export/model_data/``.
 * ``--forecast`` — only ``static_export/forecast/``.
 * ``--frontend`` — only the bundled Vite SPA under ``static_export/frontend/``.
+* ``--ar`` — only ``static_export/ar/`` from tARget v4 netCDF input.
 
 Boundary export flags (combinable with each other; not with build modes above):
 
@@ -83,7 +88,7 @@ or otherwise altering output shape without touching sources.
 ``--force`` re-exports every artifact regardless of staleness (outputs are kept).
 ``--clean`` deletes the entire output directory first (which also forces a full
 rebuild); only allowed for a **full** export (no ``--static`` /
-``--data`` / ``--forecast`` / ``--frontend``).
+``--data`` / ``--forecast`` / ``--frontend`` / ``--ar``).
 
 The .bin files are raw float32 arrays (row-major, height × width).
 
@@ -96,6 +101,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -121,23 +127,22 @@ from wbd_core import layer_cache_path as _wbd_layer_cache_path
 from wbd_core import parent_huc as _wbd_parent_huc
 from wbd_core import polygons_bbox as _polygons_bbox
 from model_registry import MODEL_REGISTRY, DEFAULT_MODEL
-from compute_stats import SEASONS
+from stats_pipeline.verification import SEASONS
+from stats_pipeline.episode_metrics import BASIN_HISTORY_FILENAME, basin_history_filename
+from stats_pipeline.episodes import episode_catalog_filename
 from forecast_variables import FORECAST_VARIABLES
 from stats_grid_metadata import load_model_metadata, model_metadata_path
 from statistics_plugins.registry import (
-    CONSISTENCY_STAT_NAMES,
+    ALL_STATISTICS,
     DEFAULT_STATISTIC,
-    ENABLED_STATISTICS,
+    EPISODE_CATALOG_FILENAME,
+    EPISODE_CONTEXT_STATS,
     STATISTICS_BY_NAME,
 )
 from statistics_plugins.consistency import (
-    DEFAULT_SCALE_KM,
-    DEFAULT_THRESHOLD_MM,
-    JUMPINESS_SCALES_KM,
-    JUMPINESS_THRESHOLDS_MM,
-    LOCK_IN_FRACTION,
     combo_tag,
 )
+from atmospheric_rivers import TARGET_AR_DATA_DIR, discover_target_ar_sources
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 load_dotenv(_PROJECT_ROOT / ".env", override=True)
@@ -152,6 +157,16 @@ FRONTEND_ROOT = _PROJECT_ROOT / "frontend"
 DATA_DIR_NAME = "model_data"
 FORECAST_DIR_NAME = "forecast"
 FRONTEND_DIR_NAME = "frontend"
+AR_DIR_NAME = "ar"
+# HUC2 regions with a basin stage (per-HUC6 forecast histories + AR episode
+# catalogs): California, Pacific Northwest, Upper Colorado. Order = display order.
+BASIN_HUC2_REGIONS: dict[str, str] = {
+    "18": "California",
+    "17": "Pacific Northwest",
+    "14": "Upper Colorado",
+}
+# Curated storm catalogs, per region.
+FIGURE_DATA_ROOT = _PROJECT_ROOT / "figures" / "out" / "data"
 # Served WBD depth (backend chunks + map assets, all on S3). Default comes
 # from wbd_core.DEFAULT_MAX_HUC_LEVEL — the one knob shared with the loader.
 # Override per-run with --max-huc-level.
@@ -905,6 +920,23 @@ def export_s3_assets(site_root: Path, maptiler_key: str) -> None:
     export_config(assets_dir, maptiler_key)
     export_tiles(assets_dir)
     export_value_ranges(assets_dir)
+    export_episode_model_comparison(assets_dir)
+
+
+def export_episode_model_comparison(site_root: Path) -> None:
+    """Copy stats_output/episode_model_comparison.json → ar/model_comparison.json.
+
+    Cross-model paired-ΔR curated artifact (CONTRACT §4); statically served,
+    no UI requirement. Absent until compute_stats.py --only episodes has run
+    for at least two models — skipping then is normal, not an error.
+    """
+    src = STATS_ROOT / "episode_model_comparison.json"
+    if not src.is_file():
+        print("  SKIP: stats_output/episode_model_comparison.json not found")
+        return
+    out = site_root / AR_DIR_NAME / "model_comparison.json"
+    _write_text_if_changed(out, src.read_text(encoding="utf-8"))
+    print(f"  {out} ({out.stat().st_size:,} bytes)")
 
 
 # ── config.json ─────────────────────────────────────────────────────
@@ -917,16 +949,35 @@ def export_config(export_dir: Path, maptiler_key: str) -> None:
             "label": config.label,
             "lead_days_min": config.lead_days_min,
             "lead_days_max": config.lead_days_max,
+            # W1: which model-version window the pooled statistics cover.
+            # Dashboards and CSV metadata state it from here (hard constraint:
+            # every stats surface names its version window).
+            "version_windows": config.window_block(),
         }
         if config.ident:
             entry["ident"] = config.ident
         models.append(entry)
 
-    statistics = [
-        {"key": p.spec.name, "label": p.spec.label, "units": p.spec.units}
-        for p in ENABLED_STATISTICS
-    ]
+    statistics = [{
+        "key": entry.spec.name,
+        "label": entry.spec.label,
+        "units": entry.spec.units,
+        "scope": entry.spec.scope,
+        "axis": entry.spec.axis,
+        "periods": list(entry.spec.periods),
+        "map_support": entry.spec.map_support,
+        "winner_support": entry.spec.winner_support,
+        "winner_mode": entry.spec.winner_mode,
+        "parameters": entry.spec.parameters,
+    } for entry in ALL_STATISTICS]
 
+    # Per-lead consistency stats only (scope=="region"): revision_efficiency is
+    # also packed_grid but region_pooled — it has its own endpoint below and
+    # must not appear in the per-lead consistency stat list or parameters.
+    packed_specs = [entry.spec for entry in ALL_STATISTICS
+                    if entry.spec.storage.kind == "packed_grid"
+                    and entry.spec.scope == "region"]
+    packed_parameters = packed_specs[0].parameters if packed_specs else {}
     config_data = {
         "models": models,
         "default_model": DEFAULT_MODEL,
@@ -936,12 +987,43 @@ def export_config(export_dir: Path, maptiler_key: str) -> None:
         # the frontend renders its q/n selectors and the lock-in definition
         # from here so they can never drift from the compute pipeline.
         "consistency": {
-            "stats": sorted(CONSISTENCY_STAT_NAMES),
-            "thresholds_mm": list(JUMPINESS_THRESHOLDS_MM),
-            "scales_km": list(JUMPINESS_SCALES_KM),
-            "default_threshold_mm": DEFAULT_THRESHOLD_MM,
-            "default_scale_km": DEFAULT_SCALE_KM,
-            "lock_in_fraction": LOCK_IN_FRACTION,
+            "stats": sorted(spec.name for spec in packed_specs),
+            "thresholds_mm": packed_parameters.get("thresholds_mm", []),
+            "scales_km": packed_parameters.get("scales_km", []),
+            "default_threshold_mm": packed_parameters.get("default_threshold_mm"),
+            "default_scale_km": packed_parameters.get("default_scale_km"),
+            "lock_in_fraction": packed_parameters.get("lock_in_fraction"),
+            "curve_roles": {spec.parameters.get("curve_role"): spec.name
+                            for spec in packed_specs if spec.parameters.get("curve_role")},
+            # Grid-pooled revision efficiency R (CONTRACT §5/§6).
+            "revision_statistic": "revision_efficiency",
+            "revision_endpoint": "/api/stats/revision-efficiency",
+        },
+        "ar_episodes": {
+            # EPISODE_CONTEXT_STATS, not a scope filter: revision_efficiency's
+            # spec is scope="region_pooled" yet it is servable in the episode
+            # context alongside lock_in_gap.
+            "statistics": list(EPISODE_CONTEXT_STATS),
+            "huc_level": 6,
+            "catalog_endpoint": "/api/ar/episodes",
+            "stats_endpoint": "/api/stats",
+            # Pooled scope selectors (CONTRACT §0/§6) + the episode-cluster
+            # merge rule they are bootstrapped with.
+            "scopes": [
+                {"key": "ar_all", "label": "All AR days"},
+                {"key": "non_ar", "label": "Non-AR days"},
+                {"key": "all_days", "label": "All days"},
+            ],
+            "cluster_merge_hours": 72,
+        },
+        "atmospheric_rivers": {
+            "dataset": "Guan & Waliser tARget v4",
+            "manifest_url": "/ar/manifest.json",
+            "temporal_resolution_hours": 6,
+            "grid_resolution_degrees": 0.25,
+            # Per-basin raw forecast revision series (one JSON per model/HUC6);
+            # AR mode fetches these directly (see export_basin_revisions).
+            "revisions_base": "/ar/basin_revisions",
         },
         "maptiler_api_key": maptiler_key,
     }
@@ -969,7 +1051,21 @@ def _prune_stale_stat_dirs(parent: Path, valid_stats: set[str]) -> int:
 
 
 def _verification_stat_names() -> set[str]:
-    return {p.spec.name for p in ENABLED_STATISTICS if p.spec.name != "forecast"}
+    """Valid exported per-stat directory names under model_data/{model}/.
+
+    Grid stats export under their own name; packed stats export under the
+    first segment of their storage path template — which differs from the
+    stat name for revision_efficiency (directory ``revision/``). Using the
+    template keeps the prune from deleting a freshly exported revision tree.
+    """
+    names: set[str] = set()
+    for entry in ALL_STATISTICS:
+        kind = entry.spec.storage.kind
+        if kind == "grid":
+            names.add(entry.spec.name)
+        elif kind == "packed_grid":
+            names.add(entry.spec.storage.path_template.split("/", 1)[0])
+    return names
 
 
 def export_data_layers(data_root: Path) -> None:
@@ -991,12 +1087,9 @@ def export_data_layers(data_root: Path) -> None:
             pruned_bins += 1
 
         # Export each layer as flat float32 .bin (verification stats + any non-forecast dirs).
-        for plugin in ENABLED_STATISTICS:
+        for plugin in ALL_STATISTICS:
             stat_name = plugin.spec.name
-            if stat_name == "forecast":
-                # Separate tree (``static_export/forecast/``) — see ``export_forecast_data_layers``.
-                continue
-            if stat_name in CONSISTENCY_STAT_NAMES:
+            if plugin.spec.storage.kind != "grid":
                 # Packed two-plane bins — see ``export_consistency_layers``.
                 continue
             field = plugin.spec.render_field
@@ -1087,41 +1180,89 @@ def _consistency_periods(stat_dir: Path) -> list[tuple[Path, Path]]:
     return periods
 
 
+def _export_revision_layers(model_key: str, model_stats: Path, data_root: Path) -> int:
+    """Export the gridded revision planes (CONTRACT §5).
+
+    ``rev_sse``/``rev_cnt`` are accumulated by the consistency stage *inside*
+    the jumpiness ``pair_<P>.npz`` files (yearly + seasonal); they export as
+    two packed float32 planes to ``model_data/{model}/revision/…/pair_<P>.bin``
+    (identical packing convention to convergence). A jumpiness npz written
+    before the revision recompute lacks the rev keys — those files are skipped
+    with a warning rather than failing the export.
+    """
+    spec = STATISTICS_BY_NAME["revision_efficiency"].spec
+    src_root = model_stats / "jumpiness"
+    if not src_root.is_dir():
+        return 0
+    out_root = data_root / model_key / spec.storage.path_template.split("/", 1)[0]
+    total = 0
+    missing = 0
+    for src_dir, rel_out in _consistency_periods(src_root):
+        for npz_path in sorted(src_dir.glob("pair_*.npz")):
+            if not npz_path.stem.removeprefix("pair_").isdigit():
+                continue
+            out_path = out_root / rel_out / (npz_path.stem + ".bin")
+            written = _export_packed_layer(
+                npz_path, spec.storage.source_fields,
+                np.dtype(spec.storage.export_dtype), out_path,
+            )
+            if written == 0:
+                missing += 1
+            total += written
+    if missing:
+        print(f"  WARNING: {model_key}: {missing} jumpiness pair npz file(s) lack "
+              "rev_sse/rev_cnt (revision planes not yet computed) — skipped; "
+              "rerun compute_stats.py --only consistency to produce them")
+    return total
+
+
 def export_consistency_layers(data_root: Path) -> None:
     total = 0
     for model_key in MODEL_REGISTRY:
         model_stats = STATS_ROOT / model_key
-        jump_dir = model_stats / "jumpiness"
-        conv_dir = model_stats / "convergence"
-
-        if jump_dir.is_dir():
-            for src_dir, rel_out in _consistency_periods(jump_dir):
-                for npz_path in sorted(src_dir.glob("pair_*.npz")):
-                    if not npz_path.stem.removeprefix("pair_").isdigit():
+        for entry in ALL_STATISTICS:
+            spec = entry.spec
+            if spec.storage.kind != "packed_grid" or spec.scope != "region":
+                # region_pooled packed planes (revision_efficiency) have no
+                # stats_output dir of their own — they ride inside the
+                # jumpiness npz files; see _export_revision_layers below.
+                continue
+            stat_dir = model_stats / spec.name
+            if not stat_dir.is_dir():
+                continue
+            prefix = "pair" if spec.axis == "lead_pair" else "lead"
+            thresholds = spec.parameters.get("thresholds_mm", [None])
+            scales = spec.parameters.get("scales_km", [None])
+            combinations = (
+                [(combo_tag(q, n),) for q in thresholds for n in scales]
+                if spec.axis == "lead_pair" else [(None,)]
+            )
+            for src_dir, rel_out in _consistency_periods(stat_dir):
+                for npz_path in sorted(src_dir.glob(f"{prefix}_*.npz")):
+                    if not npz_path.stem.removeprefix(f"{prefix}_").isdigit():
                         continue
-                    for q in JUMPINESS_THRESHOLDS_MM:
-                        for n in JUMPINESS_SCALES_KM:
-                            tag = combo_tag(q, n)
-                            out_path = (data_root / model_key / "jumpiness" / tag
-                                        / rel_out / (npz_path.stem + ".bin"))
-                            total += _export_packed_layer(
-                                npz_path, (f"num_{tag}", f"den_{tag}"),
-                                np.float16, out_path,
-                            )
+                    for (combo,) in combinations:
+                        keys = tuple(key.format(combo=combo) for key in spec.storage.source_fields)
+                        base = data_root / model_key / spec.name
+                        if combo:
+                            base /= combo
+                        out_path = base / rel_out / (npz_path.stem + ".bin")
+                        total += _export_packed_layer(
+                            npz_path, keys, np.dtype(spec.storage.export_dtype), out_path,
+                        )
 
-        if conv_dir.is_dir():
-            for src_dir, rel_out in _consistency_periods(conv_dir):
-                for npz_path in sorted(src_dir.glob("lead_*.npz")):
-                    if not npz_path.stem.removeprefix("lead_").isdigit():
-                        continue
-                    out_path = (data_root / model_key / "convergence"
-                                / rel_out / (npz_path.stem + ".bin"))
-                    total += _export_packed_layer(
-                        npz_path, ("sum_squared_error", "sample_count"),
-                        np.float32, out_path,
-                    )
+        total += _export_revision_layers(model_key, model_stats, data_root)
 
         _export_consistency_meta(model_stats, data_root / model_key)
+
+        # One catalog per HUC2 region: California keeps the bare name, the
+        # others carry the region suffix (see stats_pipeline.episodes).
+        for huc2 in BASIN_HUC2_REGIONS:
+            episode_src = model_stats / episode_catalog_filename(huc2)
+            if episode_src.is_file():
+                episode_out = data_root / model_key / episode_catalog_filename(huc2)
+                episode_out.parent.mkdir(parents=True, exist_ok=True)
+                _write_text_if_changed(episode_out, episode_src.read_text(encoding="utf-8"))
 
     print(f"  {total} consistency .bin layer files exported")
 
@@ -1133,7 +1274,7 @@ def _export_consistency_meta(model_stats: Path, out_dir: Path) -> None:
     valid-date set) slices for cross-model comparison; the date counts make
     the valid-date-set part of that visible to the client.
     """
-    manifest_path = model_stats / "consistency_manifest.json"
+    manifest_path = model_stats / "manifest.json"
     if not manifest_path.exists():
         return
     try:
@@ -1141,7 +1282,7 @@ def _export_consistency_meta(model_stats: Path, out_dir: Path) -> None:
             manifest = json.load(f)
     except (json.JSONDecodeError, OSError):
         return
-    dates = manifest.get("processed_valid_dates", [])
+    dates = manifest.get("stages", {}).get("consistency", {}).get("processed_valid_dates", [])
     month_counts: dict[str, int] = {}
     season_counts: dict[str, int] = {}
     month_to_season = {
@@ -1460,9 +1601,9 @@ def export_value_ranges(assets_dir: Path) -> None:
         # Drop ranges for stats no longer in the registry (sacc → cc, forecast).
         pruned_dirs += _prune_stale_stat_dirs(ranges_root / model_key, valid_stats)
 
-        for plugin in ENABLED_STATISTICS:
+        for plugin in ALL_STATISTICS:
             stat_name = plugin.spec.name
-            if stat_name == "forecast" or stat_name in CONSISTENCY_STAT_NAMES:
+            if not plugin.spec.map_support:
                 continue  # panel-only stats — no map tiles or legend ranges
             stat_dir = model_stats / stat_name
             if not stat_dir.is_dir():
@@ -1568,6 +1709,215 @@ def _resolve_boundary_parts(args: argparse.Namespace) -> dict[str, bool]:
     }
 
 
+def _discover_ar_sources() -> list[Path]:
+    """Resolve tARget inputs through the canonical AR path authority."""
+    return discover_target_ar_sources()
+
+
+def export_atmospheric_rivers(
+    site_root: Path,
+    sources: list[Path],
+    *,
+    variable: str | None,
+    min_cells: int,
+) -> None:
+    """Export tARget v4 frame GeoJSON + manifest through the shared pipeline."""
+    from atmospheric_rivers.export import export_files
+
+    export_files(
+        sources,
+        site_root / AR_DIR_NAME,
+        variable,
+        max(1, min_cells),
+        force=_FORCE_EXPORT,
+    )
+
+
+def _round_or_none(value, ndigits: int) -> float | None:
+    """Round to *ndigits*, mapping non-finite (NaN/inf) to None so the emitted
+    JSON is valid (``json.dumps`` would otherwise write a bare ``NaN``)."""
+    v = float(value)
+    return round(v, ndigits) if math.isfinite(v) else None
+
+
+def export_basin_revisions(site_root: Path) -> None:
+    """Export the raw per-basin forecast revision series for the dashboard.
+
+    The dashboard's revision pane and every basin-level analysis (R, lock-in,
+    commitment, heavy-rain triggers, revision rationality) ride on the raw
+    basin-mean forecast series in ``stats_output/{model}/{basin history}``
+    (produced by ``stats_pipeline.basin``), which is otherwise never served.
+    One JSON per (model, HUC6) is written under ``ar/basin_revisions/`` for
+    every HUC2 region with a basin stage (``BASIN_HUC2_REGIONS``), keeping each
+    fetch small: the dashboard reads one basin at a time and fans out one file
+    per model. Models/regions whose npz is absent are skipped with a warning.
+
+    ``ar/basins.json`` indexes what was written so the SPA can tell which HUC6
+    selections support basin analysis without probing.
+    """
+    out_root = site_root / AR_DIR_NAME / "basin_revisions"
+    written = 0
+    index: dict[str, dict] = {}
+    for huc2, region_name in BASIN_HUC2_REGIONS.items():
+        for model_key in MODEL_REGISTRY:
+            npz_path = STATS_ROOT / model_key / basin_history_filename(huc2)
+            if not npz_path.is_file():
+                print(f"  WARNING: {model_key}: no HUC2 {huc2} basin history "
+                      f"({npz_path.name}) — run the basin stage of compute_stats.py; skipped")
+                continue
+            with np.load(npz_path, allow_pickle=False) as data:
+                hucs = [str(h) for h in data["hucs"]]
+                names = [str(n) for n in data["names"]]
+                dates = [f"{int(d):08d}" for d in data["dates"]]
+                lead_min = int(data["lead_min"])
+                lead_max = int(data["lead_max"])
+                forecasts = data["forecasts"]       # (D, L, B)
+                observed = data["observed"]         # (D, B)
+                stab = data["lock_stabilization"]   # (D, B)
+                acc = data["lock_accuracy"]         # (D, B)
+                gap = data["lock_gap"]              # (D, B)
+                lock_in_fraction = float(data["lock_in_fraction"])
+            n_dates, n_leads, _ = forecasts.shape
+            window = MODEL_REGISTRY[model_key].window_block()
+            primary_label = (window.get("primary") or {}).get("label")
+            primary_valid_range = [
+                (d.replace("-", "") if isinstance(d, str) else None)
+                for d in (window.get("primary_valid_range") or [None, None])
+            ]
+            for bi, huc in enumerate(hucs):
+                payload = {
+                    "huc": huc,
+                    "huc2": huc2,
+                    "region": region_name,
+                    "name": names[bi],
+                    "model": model_key,
+                    "lead_min": lead_min,
+                    "lead_max": lead_max,
+                    # Primary model-version window as [first, last] valid date
+                    # (YYYYMMDD or null = open): pooled products restrict to it.
+                    "primary_window": primary_label,
+                    "primary_valid_range": primary_valid_range,
+                    "dates": dates,
+                    # Forecast/observation precip rounded to 0.01 mm; lock leads are
+                    # already 0.5-day-quantized so one decimal is lossless.
+                    "forecasts": [
+                        [_round_or_none(forecasts[di, li, bi], 2) for li in range(n_leads)]
+                        for di in range(n_dates)
+                    ],
+                    "observed": [_round_or_none(observed[di, bi], 2) for di in range(n_dates)],
+                    "lock": {
+                        "stabilization": [_round_or_none(stab[di, bi], 1) for di in range(n_dates)],
+                        "accuracy": [_round_or_none(acc[di, bi], 1) for di in range(n_dates)],
+                        "gap": [_round_or_none(gap[di, bi], 1) for di in range(n_dates)],
+                    },
+                    "lock_in_fraction": lock_in_fraction,
+                }
+                out_path = out_root / model_key / f"{huc}.json"
+                if _write_text_if_changed(out_path, json.dumps(payload, separators=(",", ":"))):
+                    written += 1
+                entry = index.setdefault(huc, {
+                    "name": names[bi], "huc2": huc2, "region": region_name, "models": [],
+                })
+                if model_key not in entry["models"]:
+                    entry["models"].append(model_key)
+    index_payload = {
+        "huc_level": 6,
+        "regions": [
+            {"huc2": huc2, "name": name,
+             "basins": sorted(h for h, e in index.items() if e["huc2"] == huc2)}
+            for huc2, name in BASIN_HUC2_REGIONS.items()
+        ],
+        "basins": dict(sorted(index.items())),
+    }
+    _write_text_if_changed(site_root / AR_DIR_NAME / "basins.json",
+                           json.dumps(index_payload, separators=(",", ":")))
+    print(f"  {written} basin revision file(s) exported; {len(index)} basins indexed")
+
+
+# Storm-table fields carried per event (per-model dicts), in catalog order.
+_STORM_MODEL_FIELDS = ("j3", "j3_ca", "r_eff", "mae3", "fss3", "fss3_ca", "r3")
+
+
+def export_storm_catalog(site_root: Path) -> None:
+    """Export the curated storm catalogs as ``ar/storms/{huc2}.json``.
+
+    Merges ``data/ar_events[_hucNN].json`` (the region-wide AR
+    event catalog: 72-h clusters merged across basins, PRISM accumulation,
+    volume rank, peak-day climatology percentile) with
+    ``storm_table[_hucNN].json`` (the per-storm ledger: storm-pooled J at pair
+    3, per-event R, lead-3 MAE/FSS/correlation, and the per-event crowns).
+    Both are offline curated artifacts; a region whose extractors have not
+    run is skipped — the dashboard then falls back to the episode catalog.
+    """
+    out_root = site_root / AR_DIR_NAME / "storms"
+    for huc2, region_name in BASIN_HUC2_REGIONS.items():
+        suffix = "" if huc2 == "18" else f"_huc{huc2}"
+        events_path = FIGURE_DATA_ROOT / f"ar_events{suffix}.json"
+        if not events_path.is_file():
+            print(f"  SKIP: {events_path.name} not found (run figures.data.ar_events)")
+            continue
+        events_doc = json.loads(events_path.read_text(encoding="utf-8"))
+        table_path = FIGURE_DATA_ROOT / f"storm_table{suffix}.json"
+        table_by_id: dict[str, dict] = {}
+        table_meta = None
+        if table_path.is_file():
+            table_doc = json.loads(table_path.read_text(encoding="utf-8"))
+            table_by_id = {e["event_id"]: e for e in table_doc.get("events", [])}
+            table_meta = table_doc.get("meta")
+        events_out = []
+        for ev in events_doc.get("events", []):
+            obs = ev.get("observed") or {}
+            row = {
+                "event_id": ev["event_id"],
+                "start_date": ev["start_date"],
+                "end_date": ev["end_date"],
+                "span_days": ev.get("span_days"),
+                "basins": ev.get("basins"),
+                "basin_hucs": ev.get("basin_hucs", []),
+                "in_analysis": bool(ev.get("in_analysis")),
+                "observed_coverage": ev.get("observed_coverage"),
+                "volume_km3": obs.get("volume_km3"),
+                "record_share_pct": obs.get("record_share_pct"),
+                "volume_rank": ev.get("volume_rank"),
+                "volume_rank_of": ev.get("volume_rank_of"),
+                "peak": {
+                    "date": obs.get("ca_peak_date"),
+                    "mm": obs.get("ca_peak_day_mm"),
+                    "prism_pct": obs.get("ca_peak_prism_pct"),
+                    "basin_huc": obs.get("peak_basin_huc"),
+                    "basin_name": obs.get("peak_basin_name"),
+                    "basin_date": obs.get("peak_basin_date"),
+                    "basin_mm": obs.get("peak_basin_day_mm"),
+                },
+                "climatology": (ev.get("climatology") or {}).get("ca_peak_day"),
+                "flagship": bool(ev.get("flagship")),
+            }
+            table = table_by_id.get(ev["event_id"])
+            if table:
+                row["scored"] = bool(table.get("scored"))
+                row["models"] = {field: table.get(field) for field in _STORM_MODEL_FIELDS
+                                 if table.get(field) is not None}
+                row["r_eff_detail"] = table.get("r_eff_detail")
+                row["winners"] = table.get("winners")
+                row["j_by_pair"] = table.get("j_ca_by_pair")
+            events_out.append(row)
+        payload = {
+            "huc2": huc2,
+            "region": region_name,
+            "record": events_doc.get("record"),
+            "baseline": events_doc.get("baseline"),
+            "basin_names": events_doc.get("basin_names"),
+            "flagship": events_doc.get("flagship"),
+            "events": events_out,
+            "ledger_meta": table_meta,
+            "events_meta": events_doc.get("meta"),
+        }
+        out_path = out_root / f"{huc2}.json"
+        _write_text_if_changed(out_path, json.dumps(payload, separators=(",", ":")))
+        print(f"  {out_path} ({len(events_out)} events, "
+              f"{sum(1 for e in events_out if e['in_analysis'])} in analysis)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Export static files for serverless deployment.",
@@ -1604,6 +1954,24 @@ def main() -> None:
         help="Only rebuild the bundled Vite SPA under static_export/frontend/",
     )
     parser.add_argument(
+        "--ar", action="store_true",
+        help="Only export Guan & Waliser tARget v4 netCDF masks under static_export/ar/",
+    )
+    parser.add_argument(
+        "--basins", action="store_true",
+        help="Only export the per-basin revision series, basins index and storm "
+             "catalogs under static_export/ar/ (plus the regional episode catalogs "
+             "under model_data/)",
+    )
+    parser.add_argument(
+        "--ar-variable", metavar="NAME",
+        help="tARget mask variable name (auto-detected by default)",
+    )
+    parser.add_argument(
+        "--ar-min-cells", type=int, default=1, metavar="N",
+        help="Drop connected AR components smaller than N grid cells (default: 1)",
+    )
+    parser.add_argument(
         "--zip", action="store_true",
         help="Only zip/{code}.json from boundary_data/zip/zip_lookup.csv",
     )
@@ -1628,19 +1996,24 @@ def main() -> None:
 
     mode_count = (
         int(args.static) + int(args.data)
-        + int(args.forecast) + int(args.frontend)
+        + int(args.forecast) + int(args.frontend) + int(args.ar) + int(args.basins)
     )
     if mode_count > 1:
-        parser.error("Use at most one of --static, --data, --forecast, --frontend.")
+        parser.error("Use at most one of --static, --data, --forecast, --frontend, --ar.")
     if args.clean and mode_count:
         parser.error(
             "--clean applies only to a full export "
-            "(omit --static, --data, --forecast, and --frontend)."
+            "(omit --static, --data, --forecast, --frontend, and --ar)."
         )
     if _has_boundary_flags(args) and mode_count:
         parser.error(
             "Boundary flags (--zip, --admin, --huc, --military) cannot combine "
-            "with --static, --data, --forecast, or --frontend."
+            "with --static, --data, --forecast, --frontend, or --ar."
+        )
+    ar_options_set = bool(args.ar_variable or args.ar_min_cells != 1)
+    if ar_options_set and (args.data or args.forecast or args.frontend or _has_boundary_flags(args)):
+        parser.error(
+            "AR options can only be used with --ar, --static, or a full export."
         )
 
     # --clean wipes the tree, so a full rebuild follows naturally; --force keeps
@@ -1649,6 +2022,12 @@ def main() -> None:
     _FORCE_EXPORT = args.force or args.clean
 
     site_root = Path(args.output)
+    ar_sources = _discover_ar_sources()
+    if args.ar and not ar_sources:
+        parser.error(
+            f"--ar requires a cached tARget date range under "
+            f"{TARGET_AR_DATA_DIR}; run download.py --ar with dates first."
+        )
 
     if _has_boundary_flags(args) and mode_count == 0:
         parts = _resolve_boundary_parts(args)
@@ -1673,6 +2052,37 @@ def main() -> None:
         print(f"\nDone (--frontend). SPA ~ {spa_bytes / (1024 * 1024):.2f} MB under {frontend_root}")
         return
 
+    if args.ar:
+        site_root.mkdir(parents=True, exist_ok=True)
+        print("--ar: exporting Guan & Waliser tARget v4 frames...")
+        export_atmospheric_rivers(
+            site_root,
+            ar_sources,
+            variable=args.ar_variable,
+            min_cells=args.ar_min_cells,
+        )
+        print(f"\nDone (--ar). Atmospheric-river assets under {site_root / AR_DIR_NAME}")
+        return
+
+    if args.basins:
+        site_root.mkdir(parents=True, exist_ok=True)
+        data_root = site_root / DATA_DIR_NAME
+        print("--basins: copying regional episode catalogs...")
+        for model_key in MODEL_REGISTRY:
+            model_stats = STATS_ROOT / model_key
+            for huc2 in BASIN_HUC2_REGIONS:
+                episode_src = model_stats / episode_catalog_filename(huc2)
+                if episode_src.is_file():
+                    episode_out = data_root / model_key / episode_catalog_filename(huc2)
+                    episode_out.parent.mkdir(parents=True, exist_ok=True)
+                    _write_text_if_changed(episode_out, episode_src.read_text(encoding="utf-8"))
+        print("--basins: exporting basin revision series...")
+        export_basin_revisions(site_root)
+        print("--basins: exporting storm catalogs...")
+        export_storm_catalog(site_root)
+        print(f"\nDone (--basins). Basin assets under {site_root / AR_DIR_NAME}")
+        return
+
     if args.static:
         site_root.mkdir(parents=True, exist_ok=True)
         maptiler_key = _maptiler_key()
@@ -1689,6 +2099,19 @@ def main() -> None:
         export_forecast_data_layers(forecast_root)
         print("--static: exporting forecast calendar...")
         export_forecast_calendar(forecast_root)
+        if ar_sources:
+            print("--static: exporting tARget v4 atmospheric-river frames...")
+            export_atmospheric_rivers(
+                site_root,
+                ar_sources,
+                variable=args.ar_variable,
+                min_cells=args.ar_min_cells,
+            )
+        else:
+            print("--static: SKIP atmospheric-river frames (no tARget source configured)")
+        print("--static: exporting basin revision series...")
+        export_basin_revisions(site_root)
+        export_storm_catalog(site_root)
         print(
             f"\nDone (--static). S3 assets under {site_root} "
             f"and {forecast_root}"
@@ -1743,6 +2166,21 @@ def main() -> None:
 
     print("Exporting forecast calendar...")
     export_forecast_calendar(forecast_root)
+
+    if ar_sources:
+        print("Exporting tARget v4 atmospheric-river frames...")
+        export_atmospheric_rivers(
+            site_root,
+            ar_sources,
+            variable=args.ar_variable,
+            min_cells=args.ar_min_cells,
+        )
+    else:
+        print("SKIP atmospheric-river frames (no tARget source configured)")
+
+    print("Exporting basin revision series...")
+    export_basin_revisions(site_root)
+    export_storm_catalog(site_root)
 
     print("Building static frontend...")
     build_static_frontend(site_root / FRONTEND_DIR_NAME)

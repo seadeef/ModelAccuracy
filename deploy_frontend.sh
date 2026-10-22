@@ -27,13 +27,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
-
-if [[ -f "$ROOT/.env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "$ROOT/.env"
-  set +a
-fi
+source "$ROOT/deploy_common.sh"
+deploy_init "$ROOT"
 
 if [[ -z "${DATA_S3_URI:-}" ]]; then
   echo "ERROR: DATA_S3_URI not set (expected s3://bucket[/prefix])." >&2
@@ -47,12 +42,6 @@ if [[ -z "${CLOUDFRONT_DISTRIBUTION_ID:-}" ]]; then
   exit 1
 fi
 DISTRIBUTION_ID="$CLOUDFRONT_DISTRIBUTION_ID"
-AWS_REGION="${AWS_REGION:-us-west-1}"
-if [[ -n "${AWS_PROFILE:-}" ]]; then
-  export AWS_PROFILE
-  echo "==> Using AWS_PROFILE=${AWS_PROFILE}"
-fi
-
 SPA="$ROOT/static_export/frontend"
 
 if [[ -z "${SKIP_BUILD:-}" ]]; then

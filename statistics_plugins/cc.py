@@ -26,6 +26,7 @@ class CCPlugin:
         render_field="value",
         colormap="diverging_reversed",
         fixed_range=(0.0, 1.0),
+        winner_mode="higher",
     )
 
     def init_accumulator(self, shape: tuple[int, int]) -> dict[str, np.ndarray]:

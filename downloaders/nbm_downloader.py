@@ -43,6 +43,7 @@ _this_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(_this_dir.parent))
 sys.path.insert(0, str(_this_dir))
 
+from accumulation import daily_from_buckets
 from base import BaseDownloader
 from model_registry import US_CROP_BOUNDS
 
@@ -154,19 +155,17 @@ def _assemble_one(item: tuple) -> None:
     npy_out = Path(npy_out_str)
     target_transform = Affine(*transform_vals)
 
-    # Read and sum the four 6h grids.
-    total = None
+    # Read the four 6h grids; the shared core sums them into the daily total.
+    buckets = []
     src_transform = None
     src_crs = None
     for grib_path in sub_paths_str:
         with rasterio.open(grib_path) as src:
-            data = src.read(1).astype(np.float32)
-            if total is None:
-                total = data.copy()
+            buckets.append(src.read(1).astype(np.float32))
+            if src_transform is None:
                 src_transform = src.transform
                 src_crs = src.crs
-            else:
-                total += data
+    total = daily_from_buckets(buckets)
 
     # Reproject from Lambert Conformal to regular lat/lon with area-average
     # resampling (downsampling ~2.5 km → 0.25°); geometry still depends on

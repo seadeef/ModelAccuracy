@@ -15,18 +15,29 @@ from dotenv import load_dotenv
 
 load_dotenv(_project_root / ".env", override=True)
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 
 from model_registry import MODEL_REGISTRY
-from backend.request_models import ForecastAllModelsRequest, LeadWinnersRequest, StatsQueryRequest
+from backend.request_models import (
+    ForecastAllModelsRequest,
+    LeadWinnersRequest,
+    RevisionEfficiencyRequest,
+    StatsQueryRequest,
+)
 from backend.auth import public_auth_config
 from backend.shapes_router import create_shapes_router
 from backend.static_store import forecast_store_from_env, store_from_env
-from backend.stats_service import query_forecast_all_models_payload, query_lead_winners_payload, query_stats_payload
+from backend.stats_service import (
+    query_episode_catalog_payload,
+    query_forecast_all_models_payload,
+    query_lead_winners_payload,
+    query_revision_efficiency_payload,
+    query_stats_payload,
+)
 
 
 STATIC_SITE_ROOT = _project_root / "static_export"
@@ -123,6 +134,7 @@ class LongCacheStaticMiddleware(BaseHTTPMiddleware):
     _MUTABLE_PREFIXES = (
         "/tiles/",
         "/ranges/",
+        "/ar/",
         "/config.json",
         "/model_data/",
         "/forecast/",
@@ -155,7 +167,7 @@ app.add_middleware(LongCacheStaticMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
-@app.post("/api/stats/query")
+@app.post("/api/stats")
 def query_stats(
     payload: StatsQueryRequest,
     x_model: str | None = Header(
@@ -176,6 +188,24 @@ def query_stats(
 app.include_router(create_shapes_router())
 
 
+@app.post("/api/stats/revision-efficiency")
+def revision_efficiency(
+    payload: RevisionEfficiencyRequest,
+    x_model: str | None = Header(
+        None,
+        alias="X-Model",
+        description="Fallback model key when the model field is absent or empty.",
+    ),
+):
+    """Grid-pooled revision efficiency R for a region (yearly/seasonal only)."""
+    return query_revision_efficiency_payload(
+        payload,
+        store=STATIC_STORE,
+        header_model=x_model,
+        now_month=datetime.now(timezone.utc).month,
+    )
+
+
 @app.post("/api/stats/lead-winners")
 def lead_winners(payload: LeadWinnersRequest):
     """Best verification-stat model per lead day for the given map region (not domain-wide)."""
@@ -192,6 +222,23 @@ def forecast_all_models(payload: ForecastAllModelsRequest):
     return query_forecast_all_models_payload(
         payload, store=STATIC_STORE, forecast_store=_get_forecast_store(),
     )
+
+
+@app.get("/api/ar/episodes")
+def ar_episodes(
+    model: str = Query(...),
+    huc: str | None = Query(None),
+    huc2: str | None = Query(None),
+):
+    """Canonical episode metadata: one server-owned HUC6 basin with ``huc``,
+    or the all-basin metadata listing without it (episode-first entry).
+    The region is implied by the HUC6 prefix; ``huc2`` selects the region
+    (18 California, 17 Pacific Northwest, 14 Upper Colorado) for the listing."""
+    if huc is not None and (not huc.isdigit() or len(huc) != 6):
+        raise HTTPException(status_code=422, detail="huc must be a six-digit HUC6 code")
+    if huc2 is not None and (not huc2.isdigit() or len(huc2) != 2):
+        raise HTTPException(status_code=422, detail="huc2 must be a two-digit HUC2 code")
+    return query_episode_catalog_payload(model, huc, huc2=huc2, store=STATIC_STORE)
 
 
 class SiteStaticFiles(StaticFiles):
