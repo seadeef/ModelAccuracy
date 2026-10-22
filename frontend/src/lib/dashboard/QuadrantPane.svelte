@@ -6,7 +6,7 @@
    * accuracy statistic (better upward). The selected model is pinned as the
    * origin, so the quadrants read as "steadier / more accurate than it".
    */
-  import { ui, appConfig, statLabel } from '../state.svelte.js';
+  import { ui, appConfig, statLabel, isArPeriod } from '../state.svelte.js';
   import { dash, selectedLead, palette, modelLabel, statAt, statUnits } from './dashData.svelte.js';
   import ChartCanvas from './ChartCanvas.svelte';
   import { fmt, alpha } from './chartSetup.js';
@@ -18,7 +18,7 @@
   const mode = $derived(meta.winner_mode || 'lower'); // lower | higher | absolute_lower
   const lowerBetter = $derived(mode !== 'higher');
   const units = $derived(statUnits(ui.statistic));
-  const supported = $derived(ui.period === 'yearly' || ui.period === 'seasonal');
+  const supported = $derived(ui.period === 'yearly' || ui.period === 'seasonal' || isArPeriod(ui.period));
 
   const points = $derived.by(() => appConfig.models.map((m) => {
     const j = statAt(dash.consistency?.[m.key], lead, stabKey)?.value ?? null;

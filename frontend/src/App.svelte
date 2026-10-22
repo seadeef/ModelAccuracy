@@ -138,13 +138,13 @@
   const showPointGuide = $derived(
     ui.activeTool === 'point' && !ui.hasUsedPinTool,
   );
-  // The first-use hint hides once an area tool has been used, except that a
-  // watershed drill in progress keeps showing its breadcrumb (the only place
-  // the current drill depth is reported).
+  // The first-use hint hides once an area tool has been used, except for the
+  // watershed tool, whose hint carries the drill breadcrumb and the Enter /
+  // Escape instructions and so stays up until a basin is selected.
   const showBoundaryGuide = $derived(
     (ui.activeTool === 'state' || ui.activeTool === 'county' || ui.activeTool === 'watershed'
       || ui.activeTool === 'military')
-    && (!ui.hasUsedAreaDrawTool || (ui.activeTool === 'watershed' && ui.wbdDrillPath.length > 0)),
+    && (!ui.hasUsedAreaDrawTool || ui.activeTool === 'watershed'),
   );
   const boundaryGuideText = $derived.by(() => {
     if (ui.activeTool === 'county') return 'Click a county to analyze';
@@ -349,6 +349,7 @@
     gap: 12px;
   }
   .app.dash .map-box {
+    container: map-box / size;
     border-radius: 10px;
     overflow: hidden;
     border: 1px solid var(--panel-border);

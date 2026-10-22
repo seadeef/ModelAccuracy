@@ -47,4 +47,6 @@
   .map-key.bare .what { display: block; margin: 0 0 5px; font-size: 12px; color: var(--text-primary); }
   .map-key.bare .what b { font-weight: 600; color: var(--text-primary); }
   @media (max-width: 640px) { .map-key.bare { display: none; } }
+  /* Short map column (laptop heights): the toolbar reaches the key's row, so start the key right of it. */
+  @container map-box (max-height: 560px) { .map-key:not(.bare) { left: 72px; } }
 </style>

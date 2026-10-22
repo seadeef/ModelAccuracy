@@ -4,7 +4,7 @@
    * convergence RMSE vs lead for every model at the chosen threshold/scale,
    * with every model's value at the inspected lead ranked steadiest first.
    */
-  import { ui, appConfig } from '../state.svelte.js';
+  import { ui, appConfig, isArPeriod } from '../state.svelte.js';
   import { statisticTooltip } from '../helpText.js';
   import { dash, selectedLead, leadAxis, palette, statSeries, modelLabel, pickLead } from './dashData.svelte.js';
   import ChartCanvas from './ChartCanvas.svelte';
@@ -18,7 +18,7 @@
   const curve = $derived(ui.consistencyCurve === 'convergence' ? accKey : stabKey);
   const isJ = $derived(curve === stabKey);
   const cursor = cursorPlugin(() => selectedLead() - 1);
-  const supported = $derived(ui.period === 'yearly' || ui.period === 'seasonal' || ui.period === 'ar-episode');
+  const supported = $derived(ui.period === 'yearly' || ui.period === 'seasonal' || isArPeriod(ui.period));
 
   const config = $derived.by(() => {
     const datasets = appConfig.models.map((m) => ({
