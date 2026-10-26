@@ -126,7 +126,7 @@
   }
 </script>
 
-<div class="search" role="combobox" aria-expanded={open} aria-haspopup="listbox" aria-owns="address-suggestions">
+<div class="search" role="combobox" aria-expanded={open} aria-haspopup="listbox" aria-controls="address-suggestions" aria-owns="address-suggestions">
   <div class="search-box" class:search-box--open={open && suggestions.length > 0}>
     <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true">
       <circle cx="7" cy="7" r="4.5" />

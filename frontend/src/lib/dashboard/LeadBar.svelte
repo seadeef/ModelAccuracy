@@ -2,11 +2,13 @@
   /** Shared lead-day bar: best model per lead for the selected statistic; click = inspect that lead everywhere. */
   import { ui, statLabel, winnerStatKeys } from '../state.svelte.js';
   import { statColor } from '../palette.js';
-  import { dash, selectedLead, leadAxis, palette, modelLabel, pickLead } from './dashData.svelte.js';
+  import { dash, selectedLead, leadAxis, palette, modelLabel, pickLead, leadBoundsOf } from './dashData.svelte.js';
 
   const axis = $derived(leadAxis());
   const pal = $derived(palette());
   const lead = $derived(selectedLead());
+  /** Longest lead of the selected model; later days still rank the other models but have no tile or tile values for it. */
+  const modelMax = $derived(leadBoundsOf(ui.model).max);
   const payload = $derived(dash.winners[ui.statistic] ?? null);
   const supported = $derived(winnerStatKeys().includes(ui.statistic));
 </script>
@@ -23,9 +25,10 @@
         type="button"
         class="ls-cell"
         class:selected={l === lead}
+        class:beyond={l > modelMax}
         role="radio"
         aria-checked={l === lead}
-        title={`Lead day ${l}${w ? ` · best on ${statLabel(ui.statistic)}: ${modelLabel(w)}` : ''}`}
+        title={`Lead day ${l}${w ? ` · best on ${statLabel(ui.statistic)}: ${modelLabel(w)}` : ''}${l > modelMax ? ` · beyond ${modelLabel(ui.model)}'s ${modelMax}-day range: the map and tiles stay at day ${modelMax}` : ''}`}
         onclick={() => pickLead(l)}
       >
         <span class="ls-day">{l}</span>
@@ -45,6 +48,8 @@
   }
   .ls-cell:hover { background: #ffffff0e; }
   .ls-cell.selected { background: #6eb5ff24; border-color: #6eb5ff; }
+  .ls-cell.beyond { background: repeating-linear-gradient(135deg, #ffffff06 0 3px, transparent 3px 7px); }
+  .ls-cell.beyond .ls-day { color: var(--text-secondary); }
   .ls-day { font-size: 12px; font-weight: 600; line-height: 1; color: #c9d0da; }
   .ls-cell.selected .ls-day { color: #fff; }
   .ls-pill.foreign { color: var(--text-secondary); background: #ffffff08; }

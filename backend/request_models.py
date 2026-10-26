@@ -254,6 +254,52 @@ class RevisionEfficiencyRequest(BaseModel):
         return self
 
 
+class RegionBasinsRequest(BaseModel):
+    """Which catalogued AR basins (HUC6) a region touches — the storm pickers
+    limit the curated storm catalogs to them. Region rules as /api/stats."""
+
+    region: StatsRegion
+
+
+class RegionSeriesRequest(BaseModel):
+    """On-demand daily forecast/observation series for any region (the
+    per-basin JSON shape, pooled from the per-cell cube at request time).
+    Region rules are identical to /api/stats. ``models`` limits the fan-out
+    (default: every registered model)."""
+
+    region: StatsRegion
+    models: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_models(self) -> "RegionSeriesRequest":
+        if self.models is not None:
+            if not self.models or len(self.models) > 16:
+                raise ValueError("models must list 1..16 model keys")
+            bad = [m for m in self.models if not re.fullmatch(r"[a-z0-9_]{1,32}", str(m))]
+            if bad:
+                raise ValueError(f"invalid model keys: {bad}")
+        return self
+
+
+class RegionHeavyRainRequest(RegionSeriesRequest):
+    """Heavy-rain trigger sweep pooled over the region's cell-days at one lead.
+    ``q`` = event threshold (mm/day), ``dates`` = optional YYYYMMDD subset
+    (the client's scope: all complete days, a storm range…)."""
+
+    q: float = Field(..., gt=0, le=500)
+    lead: int = Field(..., ge=0, le=MAX_LEAD_DAYS)
+    dates: list[str] | None = None
+
+    @model_validator(mode="after")
+    def validate_dates(self) -> "RegionHeavyRainRequest":
+        if self.dates is not None:
+            if len(self.dates) > 5000:
+                raise ValueError("dates lists at most 5000 days")
+            if any(not re.fullmatch(r"\d{8}", str(d)) for d in self.dates):
+                raise ValueError("dates must be YYYYMMDD strings")
+        return self
+
+
 class ForecastAllModelsRequest(BaseModel):
     """Forecast values for all models across all leads for a given region."""
 

@@ -6,7 +6,7 @@
   import { ui, appConfig, isArPeriod } from '../state.svelte.js';
   import { statisticTooltip } from '../helpText.js';
   import { statColor } from '../palette.js';
-  import { dash, leadAxis, palette, statSeries, pickLead } from './dashData.svelte.js';
+  import { dash, leadAxis, palette, statSeries, pickLead, hasAnyValue, emptyReason } from './dashData.svelte.js';
   import ChartCanvas from './ChartCanvas.svelte';
   import { leadAxisOptions, cursorPlugin, endLabelPlugin, onClickIndex, fmt, alpha } from './chartSetup.js';
 
@@ -19,6 +19,9 @@
   const cursor = cursorPlugin(() => Math.max(1, Math.round(ui.leadFractional)) - 1);
   const ends = endLabelPlugin((ds) => ds.ident);
   const supported = $derived(ui.period === 'yearly' || ui.period === 'seasonal' || isArPeriod(ui.period));
+  /** Answered but all no_data for the drawn curve (dry cells leave J undefined; small units cover no cell). */
+  const scored = $derived(hasAnyValue(dash.consistency, curve));
+  const why = $derived(emptyReason(ui.selectedRegion, { periodSpecific: ui.period === 'seasonal' }));
 
   const config = $derived.by(() => {
     const datasets = appConfig.models.map((m) => ({
@@ -74,10 +77,16 @@
     </div>
   </div>
   <div class="plot clickable">
-    {#if dash.consistency}
+    {#if dash.consistency && scored}
       <ChartCanvas {config} />
+    {:else if !supported}
+      <div class="plot-empty">Consistency is computed for the full record and the four seasons</div>
+    {:else if dash.consistencyLoading}
+      <div class="plot-empty">Loading consistency curves…</div>
+    {:else if !dash.consistency}
+      <div class="plot-empty">The consistency request failed; change the period or region to retry</div>
     {:else}
-      <div class="plot-empty">{!supported ? 'Consistency is computed for the full record and the four seasons' : dash.consistencyLoading ? 'Loading consistency curves…' : 'No consistency data for this slice'}</div>
+      <div class="plot-empty"><span class="reason"><b>No scored {isJ ? 'J' : 'RMSE'} for this {ui.period === 'yearly' ? 'region' : 'season'}</b>{isJ && ui.period === 'seasonal' ? `J needs runs that both forecast rain above ${ui.consistencyThreshold} mm/d; a dry season leaves it undefined. ` : ''}{why}</span></div>
     {/if}
   </div>
 </article>
@@ -90,5 +99,6 @@
   .controls .cap { margin-left: 4px; }
   .controls .chip { padding: 2px 8px; font-size: 11.5px; }
   .clickable { cursor: pointer; }
+  .reason b { display: block; margin-bottom: 4px; font-weight: 600; color: var(--text-primary); }
   @media (max-width: 1250px) { .params > .cap { display: none; } }
 </style>

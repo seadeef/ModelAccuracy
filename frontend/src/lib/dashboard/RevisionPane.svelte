@@ -186,6 +186,7 @@
   .legend i.obs { background: repeating-linear-gradient(90deg, #7fd6a8 0 4px, transparent 4px 7px); }
   .legend .muted { color: var(--text-secondary); }
   .side { width: 270px; flex: none; border-left: 1px solid var(--rule); padding-left: 16px; display: flex; flex-direction: column; justify-content: center; gap: 4px; min-height: 0; overflow: auto; }
+  .side > .cap { white-space: normal; line-height: 1.35; }
   .rows { display: flex; flex-direction: column; gap: 9px; margin-top: 10px; }
   .row { display: grid; grid-template-columns: 46px 1fr 62px; align-items: center; gap: 8px; font-size: 13px; color: #bec6d2; }
   .row b { font-weight: 600; }

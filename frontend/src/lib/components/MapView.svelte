@@ -4,7 +4,7 @@
   import 'maplibre-gl/dist/maplibre-gl.css';
   import { appConfig, ui, isConsistencyStat } from '../state.svelte.js';
   import { FALLBACK_STYLE_URL, TILE_IMAGE_BOUNDS_WGS84, STATIC_BASE } from '../constants.js';
-  import { fetchAtmosphericRiverFrame, fetchArEpisodes } from '../api.js';
+  import { fetchAtmosphericRiverFrame } from '../api.js';
   import { createAtmosphericRiverMapLayer } from '../atmosphericRiverMapLayer.js';
   import {
     tileUrl, preloadLeads, clearLeadImages, getLeadImage,
@@ -350,17 +350,6 @@
    */
   let wbdAccum = new Map();
 
-  /**
-   * AR-mode basin picker: the entry point in atmospheric-river mode is to click
-   * one of the precomputed HUC6 basins, highlighted with the same boundary
-   * layer the watershed selector uses. `arBasinFc` is the FeatureCollection of
-   * only those basins that have AR statistics for `arBasinModel`; rebuilt when
-   * the model changes (precomputed coverage is per-model).
-   */
-  let arBasinFc = null;
-  let arBasinModel = null;
-  let arBasinGen = 0;
-
   const boundaryHover = createBoundaryHoverHandlers(() => map, {
     sourceId: boundarySourceId,
     hoveredIdRef: boundaryHoveredRef,
@@ -450,7 +439,6 @@
       hoveredIdRef: boundaryHoveredRef,
       onClick: boundaryModeLoaded === 'watershed-drill' ? handleWbdClick
         : boundaryModeLoaded === 'military' ? handleMilitaryClick
-        : boundaryModeLoaded === 'ar-basins' ? handleArBasinClick
         : handleAdminClick,
       onHoverEnter: boundaryHover.onHoverEnter,
       onHoverLeave: boundaryHover.onHoverLeave,
@@ -778,112 +766,6 @@
     if (boundaryModeLoaded !== 'watershed-drill') {
       teardownBoundarySelectionLayer();
       await startWbdDrill();
-    }
-  }
-
-  // ── AR-mode basin picker ────────────────────────────────────────────
-  /**
-   * FeatureCollection of the precomputed HUC6 basins for `model` (the ones the
-   * AR-episode catalog reports statistics for). Geometry is resolved through the
-   * same WBD chunks the watershed drill loads, so a picked basin is byte-for-byte
-   * the region a map drill would produce. Cached per model.
-   */
-  async function buildArBasinFc(model) {
-    if (arBasinFc && arBasinModel === model) return arBasinFc;
-    let catalog;
-    try {
-      catalog = await fetchArEpisodes({ model });
-    } catch {
-      return null;
-    }
-    const basins = catalog?.basins ?? [];
-    const features = (await Promise.all(
-      basins.map(async (b) => {
-        const code = String(b?.huc ?? '');
-        if (code.length !== 6) return null;
-        try {
-          const region = await resolveHucRegion(code);
-          if (!region?.geometry) return null;
-          return {
-            type: 'Feature',
-            id: code,
-            properties: { huc: code, level: 6, name: region.name || b.name || '' },
-            geometry: region.geometry,
-          };
-        } catch {
-          return null;
-        }
-      }),
-    )).filter(Boolean);
-    arBasinFc = { type: 'FeatureCollection', features };
-    arBasinModel = model;
-    return arBasinFc;
-  }
-
-  function handleArBasinClick(e) {
-    const f = e.features?.[0];
-    if (!f) return;
-    const code = String(f.properties?.huc ?? f.id ?? '');
-    // MapLibre hands back a tile-clipped geometry fragment; look the full basin
-    // up from the cached collection so the region/dim-mask cover the whole basin.
-    const full = arBasinFc?.features?.find((x) => String(x.id) === code);
-    const geometry = full?.geometry || f.geometry;
-    const bounds = geomBboxFromRegion(geometry);
-    ui.selectedRegion = {
-      type: 'huc',
-      huc: code,
-      level: 6,
-      name: full?.properties?.name || f.properties?.name || '',
-      bounds,
-      geometry,
-    };
-    ui.hasUsedAreaDrawTool = true;
-    teardownBoundarySelectionLayer();
-    if (Array.isArray(bounds) && bounds.every(Number.isFinite)) {
-      map.fitBounds(
-        [[bounds[0], bounds[1]], [bounds[2], bounds[3]]],
-        { padding: 60, maxZoom: 9, duration: 700 },
-      );
-    }
-  }
-
-  async function setupArBasinLayer(model) {
-    if (!map) return;
-    if (ui.selectedRegion?.type === 'huc') return;
-    const gen = ++arBasinGen;
-    const fc = await buildArBasinFc(model);
-    // Superseded (model changed / region picked / left AR mode) while resolving.
-    if (gen !== arBasinGen || !map || ui.mode !== 'atmospheric-rivers'
-        || ui.selectedRegion?.type === 'huc') {
-      return;
-    }
-    teardownBoundarySelectionLayer();
-    if (!fc || !fc.features.length) {
-      boundaryModeLoaded = null;
-      return;
-    }
-    setupBoundaryLayer(map, {
-      sourceId: boundarySourceId,
-      fillLayerId: boundaryFillLayerId,
-      outlineLayerId: boundaryOutlineLayerId,
-      data: fc,
-      dimLayerId,
-      drawFillLayerId,
-      onClick: handleArBasinClick,
-      onHoverEnter: boundaryHover.onHoverEnter,
-      onHoverLeave: boundaryHover.onHoverLeave,
-    });
-    boundaryModeLoaded = 'ar-basins';
-    // Frame the CA basins so the highlighted picker targets are visible.
-    const union = fc.features.reduce((acc, feat) => {
-      const b = geomBboxFromRegion(feat.geometry);
-      if (!acc) return b;
-      return [Math.min(acc[0], b[0]), Math.min(acc[1], b[1]),
-        Math.max(acc[2], b[2]), Math.max(acc[3], b[3])];
-    }, null);
-    if (union && union.every(Number.isFinite)) {
-      map.fitBounds([[union[0], union[1]], [union[2], union[3]]],
-        { padding: 60, maxZoom: 8, duration: 700 });
     }
   }
 
@@ -1391,6 +1273,7 @@
     if (e.key === 'Escape') {
       if (isDrawing || polyPoints.length > 0 || rectStart) {
         cancelInProgressDraw();
+        e.preventDefault(); // handled here: App must not also close the dashboard
       }
     }
   }
@@ -1402,7 +1285,6 @@
   // no dep is tracked, and later button clicks never re-run this effect.
   $effect(() => {
     const tool = ui.activeTool;
-    const mode = ui.mode;
     if (!map) return;
     const canvas = map.getCanvas();
     if (tool) {
@@ -1411,10 +1293,8 @@
     } else {
       canvas.style.cursor = '';
     }
-    // In AR mode the map's boundary layer is the precomputed-basin picker, driven
-    // solely by the AR-basin effect below; the draw/admin/watershed tools do not
-    // manage boundary selection here (mode is tracked so this re-runs on switch).
-    if (mode === 'atmospheric-rivers') return;
+    // Mode is presentation-only and deliberately not read here: a mode toggle
+    // must not re-draw a selection layer that a finished pick already tore down.
     if (tool === 'state' || tool === 'county') {
       if (boundaryModeLoaded !== tool) {
         teardownBoundarySelectionLayer();
@@ -1440,32 +1320,19 @@
     }
   });
 
-  // AR-mode basin picker: show the precomputed HUC6 basins as the entry point
-  // whenever AR mode is active and no basin is selected yet; tear it down on
-  // leaving AR mode or once a basin is picked. Rebuilds when the model changes
-  // (precomputed coverage is per-model).
+  // Clear draw visualization when region is cleared, and re-arm the picker:
+  // a finished pick tears its boundary layer down, so closing the dashboard
+  // (× or Escape) must bring the active tool's layer back for the next pick.
   $effect(() => {
-    const mode = ui.mode;
-    const model = ui.model;
-    const region = ui.selectedRegion;
-    if (!map) return;
-    const wantPicker = mode === 'atmospheric-rivers' && region?.type !== 'huc';
-    if (wantPicker) {
-      if (boundaryModeLoaded !== 'ar-basins' || arBasinModel !== model) {
-        void setupArBasinLayer(model);
-      }
-    } else if (boundaryModeLoaded === 'ar-basins') {
-      arBasinGen += 1; // supersede any in-flight setup
-      teardownBoundarySelectionLayer();
-    }
-  });
-
-  // Clear draw visualization when region is cleared
-  $effect(() => {
+    const tool = ui.activeTool;
     if (!ui.selectedRegion && map) {
       clearDrawState();
-      if (ui.activeTool === 'watershed' && boundaryModeLoaded !== 'watershed-drill') {
+      if (tool === 'watershed' && boundaryModeLoaded !== 'watershed-drill') {
         void setupWatershedTool();
+      } else if ((tool === 'state' || tool === 'county') && boundaryModeLoaded !== tool) {
+        void setupAdminLayer(tool);
+      } else if (tool === 'military' && boundaryModeLoaded !== 'military') {
+        void setupMilitaryLayer();
       }
     }
   });
@@ -1548,9 +1415,6 @@
     coarseMql.addEventListener('change', coarseMqlHandler);
 
     map.on('click', (event) => {
-      // AR mode's only map interaction is the precomputed-basin picker (its own
-      // fill-layer click handler); the draw tools never create a region here.
-      if (ui.mode === 'atmospheric-rivers') return;
       if (ui.activeTool) handleDrawClick(event);
     });
 

@@ -7,7 +7,7 @@
    * origin, so the quadrants read as "steadier / more accurate than it".
    */
   import { ui, appConfig, statLabel, isArPeriod } from '../state.svelte.js';
-  import { dash, selectedLead, palette, modelLabel, statAt, statUnits } from './dashData.svelte.js';
+  import { dash, selectedLead, palette, modelLabel, statAt, statUnits, hasAnyValue, emptyReason } from './dashData.svelte.js';
   import ChartCanvas from './ChartCanvas.svelte';
   import { fmt, alpha } from './chartSetup.js';
 
@@ -19,6 +19,9 @@
   const lowerBetter = $derived(mode !== 'higher');
   const units = $derived(statUnits(ui.statistic));
   const supported = $derived(ui.period === 'yearly' || ui.period === 'seasonal' || isArPeriod(ui.period));
+  /** Nothing scored at any lead (not just this one): explain the region or season rather than the lead. */
+  const nothingScored = $derived(!!dash.accuracy && !!dash.consistency
+    && !(hasAnyValue(dash.accuracy, ui.statistic) && hasAnyValue(dash.consistency, stabKey)));
 
   const points = $derived.by(() => appConfig.models.map((m) => {
     const j = statAt(dash.consistency?.[m.key], lead, stabKey)?.value ?? null;
@@ -26,7 +29,13 @@
     const acc = raw == null ? null : mode === 'absolute_lower' ? Math.abs(raw) : raw;
     return { key: m.key, label: m.label, j, raw, acc };
   }).filter((p) => p.j != null && p.acc != null));
-  const origin = $derived(points.find((p) => p.key === ui.model) ?? null);
+  /** The selected model is the origin; when it has no value at this lead (NBM / WeatherNext 2 past
+   *  their range) the first scoring model stands in, and the pane says so. */
+  const originFallback = $derived(!points.some((p) => p.key === ui.model) && points.length > 0);
+  const origin = $derived(points.find((p) => p.key === ui.model) ?? points[0] ?? null);
+  const originKey = $derived(origin?.key ?? ui.model);
+  /** J for the pair ending at the longest lead needs a run that does not exist: say so instead of "not enough models". */
+  const longest = $derived(Math.max(...appConfig.models.map((m) => m.lead_days_max ?? 14)));
   const better = (p) => origin && p.key !== origin.key && p.j < origin.j && (lowerBetter ? p.acc < origin.acc : p.acc > origin.acc);
   const steadier = (p) => origin && p.key !== origin.key && p.j < origin.j;
   const moreAccurate = (p) => origin && p.key !== origin.key && (lowerBetter ? p.acc < origin.acc : p.acc > origin.acc);
@@ -87,11 +96,11 @@
     const datasets = [{
       label: 'models',
       data: points.map((p) => ({ x: p.j, y: p.acc, key: p.key, label: p.label, raw: p.raw })),
-      pointRadius: points.map((p) => (p.key === ui.model ? 7 : 5.5)),
+      pointRadius: points.map((p) => (p.key === originKey ? 7 : 5.5)),
       pointHoverRadius: 8,
       pointBackgroundColor: points.map((p) => alpha(pal[p.key]?.text, 0.9)),
-      pointBorderColor: points.map((p) => (p.key === ui.model ? '#fff' : alpha(pal[p.key]?.text, 1))),
-      pointBorderWidth: points.map((p) => (p.key === ui.model ? 2 : 1)),
+      pointBorderColor: points.map((p) => (p.key === originKey ? '#fff' : alpha(pal[p.key]?.text, 1))),
+      pointBorderWidth: points.map((p) => (p.key === originKey ? 2 : 1)),
       showLine: false,
     }];
     const yLabel = `${statLabel(ui.statistic)}${units ? ` (${units})` : ''}${mode === 'absolute_lower' ? ', magnitude' : ''}`;
@@ -115,13 +124,17 @@
 
   const beats = $derived(points.filter(better));
   const verdict = $derived.by(() => {
-    if (!origin) return `${modelLabel(ui.model)} has no value at lead day ${lead} on this slice.`;
-    const o = pal[ui.model]?.ident ?? origin.label;
-    if (!beats.length) return `No model is both steadier and more accurate than ${o} at lead day ${lead}.`;
+    if (!origin) {
+      if (lead >= longest) return `Jumpiness compares each run with the run before it, so there is no pair ending at lead day ${lead}, the longest lead. Pick lead day ${longest - 1} or shorter.`;
+      return `No model has both a jumpiness and a ${statLabel(ui.statistic)} value at lead day ${lead} here.`;
+    }
+    const o = pal[originKey]?.ident ?? origin.label;
+    const pre = originFallback ? `${modelLabel(ui.model)} has no lead ${lead}, so ${o} is the origin. ` : '';
+    if (!beats.length) return `${pre}No model is both steadier and more accurate than ${o} at lead day ${lead}.`;
     const names = beats.map((p) => pal[p.key]?.ident ?? p.label);
     const list = names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : names[0];
     const verb = names.length === 1 ? 'is' : names.length === 2 ? 'are both' : 'are all';
-    return `${list} ${verb} steadier and more accurate than ${o} at lead day ${lead}.`;
+    return `${pre}${list} ${verb} steadier and more accurate than ${o} at lead day ${lead}.`;
   });
 </script>
 
@@ -131,7 +144,7 @@
       <div class="eyebrow" title="Every model at the inspected lead. x = jumpiness J for the run pair ending at this lead (threshold and scale from the consistency pane); y = the selected accuracy statistic at this lead. The selected model is the origin, so the shaded quadrant holds models that beat it on both.">
         Steadiness against accuracy at lead day <em>{lead}</em>
       </div>
-      <span class="cap">origin = <b style:color={pal[ui.model]?.text}>{modelLabel(ui.model)}</b></span>
+      <span class="cap">origin = <b style:color={pal[originKey]?.text}>{modelLabel(originKey)}</b></span>
     </div>
     <div class="plot">
       {#if !supported}
@@ -139,7 +152,7 @@
       {:else if points.length >= 2}
         <ChartCanvas {config} />
       {:else}
-        <div class="plot-empty">{dash.consistencyLoading || dash.accuracyLoading ? 'Loading curves…' : `Not enough models score at lead day ${lead}`}</div>
+        <div class="plot-empty">{dash.consistencyLoading || dash.accuracyLoading ? 'Loading curves…' : nothingScored ? `Nothing scored here. ${emptyReason(ui.selectedRegion, { periodSpecific: ui.period === 'seasonal' })}` : lead >= longest ? `No run pair ends at lead day ${lead}, the longest lead — pick lead day ${longest - 1} or shorter` : `Fewer than two models score at lead day ${lead}`}</div>
       {/if}
     </div>
   </section>
@@ -149,12 +162,12 @@
       <thead><tr><th></th><th title="Jumpiness for the run pair ending at this lead">J</th><th title={statLabel(ui.statistic)}>{statLabel(ui.statistic)}</th><th>Steadier</th><th>More accurate</th></tr></thead>
       <tbody>
         {#each points.slice().sort((a, b) => a.j - b.j) as p (p.key)}
-          <tr class:on={p.key === ui.model}>
+          <tr class:on={p.key === originKey}>
             <td><b style:color={pal[p.key]?.text}>{pal[p.key]?.ident}</b></td>
             <td>{fmt(p.j, 3)}</td>
             <td>{fmt(p.raw, 2)}{units}</td>
-            <td class:yes={steadier(p)}>{p.key === ui.model ? '·' : steadier(p) ? 'yes' : 'no'}</td>
-            <td class:yes={moreAccurate(p)}>{p.key === ui.model ? '·' : moreAccurate(p) ? 'yes' : 'no'}</td>
+            <td class:yes={steadier(p)}>{p.key === originKey ? '·' : steadier(p) ? 'yes' : 'no'}</td>
+            <td class:yes={moreAccurate(p)}>{p.key === originKey ? '·' : moreAccurate(p) ? 'yes' : 'no'}</td>
           </tr>
         {/each}
       </tbody>

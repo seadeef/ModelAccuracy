@@ -25,10 +25,14 @@ from model_registry import MODEL_REGISTRY
 from backend.request_models import (
     ForecastAllModelsRequest,
     LeadWinnersRequest,
+    RegionBasinsRequest,
+    RegionHeavyRainRequest,
+    RegionSeriesRequest,
     RevisionEfficiencyRequest,
     StatsQueryRequest,
 )
 from backend.auth import public_auth_config
+from backend.series_query import basins_for_region, heavy_rain_for_region_all_models, series_for_region_all_models
 from backend.shapes_router import create_shapes_router
 from backend.static_store import forecast_store_from_env, store_from_env
 from backend.stats_service import (
@@ -222,6 +226,58 @@ def forecast_all_models(payload: ForecastAllModelsRequest):
     return query_forecast_all_models_payload(
         payload, store=STATIC_STORE, forecast_store=_get_forecast_store(),
     )
+
+
+@app.post("/api/series")
+def region_series(payload: RegionSeriesRequest):
+    """Daily forecast/observation series for ANY region, every model, pooled
+    from the per-cell cube at request time (``backend.series_query``). Same
+    payload shape per model as ``/ar/basin_revisions/{model}/{huc}.json``;
+    a model whose cube is not exported, or a region covering no land cell,
+    answers ``null`` for that model."""
+    models = payload.models
+    if models is not None:
+        unknown = [m for m in models if m not in MODEL_REGISTRY]
+        if unknown:
+            raise HTTPException(status_code=422, detail=f"unknown models: {unknown}")
+    result = series_for_region_all_models(
+        STATIC_STORE, payload.region.model_dump(exclude_none=True), models)
+    if not result["available"]:
+        raise HTTPException(
+            status_code=404,
+            detail="No per-cell cube is exported; run compute_stats.py --only cube "
+                   "and export_static.py --cube.")
+    return result
+
+
+@app.post("/api/series/basins")
+def region_basins(payload: RegionBasinsRequest):
+    """The catalogued atmospheric-river basins (HUC6) whose grid cells a region
+    shares (``backend.series_query.basins_for_region``). ``[]`` when the region
+    touches none, or when no AR basin index is exported."""
+    return {"hucs": basins_for_region(STATIC_STORE, payload.region.model_dump(exclude_none=True))}
+
+
+@app.post("/api/series/heavy-rain")
+def region_heavy_rain(payload: RegionHeavyRainRequest):
+    """Heavy-rain trigger sweep for ANY region, every model, judged per
+    CELL-DAY over the region (event = PRISM ≥ q in a cell on a day). Same
+    fields as the browser's region-mean ``triggerSkill``; see
+    ``backend.series_query.heavy_rain_for_region`` for why the estimand differs."""
+    models = payload.models
+    if models is not None:
+        unknown = [m for m in models if m not in MODEL_REGISTRY]
+        if unknown:
+            raise HTTPException(status_code=422, detail=f"unknown models: {unknown}")
+    result = heavy_rain_for_region_all_models(
+        STATIC_STORE, payload.region.model_dump(exclude_none=True),
+        q=float(payload.q), lead=int(payload.lead), dates=payload.dates, models=models)
+    if not result["available"]:
+        raise HTTPException(
+            status_code=404,
+            detail="No per-cell cube is exported; run compute_stats.py --only cube "
+                   "and export_static.py --cube.")
+    return result
 
 
 @app.get("/api/ar/episodes")

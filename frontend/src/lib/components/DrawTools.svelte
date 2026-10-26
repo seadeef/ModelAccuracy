@@ -141,15 +141,14 @@
 <svelte:window onclick={handleClickOutside} />
 
 <div class="toolbar">
-  <!-- AR mode's only entry point is clicking a precomputed basin on the map, so
-       the free-form area / admin selection tools are DISABLED (not hidden) while
-       it is active — the toolbar keeps its shape and the AR button its place. -->
+  <!-- Every selection tool works in AR mode too: the dashboard's storm tabs
+       pool any region on demand, so a state, a county or a drawn shape opens
+       the same AR-scoped analysis. -->
   {#each drawTools as tool}
     <button
       class="tool-btn"
-      class:active={!arModeActive && ui.activeTool === tool.id}
-      disabled={arModeActive}
-      title={arModeActive ? `${tool.label} — unavailable in AR mode` : toolTitle(tool)}
+      class:active={ui.activeTool === tool.id}
+      title={toolTitle(tool)}
       onclick={() => selectTool(tool.id)}
     >
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
@@ -163,9 +162,8 @@
   {#each adminTools as tool}
     <button
       class="tool-btn"
-      class:active={!arModeActive && ui.activeTool === tool.id}
-      disabled={arModeActive}
-      title={arModeActive ? `${tool.label} — unavailable in AR mode` : toolTitle(tool)}
+      class:active={ui.activeTool === tool.id}
+      title={toolTitle(tool)}
       onclick={() => selectTool(tool.id)}
     >
       <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
@@ -181,7 +179,7 @@
     class:active={arModeActive}
     title={arModeActive
       ? 'Atmospheric-river mode — click to return to Explore'
-      : 'Atmospheric-river mode — show AR footprints and episode/AR-day scoring for California basins'}
+      : 'Atmospheric-river mode — scrub tARget footprints on a timeline, then open any region\'s storm analysis for that range'}
     aria-pressed={arModeActive}
     onclick={toggleArMode}
   >
@@ -208,7 +206,7 @@
 
         {#if showSavePrompt}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
-          <div class="popover save-popover" onclick={(e) => e.stopPropagation()}>
+          <div class="popover save-popover" role="dialog" aria-label="Save region" tabindex="-1" onclick={(e) => e.stopPropagation()}>
             <div class="popover-title">Save region</div>
             <form class="save-form" onsubmit={(e) => { e.preventDefault(); handleSave(); }}>
               <input
@@ -217,7 +215,7 @@
                 placeholder="Region name…"
                 bind:value={saveName}
                 maxlength="200"
-                autofocus
+                {...{ autofocus: true }}
               />
               <button type="submit" class="save-submit" disabled={saving || !saveName.trim()}>
                 {saving ? '…' : 'Save'}
@@ -242,7 +240,7 @@
 
       {#if showLoadPopover}
         <!-- svelte-ignore a11y_click_events_have_key_events -->
-        <div class="popover load-popover" onclick={(e) => e.stopPropagation()}>
+        <div class="popover load-popover" role="dialog" aria-label="Saved regions" tabindex="-1" onclick={(e) => e.stopPropagation()}>
           <div class="popover-title">Saved regions</div>
           {#if loadingShapes}
             <div class="popover-msg">Loading…</div>

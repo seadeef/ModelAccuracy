@@ -94,7 +94,7 @@
               {#if f.ci}<i class="ci" style:left="{(100 * f.ci[0]) / forestMax}%" style:width="{(100 * (f.ci[1] - f.ci[0])) / forestMax}%"></i>{/if}
               {#if f.value != null}<i class="dot" style:left="{(100 * f.value) / forestMax}%" style:background={pal[f.key]?.text}></i>{/if}
             </div>
-            <span>{f.value == null ? (f.skillGainNonpositive ? 'no skill gain' : '—') : fmt(f.value, 2)} <small>{f.ci ? fmtCi(f.ci) : f.reason}</small></span>
+            <span>{f.value == null ? (f.skillGainNonpositive ? 'no skill gain' : '—') : fmt(f.value, 2)} <small>{f.ci ? fmtCi(f.ci) : f.suppressed ? 'no interval' : f.reason}</small></span>
           </div>
         {/each}
       </div>
@@ -118,7 +118,7 @@
   .head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 6px; min-width: 0; }
   .head .eyebrow { flex: 1; }
   .head.stack { flex-direction: column; align-items: flex-start; gap: 6px; }
-  .rows { display: flex; flex-direction: column; gap: 10px; flex: 1; justify-content: center; }
+  .rows { display: flex; flex-direction: column; gap: 14px; flex: 1; justify-content: flex-start; padding-top: 10px; }
   .row { display: grid; grid-template-columns: 46px 1fr 120px; align-items: center; gap: 10px; font-size: 13px; color: #bec6d2; }
   .row.on { color: #eef2f7; }
   .row b { font-weight: 600; }
@@ -126,7 +126,7 @@
   .track .ref { position: absolute; top: 0; bottom: 0; width: 1px; background: #ffffff55; }
   .track .ci { position: absolute; top: 6px; height: 4px; background: #ffffff33; border-radius: 2px; }
   .track .dot { position: absolute; top: 3px; width: 10px; height: 10px; border-radius: 50%; margin-left: -5px; }
-  .row span { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .row span { white-space: nowrap; font-variant-numeric: tabular-nums; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .row small { color: var(--text-secondary); font-size: 11px; }
-  .col > .cap { margin-top: 6px; }
+  .col > .cap { margin-top: 6px; white-space: normal; line-height: 1.35; }
 </style>

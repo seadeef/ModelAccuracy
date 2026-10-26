@@ -3,8 +3,9 @@
   import { ui, appConfig, accuracyStatKeys, statLabel } from '../state.svelte.js';
   import { statisticTooltip } from '../helpText.js';
   import { statColor } from '../palette.js';
-  import { dash, selectedLead, statAt, modelLabel, palette } from './dashData.svelte.js';
+  import { dash, selectedLead, statAt, modelLabel, palette, leadBeyondModel, leadBoundsOf } from './dashData.svelte.js';
   import { fmt } from './chartSetup.js';
+  import { fitText } from '../fitText.js';
 
   let { onstatchange } = $props();
   const NAMES = { nmad: 'Error · NMAD', cc: 'Correlation', nrmse: 'RMS error', rb: 'Bias' };
@@ -23,7 +24,7 @@
 </script>
 
 <div class="tiles">
-  <div class="eyebrow"><em style:color={pal[ui.model]?.text}>{modelLabel(ui.model)}</em> at lead day <em>{lead}</em></div>
+  <div class="eyebrow" use:fitText={{ min: 9 }} title={leadBeyondModel() ? `${modelLabel(ui.model)} forecasts ${leadBoundsOf(ui.model).max} days ahead at most; pick an earlier day or another model` : undefined}><em style:color={pal[ui.model]?.text}>{modelLabel(ui.model)}</em> at lead day <em>{lead}</em>{#if leadBeyondModel()}<span class="cap note">· beyond its {leadBoundsOf(ui.model).max}-day range</span>{/if}</div>
   <div class="grid">
     {#each keys as k (k)}
       {@const s = statAt(dash.accuracy?.[ui.model], lead, k)}
@@ -39,6 +40,7 @@
 <style>
   .tiles { flex: none; padding: 12px 14px 14px; border: 1px solid var(--panel-border); border-radius: 12px; background: var(--pane-bg); display: flex; flex-direction: column; gap: 10px; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .note { margin-left: 6px; text-transform: none; letter-spacing: 0; }
   .tile {
     display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 10px 6px 8px; font: inherit; cursor: pointer;
     background: #ffffff05; border: 1px solid var(--panel-border); border-radius: 10px; color: var(--text-primary); position: relative; overflow: hidden;

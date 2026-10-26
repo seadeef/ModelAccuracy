@@ -68,16 +68,23 @@ python download.py --ar --start-date 2025-01-01 --end-date 2025-01-31 --force
 ### `compute_stats.py`
 
 This is the only statistics producer. With no stage filter it runs verification,
-coupled consistency, basin histories, and AR episode diagnostics for every model.
-Missing WBD or staged tARget inputs skip only the dependent optional stages and
-are reported in the final summary.
+coupled consistency, basin histories, AR episode diagnostics and the per-cell
+daily cube for every model. Missing WBD or staged tARget inputs skip only the
+dependent optional stages and are reported in the final summary.
 
 ```bash
 python compute_stats.py                              # every available product, all models
 python compute_stats.py --model gfs                  # every available product, one model
 python compute_stats.py --only consistency --only basin
 python compute_stats.py --only episodes --force      # basin dependency is resolved automatically
+python compute_stats.py --only cube                  # per-cell daily cube (stats_output/{model}/cube/, ~1 min per model)
 ```
+
+The `cube` stage (`stats_pipeline/cube.py`) is the basin stage generalised to
+every land grid cell: `forecasts.npy` (float16, cells × dates × leads) and
+`observed.npy` (PRISM area-averaged onto the model grid) over the scorable
+dates, self-gated on its `meta.json`. `export_static.py --cube` publishes it
+and `POST /api/series` pools it over any region at request time.
 
 Statistics are stored as monthly accumulators, with yearly and seasonal views derived by summing:
 
@@ -152,6 +159,7 @@ Builds the flat `static_export/` tree for disk-backed serving: the bundled Vite 
 - `python export_static.py --data` — only `static_export/model_data/` (verification `.bin` + `grid.json`).
 - `python export_static.py --forecast` — only `static_export/forecast/` (forecast bins + `forecast_calendar.json`).
 - `python export_static.py --frontend` — only the bundled SPA under `static_export/frontend/`.
+- `python export_static.py --cube` — only the per-cell daily cubes `static_export/cube/{model}/{meta.json, cells.npy, forecasts.npy, observed.npy}` (hard-linked from `stats_output/{model}/cube/`, built by `compute_stats.py --only cube`). They back `POST /api/series`, which gives any region — a state, a HUC2, a county, a drawn shape — the same daily forecast/observation series the exported basins have, so the dashboard's storm tabs work everywhere. About 100–150 MB per model (float16, land cells only); also part of the full export, not of `--static`.
 
 Boundary flags (combinable with each other, not with build modes): `--zip`, `--admin`, `--huc`, `--military`. Each writes both halves of its output — `--admin`/`--huc`/`--military` produce the map TopoJSON/GeoJSON *and* the polygon JSON the backend reads for region masks (from disk in dev, from S3 on Lambda). WBD chunk polygons are coordinate-rounded on export (`CHUNK_COORD_DECIMALS`, ~11 m) — half the bytes, bit-identical masks.
 
@@ -352,6 +360,8 @@ Dynamic routes:
 - `POST /api/stats` — regional lead queries and AR-episode scoped statistic queries
 - `GET /api/ar/episodes?model=<key>&huc=<huc6>` — canonical episode metadata only; the HUC6 prefix picks the regional catalog (`episodes.json` for California, `episodes_huc17.json` / `episodes_huc14.json` for the Pacific Northwest / Upper Colorado). Without `huc`, `huc2=<NN>` selects the region for the all-basin listing (default 18).
 - `POST /api/stats/lead-winners` — best verification statistic per lead for the current map region
+- `POST /api/series` — `{region, models?}` → daily forecast/observation series for ANY region, pooled at request time from the per-cell cube (`static_export/cube/`, see `--cube`): one payload per model in the `ar/basin_revisions` JSON shape (`dates`, `forecasts[date][lead]`, `observed`, `lead_min/max`, `primary_valid_range`) plus `source: "cube"`, `cells` (pooled count) and `nearest_cell` (a point or all-water sub-cell region took the nearest land cell). Equal cell weights, no lock-in leads, no AR episode membership; a model without a cube answers `null`, no cube at all → 404.
+- `POST /api/series/heavy-rain` — `{region, q, lead, dates?, models?}` → the heavy-rain trigger sweep (precision, recall, F1, frequency bias per trigger 0–80 mm, AP, the t = q operating point) judged per **cell-day** over the region from the same cube: event = PRISM ≥ q in a grid cell on a day. The browser's region-mean sweep stays for exported basins (a daily basin total is the estimand there); for a state the mean almost never reaches 25 mm, so this is what the Heavy rain tab uses for every cube-served region.
 - `POST /api/stats/forecast` — forecast values for all models across all leads for a region
 - `GET /api/ar/episodes (catalog) and POST /api/stats (episode values)` — list precomputed CA HUC6 AR episode
   ranges; include `episodeId` to receive that episode's R and basin lock-in gap

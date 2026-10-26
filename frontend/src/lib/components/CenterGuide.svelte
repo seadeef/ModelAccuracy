@@ -1,10 +1,16 @@
 <script>
   import { ui } from '../state.svelte.js';
+  import { fitText } from '../fitText.js';
   /**
    * Centered glass status overlay used to instruct the user mid-flow
    * (e.g. "Click a state to analyze"). Body is a snippet so callers can
    * compose rich text. Auto-repositions above the bottom dashboard panel
    * whenever a region is selected — callers don't need to wire that.
+   *
+   * Text never leaves the bubble: each line is nowrap inside a bounded box,
+   * ``use:fitText`` shrinks it when it would overflow, and ellipsis is the
+   * last resort. Callers should keep the body static and put anything
+   * variable (a basin name) in ``hint``.
    *
    * Props:
    *   children — body snippet (the main instruction line)
@@ -21,9 +27,9 @@
   role="status"
   aria-live="polite"
 >
-  <div class="center-guide-text">{@render children?.()}</div>
+  <div class="center-guide-text" use:fitText={{ min: 12 }}>{@render children?.()}</div>
   {#if hint}
-    <div class="center-guide-hint">{hint}</div>
+    <div class="center-guide-hint" use:fitText={{ min: 10 }}>{hint}</div>
   {/if}
 </div>
 
@@ -72,6 +78,13 @@
   }
   .center-guide--with-panel {
     top: min(40vh, calc(100vh - 52vh - 56px));
+  }
+  .center-guide-text, .center-guide-hint {
+    max-width: 100%;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .center-guide-text {
     font-size: 16px;

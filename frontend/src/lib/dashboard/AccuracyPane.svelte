@@ -3,7 +3,7 @@
   import { ui, statLabel, appConfig } from '../state.svelte.js';
   import { statisticTooltip } from '../helpText.js';
   import { statColor } from '../palette.js';
-  import { dash, leadAxis, palette, statSeries, statUnits, pickLead } from './dashData.svelte.js';
+  import { dash, leadAxis, palette, statSeries, statUnits, pickLead, hasAnyValue, emptyReason } from './dashData.svelte.js';
   import ChartCanvas from './ChartCanvas.svelte';
   import { leadAxisOptions, cursorPlugin, endLabelPlugin, onClickIndex, fmt, alpha } from './chartSetup.js';
 
@@ -14,6 +14,9 @@
   const ends = endLabelPlugin((ds) => ds.ident);
   const meta = $derived(appConfig.statistics.find((s) => s.key === ui.statistic) ?? {});
   const polarity = $derived(meta.winner_mode === 'higher' ? 'higher is better' : meta.winner_mode === 'absolute_lower' ? 'closer to 0 is better' : 'lower is better');
+  /** The request answered, but every model is no_data for this statistic: say why instead of drawing empty axes. */
+  const scored = $derived(hasAnyValue(dash.accuracy, ui.statistic));
+  const why = $derived(emptyReason(ui.selectedRegion, { periodSpecific: ui.period === 'seasonal' || ui.period === 'monthly' }));
 
   const config = $derived.by(() => {
     const stat = ui.statistic;
@@ -48,10 +51,14 @@
     <span class="cap">{polarity}</span>
   </div>
   <div class="plot clickable">
-    {#if dash.accuracy}
+    {#if dash.accuracy && scored}
       <ChartCanvas {config} />
+    {:else if dash.accuracyLoading}
+      <div class="plot-empty">Loading accuracy curves…</div>
+    {:else if !dash.accuracy}
+      <div class="plot-empty">The accuracy request failed; change the period or region to retry</div>
     {:else}
-      <div class="plot-empty">{dash.accuracyLoading ? 'Loading accuracy curves…' : 'No accuracy data for this slice'}</div>
+      <div class="plot-empty"><span class="reason"><b>No scored data for this {ui.period === 'yearly' ? 'region' : 'slice'}</b>{why}</span></div>
     {/if}
   </div>
 </article>
@@ -60,4 +67,5 @@
   .pane { display: flex; flex-direction: column; min-width: 0; min-height: 0; padding: 12px 16px 10px; }
   .head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 6px; min-width: 0; }
   .clickable { cursor: pointer; }
+  .reason b { display: block; margin-bottom: 4px; font-weight: 600; color: var(--text-primary); }
 </style>

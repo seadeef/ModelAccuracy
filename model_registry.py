@@ -258,7 +258,9 @@ MODEL_REGISTRY: dict[str, ModelConfig] = {
         # 2026-05-12 together with AIFS v2 (ECMWF announcement, pinned
         # 2026-07-24), so the 49r1→50r1 boundary mirrors the AIFS v1.1→v2
         # boundary exactly: last 49r1 12Z init 2026-05-11, first 50r1 init
-        # 2026-05-12. Never pooled across the switch.
+        # 2026-05-12. Never pooled across the switch. 50r1 also removed the
+        # control member from the open-data ENS, so the 50r1 era is the HRES
+        # deterministic run (downloaders.ifs_downloader.IFS_OPER_FIRST_DATE).
         version_windows=(
             VersionWindow("49r1", None, date(2026, 5, 11), "clean"),
             VersionWindow("50r1", date(2026, 5, 12), None, "current"),

@@ -1,9 +1,10 @@
 <script>
   /** Dashboard header: region identity, model + period controls, export menu, close. */
-  import { ui, appConfig, accuracyStatKeys } from '../state.svelte.js';
+  import { ui, appConfig, accuracyStatKeys, isArPeriod } from '../state.svelte.js';
   import { MONTH_NAMES } from '../constants.js';
   import { dash, palette, regionTitle, regionKind, leadAxis } from './dashData.svelte.js';
   import { buildDashboardCsv, downloadText } from './dashboardCsv.js';
+  import { fitText } from '../fitText.js';
   import Dropdown from './Dropdown.svelte';
 
   let { onmodelchange, onperiodchange, onexportmap, onclose } = $props();
@@ -11,7 +12,11 @@
   const modelItems = $derived(appConfig.models.map((m) => ({
     key: m.key, label: m.label, color: pal[m.key]?.text, sub: `leads 1–${m.lead_days_max ?? 14}`,
   })));
-  const periodItems = [
+  /** AR mode has its own period (the timeline's date range); offer it so the picker reflects the real state and can return to it. */
+  const arPeriodItems = $derived(ui.mode === 'atmospheric-rivers' || isArPeriod(ui.period)
+    ? [{ key: 'ar-episode', label: 'AR range', sub: 'dates from the timeline', group: 'Atmospheric rivers' }] : []);
+  const periodItems = $derived([
+    ...arPeriodItems,
     { key: 'yearly', label: 'Full record', sub: 'every scored day', group: 'Period' },
     { key: 'seasonal:djf', label: 'Winter', sub: 'Dec – Feb' },
     { key: 'seasonal:mam', label: 'Spring', sub: 'Mar – May' },
@@ -20,8 +25,8 @@
     ...Array.from({ length: 12 }, (_, i) => ({
       key: `monthly:${String(i + 1).padStart(2, '0')}`, label: MONTH_NAMES[i + 1], sub: 'accuracy only', group: i === 0 ? 'Month' : undefined,
     })),
-  ];
-  const periodValue = $derived(ui.period === 'seasonal' ? `seasonal:${ui.season}` : ui.period === 'monthly' ? `monthly:${ui.month}` : 'yearly');
+  ]);
+  const periodValue = $derived(isArPeriod(ui.period) ? 'ar-episode' : ui.period === 'seasonal' ? `seasonal:${ui.season}` : ui.period === 'monthly' ? `monthly:${ui.month}` : 'yearly');
   function pickPeriod(key) {
     const [p, sub] = key.split(':');
     ui.period = p;
@@ -31,8 +36,8 @@
     onperiodchange?.();
   }
   const exportItems = [
-    { key: 'csv', label: 'Download CSV', sub: 'every model × lead, best model, basin series' },
-    { key: 'json', label: 'Basin series JSON', sub: 'raw forecast history for this basin' },
+    { key: 'csv', label: 'Download CSV', sub: 'every model × lead, best model, daily series' },
+    { key: 'json', label: 'Daily series JSON', sub: 'raw forecast history for this region' },
     { key: 'map', label: 'Map image', sub: 'current overlay with the region' },
   ];
   function doExport(key) {
@@ -54,17 +59,23 @@
   }
   const subtitle = $derived.by(() => {
     const r = ui.selectedRegion;
-    const parts = [regionKind(r)];
+    const info = dash.basinInfo;
+    if (!r) return 'click the map to analyze another area';
+    // A point (or an all-water sliver) is scored from the nearest land cell: say so once, in place of the kind.
+    const parts = [info?.source === 'cube' && info.nearestCell ? 'Nearest 0.25° grid cell' : regionKind(r)];
     if (r?.type === 'huc') parts.push(`HUC${String(r.huc).length} ${r.huc}`);
-    if (dash.basinInfo?.region) parts.push(dash.basinInfo.region);
+    if (info?.region) parts.push(info.region);
+    if (info?.source === 'cube' && !info.nearestCell && info.cells != null) {
+      parts.push(`${info.cells} grid cell${info.cells === 1 ? '' : 's'}`);
+    }
     return parts.join(' · ');
   });
 </script>
 
 <header class="dash-header">
   <div class="brand">
-    <span class="name">{regionTitle(ui.selectedRegion)}</span>
-    <small>{subtitle}</small>
+    <span class="name" use:fitText={{ min: 14 }}>{regionTitle(ui.selectedRegion) || 'No area selected'}</span>
+    <small use:fitText={{ min: 10 }}>{subtitle}</small>
   </div>
   <div class="controls">
     <Dropdown items={modelItems} value={ui.model} ariaLabel="Forecast model" title="Model on the map, in the tiles and highlighted on every chart" width="176px"
@@ -72,7 +83,7 @@
     <Dropdown items={periodItems} value={periodValue} ariaLabel="Period" title="Days pooled for the map, the lead bar and the accuracy and consistency curves" width="154px"
       onselect={pickPeriod} />
     <Dropdown items={exportItems} value={null} placeholder="Export" ariaLabel="Export" compact width="96px" align="right" onselect={doExport} />
-    <button type="button" class="close" title="Back to the map" aria-label="Close dashboard" onclick={() => onclose?.()}>×</button>
+    <button type="button" class="close" title="Back to the map (Esc)" aria-label="Close dashboard" onclick={() => onclose?.()}>×</button>
   </div>
 </header>
 

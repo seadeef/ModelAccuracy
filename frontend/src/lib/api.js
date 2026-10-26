@@ -82,6 +82,83 @@ export async function fetchBasinRevisionsAllModels({ huc, signal } = {}) {
   return Object.keys(byModel).length ? byModel : null;
 }
 
+/**
+ * On-demand daily series for ANY region (``POST /api/series``): the backend
+ * pools the per-cell cube over the region at request time and answers one
+ * basin-shaped payload per model (``{ models: { [key]: payload | null } }``).
+ * Models without a cube, or a region covering no land cell, come back null
+ * and are omitted. Returns ``{ [modelKey]: payload }`` or null when nothing
+ * loaded (404 = no cube exported at all).
+ */
+export async function fetchRegionSeriesAllModels({ region, signal } = {}) {
+  if (!region) return null;
+  try {
+    const resp = await fetch(`${API_BASE}/api/series`, {
+      method: 'POST',
+      headers: headersWithAuth({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ region: regionPayload(region) }),
+      signal,
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const byModel = {};
+    for (const [key, payload] of Object.entries(data?.models || {})) if (payload) byModel[key] = payload;
+    return Object.keys(byModel).length ? byModel : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The catalogued atmospheric-river basins (HUC6 codes) a region's grid cells
+ * share (``POST /api/series/basins``). The storm pickers keep only the
+ * curated storms whose ``basin_hucs`` meet this list. ``[]`` when the region
+ * touches none; null when the request failed.
+ */
+export async function fetchRegionBasins({ region, signal } = {}) {
+  if (!region) return null;
+  try {
+    const resp = await fetch(`${API_BASE}/api/series/basins`, {
+      method: 'POST',
+      headers: headersWithAuth({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ region: regionPayload(region) }),
+      signal,
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return Array.isArray(data?.hucs) ? data.hucs.map(String) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Heavy-rain trigger sweep for any region, judged per CELL-DAY over the
+ * region (``POST /api/series/heavy-rain``): the server's counterpart of
+ * ``triggerSkill`` for regions where the region-mean event degenerates.
+ * ``dates`` is the YYYYMMDD population (the current scope). Returns
+ * ``{ [modelKey]: result }`` (``result.unavailable`` when the model lacks the
+ * lead) or null.
+ */
+export async function fetchHeavyRainAllModels({ region, q, lead, dates, signal } = {}) {
+  if (!region) return null;
+  try {
+    const resp = await fetch(`${API_BASE}/api/series/heavy-rain`, {
+      method: 'POST',
+      headers: headersWithAuth({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ region: regionPayload(region), q, lead, dates: dates ?? null }),
+      signal,
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const byModel = {};
+    for (const [key, r] of Object.entries(data?.models || {})) if (r) byModel[key] = r;
+    return Object.keys(byModel).length ? byModel : null;
+  } catch {
+    return null;
+  }
+}
+
 function verificationStatisticsOnly() {
   return appConfig.statistics.filter((s) => s.scope === 'region');
 }

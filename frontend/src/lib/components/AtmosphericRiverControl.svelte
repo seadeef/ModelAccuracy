@@ -15,7 +15,7 @@
 
   /**
    * Headless AR coordinator. The visible timeline (range drill, day cells,
-   * frame scrubber, episode markers) lives in the stats panel (ArTimeline);
+   * frame slider, episode markers) lives in ArRangeControl (dashboard AR tab and the bare-map AR panel);
    * this component owns the invariants that must hold even when the panel is
    * closed (no basin selected yet):
    *  - the manifest is loaded on first AR-mode entry,
@@ -52,7 +52,9 @@
   });
 
   // Keep the map's footprint frame inside the current range. The scrubber is
-  // user-driven; this only re-lands the frame when the range excludes it.
+  // user-driven; this only re-lands the frame when the range excludes it —
+  // onto the inspected day when that day is in the range (a storm pick lands
+  // on its peak), else onto the range's first footprints.
   $effect(() => {
     const frames = arData.frames;
     const start = ui.arRangeStart;
@@ -64,7 +66,9 @@
       const win = windowIndices({ start, end });
       if (!win) return;
       if (!path || idx < win.lo || idx > win.hi) {
-        selectFrame(firstWithFootprints(win.lo, win.hi));
+        const t = ui.arTargetDate;
+        const day = t && t >= start && t <= end ? windowIndices({ start: t, end: t }) : null;
+        selectFrame(day ? firstWithFootprints(day.lo, day.hi) : firstWithFootprints(win.lo, win.hi));
       }
     });
   });

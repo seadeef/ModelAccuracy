@@ -305,6 +305,67 @@ export function triggerSkill(rev, idx, q, li) {
   };
 }
 
+// ── Storm ledger for any region ──
+
+function pearson(xs, ys) {
+  const n = xs.length;
+  let mx = 0; let my = 0;
+  for (let i = 0; i < n; i++) { mx += xs[i]; my += ys[i]; }
+  mx /= n; my /= n;
+  let sxy = 0; let sxx = 0; let syy = 0;
+  for (let i = 0; i < n; i++) { const a = xs[i] - mx; const b = ys[i] - my; sxy += a * b; sxx += a * a; syy += b * b; }
+  return sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : null;
+}
+
+/**
+ * Per-model ledger over a storm's days for a region served from the per-cell
+ * cube (the curated ledger exists for the exported basins only): rain
+ * observed (region-mean mm summed over the days), the wettest day, the mean
+ * total |run-to-run revision| per day, pooled R, lead-1 and lead-``lead``
+ * absolute error and the lead-``lead`` correlation, plus RMS revision by run
+ * pair for the steadiness curve. ``positions`` = date positions in the storm;
+ * revision and error terms use the complete dates only.
+ */
+export function stormLedger(rev, positions, { lead = 3 } = {}) {
+  const n = nLeads(rev);
+  const li = lead - rev.lead_min;
+  let rain = 0;
+  let wettest = null;
+  let obsDays = 0;
+  const complete = [];
+  for (const d of positions) {
+    const y = rev.observed[d];
+    if (y != null && Number.isFinite(y)) {
+      rain += y; obsDays++;
+      if (wettest === null || y > rev.observed[wettest]) wettest = d;
+    }
+    if (isComplete(rev, d)) complete.push(d);
+  }
+  const out = {
+    days: positions.length, obsDays, rain, wettest, complete: complete.length,
+    revision: null, r: null, mae1: null, maeL: null, corrL: null, rmsByPair: null, pairLeads: null, lead,
+  };
+  if (!complete.length) return out;
+  const wf = waterfall(rev, complete);
+  out.rmsByPair = wf.meanSquaredRevisionByPair.map(Math.sqrt);
+  out.pairLeads = wf.pairLeads;
+  out.r = revisionEfficiency(rev, complete, null).value;
+  let revTot = 0; let e1 = 0; let eL = 0;
+  const xs = []; const ys = [];
+  for (const d of complete) {
+    const fc = rev.forecasts[d];
+    const y = rev.observed[d];
+    for (let i = 0; i < n - 1; i++) revTot += Math.abs(fc[i] - fc[i + 1]);
+    e1 += Math.abs(fc[0] - y);
+    if (li >= 0 && li < n) { eL += Math.abs(fc[li] - y); xs.push(fc[li]); ys.push(y); }
+  }
+  out.revision = revTot / complete.length;
+  out.mae1 = e1 / complete.length;
+  if (xs.length) out.maeL = eL / xs.length;
+  if (xs.length >= 3) out.corrL = pearson(xs, ys);
+  return out;
+}
+
 // ── Day ranking helpers ──
 
 /** Dates (positions) inside a range with an observation, newest last. */
@@ -327,4 +388,45 @@ export function wettestDay(rev, positions) {
     if (best === null || y > rev.observed[best]) best = d;
   }
   return best;
+}
+
+function dayNumber(ymd) {
+  return Date.UTC(Number(ymd.slice(0, 4)), Number(ymd.slice(4, 6)) - 1, Number(ymd.slice(6, 8))) / 86400000;
+}
+
+/**
+ * The ``count`` wettest non-overlapping ``span``-day spells on record, wettest
+ * first: ``{ start, end, total, peak }`` as positions (``total`` in mm summed
+ * over the spell, ``peak`` its wettest day). Windows must be consecutive
+ * calendar days with an observation on each; this is pure PRISM, so it ranks
+ * rain, not atmospheric-river attribution — the storm catalog does that.
+ */
+export function wettestSpells(rev, { span = 5, count = 6 } = {}) {
+  const n = rev.dates.length;
+  if (n < span) return [];
+  const sums = [];
+  for (let s = 0; s + span <= n; s++) {
+    if (dayNumber(rev.dates[s + span - 1]) - dayNumber(rev.dates[s]) !== span - 1) continue;
+    let tot = 0;
+    let ok = true;
+    for (let d = s; d < s + span; d++) {
+      const y = rev.observed[d];
+      if (y == null) { ok = false; break; }
+      tot += y;
+    }
+    if (ok) sums.push({ s, tot });
+  }
+  sums.sort((a, b) => b.tot - a.tot);
+  const taken = new Uint8Array(n);
+  const out = [];
+  for (const { s, tot } of sums) {
+    if (out.length >= count) break;
+    let clash = false;
+    for (let d = s; d < s + span; d++) if (taken[d]) { clash = true; break; }
+    if (clash) continue;
+    for (let d = s; d < s + span; d++) taken[d] = 1;
+    const positions = Array.from({ length: span }, (_, i) => s + i);
+    out.push({ start: s, end: s + span - 1, total: tot, peak: wettestDay(rev, positions) });
+  }
+  return out;
 }

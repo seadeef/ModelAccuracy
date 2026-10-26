@@ -931,6 +931,30 @@ def _polygon_mask_centers_or_corners(
     return _subgrid_mask(n_lon, n_lat * n_lon, ridx, cidx, inside)
 
 
+# Sub-cell regions (a HUC12, a small county, a tight drawn shape) take the
+# cell(s) whose footprint overlaps their bounding box — the answer the point
+# tool gives for a click on them — instead of no_data. The fallback is gated
+# on the bbox being at most this many grid steps on BOTH axes, so a region
+# that merely clips the grid's edge (Alaska's bbox reaches the top rows) is
+# still honestly empty.
+SUBCELL_FALLBACK_MAX_STEPS = 2.0
+
+
+def _subcell_bbox_mask(
+    lats: np.ndarray, lons: np.ndarray, bbox: list | tuple | None,
+) -> np.ndarray | None:
+    """Footprint-overlap mask for a sub-cell region's bbox, or None when the
+    bbox is missing or too large to be a sub-cell case."""
+    if not bbox or len(bbox) != 4:
+        return None
+    west, south, east, north = (float(v) for v in bbox)
+    lat_step = float(abs(lats[1] - lats[0])) if lats.size > 1 else float("inf")
+    lon_step = float(abs(lons[1] - lons[0])) if lons.size > 1 else float("inf")
+    if (east - west) > SUBCELL_FALLBACK_MAX_STEPS * lon_step or (north - south) > SUBCELL_FALLBACK_MAX_STEPS * lat_step:
+        return None
+    return _mask_rectangle_overlap(lats, lons, west, south, east, north)
+
+
 def _multi_polygon_mask(
     lats: np.ndarray,
     lons: np.ndarray,
@@ -981,9 +1005,13 @@ def _admin_region_mask(
         mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
         if not np.any(mask):
             mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
-        # No centroid fallback: a region that covers no grid cell (too small, or off
-        # the grid) is honest no_data — not the nearest edge cell dressed up as the
-        # region's value.
+        if not np.any(mask):
+            # Sub-cell county → the cell(s) containing it (see _subcell_bbox_mask).
+            # An off-grid region (bbox larger than the gate, or overlapping no
+            # cell) stays honestly empty — never the nearest edge cell.
+            fallback = _subcell_bbox_mask(lats, lons, entry.get("bbox"))
+            if fallback is not None:
+                return fallback
         return mask
 
     return _admin_mask_cache.get_or_compute((id(lats), id(lons), level, fips), compute)
@@ -1005,7 +1033,11 @@ def _huc_region_mask(
         mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=False)
         if not np.any(mask):
             mask = _multi_polygon_mask(lats, lons, n_lat, n_lon, polygons, use_corners=True)
-        # No centroid fallback (see _admin_region_mask): no covered cell → no_data.
+        if not np.any(mask):
+            # Sub-cell HUC10/12 → the cell(s) containing it (see _subcell_bbox_mask).
+            fallback = _subcell_bbox_mask(lats, lons, entry.get("bbox"))
+            if fallback is not None:
+                return fallback
         return mask
 
     return _huc_mask_cache.get_or_compute((id(lats), id(lons), huc), compute)
@@ -1072,7 +1104,13 @@ def _build_region_mask(
             poly_mask = _polygon_mask_centers(lats, lons, n_lat, n_lon, ring)
             if not np.any(poly_mask):
                 poly_mask = _polygon_mask_centers_or_corners(lats, lons, n_lat, n_lon, ring)
-            # No nearest-cell fabrication: a polygon covering no grid cell is no_data.
+            if not np.any(poly_mask):
+                # Sub-cell drawn shape → the cell(s) containing it (see _subcell_bbox_mask).
+                xs = [p[0] for p in ring]
+                ys = [p[1] for p in ring]
+                fallback = _subcell_bbox_mask(lats, lons, (min(xs), min(ys), max(xs), max(ys)))
+                if fallback is not None:
+                    return fallback
             return poly_mask
 
         return _geom_mask_cache.get_or_compute(geom_key, compute_poly)

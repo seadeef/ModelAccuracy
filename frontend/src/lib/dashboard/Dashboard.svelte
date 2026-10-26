@@ -11,14 +11,16 @@
   import { untrack } from 'svelte';
   import { appConfig, ui, accuracyStatKeys, winnerStatKeys, isArPeriod } from '../state.svelte.js';
   import {
-    fetchStatsAllLeadsAllModels, fetchLeadWinnersForRegion, fetchRevisionEfficiency,
-    fetchBasinsIndex, fetchBasinRevisionsAllModels, fetchArEpisodes, fetchStormCatalog,
+    fetchStatsAllLeadsAllModels, fetchLeadWinnersForRegion,
+    fetchBasinsIndex, fetchBasinRevisionsAllModels, fetchRegionSeriesAllModels, fetchRegionBasins, fetchArEpisodes, fetchStormCatalog,
     fetchForecastAllVariables,
   } from '../api.js';
   import { STATIC_BASE } from '../constants.js';
-  import { dash, resetDash, leadAxis, leadSink, regionKind, periodLabel } from './dashData.svelte.js';
-  import { datesInRange, wettestDay } from '../basinAnalysis.js';
+  import { dash, resetDash, leadAxis, leadSink, regionKind, regionTitle, periodLabel, regionKey, rangeOrigin } from './dashData.svelte.js';
+  import { datesInRange, wettestDay, wettestSpells } from '../basinAnalysis.js';
+  import { regionStormsFor } from './basinScope.svelte.js';
   import { ymdToIso, isoToYmd } from '../bootstrap.js';
+  import { fitText } from '../fitText.js';
   import LeadBar from './LeadBar.svelte';
   import AccuracyPane from './AccuracyPane.svelte';
   import ConsistencyPane from './ConsistencyPane.svelte';
@@ -30,16 +32,6 @@
   resetDash();
   $effect(() => { leadSink.fn = onleadchange; return () => { leadSink.fn = null; }; });
 
-  function regionKey(r) {
-    if (!r) return '';
-    if (r.type === 'point') return `pt:${r.coordinates.join(',')}`;
-    if (r.type === 'rectangle') return `rect:${(r.bounds || r.coordinates || []).join(',')}`;
-    if (r.type === 'polygon') return `poly:${JSON.stringify(r.coordinates)}`;
-    if (r.type === 'admin') return `admin:${r.level}:${r.fips}`;
-    if (r.type === 'huc') return `huc:${r.huc}`;
-    if (r.type === 'military') return `mil:${r.site}`;
-    return JSON.stringify(r);
-  }
 
   /** Climatology period the gridded products are read at (AR mode keeps yearly). */
   function gridPeriod() {
@@ -123,37 +115,17 @@
     });
   });
 
-  // ── Grid-pooled revision efficiency per model (non-basin fallback) ──
-  let rgGen = 0;
-  let rgKey = '';
-  $effect(() => {
-    const region = ui.selectedRegion;
-    const period = gridPeriod();
-    const season = ui.season;
-    const supported = period === 'yearly' || period === 'seasonal';
-    const key = region && supported ? `${regionKey(region)}|${period}|${season}` : '';
-    if (key === rgKey) return;
-    rgKey = key;
-    const gen = ++rgGen;
-    if (!key) { dash.revisionGrid = null; return; }
-    queueMicrotask(async () => {
-      const entries = await Promise.all(appConfig.models.map(async (m) => [
-        m.key, await fetchRevisionEfficiency({ model: m.key, region, period, season }),
-      ]));
-      if (gen !== rgGen) return;
-      const out = {};
-      for (const [k, v] of entries) if (v) out[k] = v;
-      dash.revisionGrid = out;
-    });
-  });
-
-  // ── Basin resolution + series/catalog/storms ──
+  // ── Daily series behind the storm tabs ──
+  // A click inside an exported HUC6 basin reads that basin's canonical history
+  // (area-weighted, with its AR episode and storm catalogs). Every other
+  // region — state, HUC2/4, county, installation, point or drawn shape — is
+  // pooled from the per-cell cube on demand (``POST /api/series``), so the
+  // storm tabs always have data; only the catalog-backed scopes stay basin-only.
   let basinGen = 0;
   let basinKey = '';
   $effect(() => {
     const region = ui.selectedRegion;
-    const huc = region?.type === 'huc' && String(region.huc).length >= 6 ? String(region.huc).slice(0, 6) : null;
-    const key = huc || '';
+    const key = region ? regionKey(region) : '';
     if (key === basinKey) return;
     basinKey = key;
     const gen = ++basinGen;
@@ -162,22 +134,44 @@
     dash.basinSeries = null;
     dash.episodes = null;
     dash.storms = null;
-    if (!huc) return;
+    dash.regionStorms = null;
+    if (!region) { dash.basinLoading = false; return; }
+    const huc6 = region.type === 'huc' && String(region.huc).length >= 6 ? String(region.huc).slice(0, 6) : null;
     dash.basinLoading = true;
     queueMicrotask(async () => {
-      const index = await fetchBasinsIndex();
-      const info = index?.basins?.[huc] ?? null;
+      const info = huc6 ? ((await fetchBasinsIndex())?.basins?.[huc6] ?? null) : null;
       if (gen !== basinGen) return;
-      if (!info) { dash.basinLoading = false; return; }
-      const [series, storms] = await Promise.all([
-        fetchBasinRevisionsAllModels({ huc }),
-        fetchStormCatalog(info.huc2),
-      ]);
-      if (gen !== basinGen) return;
-      dash.basinHuc = huc;
-      dash.basinInfo = info;
-      dash.basinSeries = series;
-      dash.storms = storms;
+      if (info) {
+        const [series, storms] = await Promise.all([
+          fetchBasinRevisionsAllModels({ huc: huc6 }),
+          fetchStormCatalog(info.huc2),
+        ]);
+        if (gen !== basinGen) return;
+        dash.basinHuc = huc6;
+        dash.basinInfo = { ...info, source: 'basin' };
+        dash.basinSeries = series;
+        dash.storms = storms;
+        dash.regionStorms = regionStormsFor([huc6], [storms]);
+      } else {
+        // The region's series and the catalogued basins it touches load
+        // together; the storm catalogs of those basins' regions follow.
+        const [series, hucs] = await Promise.all([
+          fetchRegionSeriesAllModels({ region }),
+          fetchRegionBasins({ region }),
+        ]);
+        if (gen !== basinGen) return;
+        const huc2s = [...new Set((hucs ?? []).map((h) => h.slice(0, 2)))];
+        const catalogs = await Promise.all(huc2s.map((h) => fetchStormCatalog(h)));
+        if (gen !== basinGen) return;
+        // Storms land with the series: the default range below reads both at once
+        // (a series without its storms would open on a wet spell, not the latest storm).
+        const first = series ? Object.values(series)[0] : null;
+        dash.regionStorms = regionStormsFor(hucs ?? [], catalogs);
+        dash.basinInfo = series
+          ? { name: regionTitle(region), region: null, source: 'cube', cells: first?.cells ?? null, nearestCell: !!first?.nearest_cell }
+          : null;
+        dash.basinSeries = series;
+      }
       dash.basinLoading = false;
     });
   });
@@ -201,12 +195,11 @@
     });
   });
 
-  // ── Default inspected range + day once a basin's series is in ──
+  // ── Default inspected range + day once a region's series is in ──
   $effect(() => {
     const series = dash.basinSeries;
-    const storms = dash.storms;
-    const huc = dash.basinHuc;
-    if (!series || !huc) return;
+    const storms = dash.regionStorms;
+    if (!series) return;
     untrack(() => {
       const rev = series[ui.model] ?? Object.values(series)[0];
       if (!rev?.dates?.length) return;
@@ -215,17 +208,27 @@
       const s = isoToYmd(ui.arRangeStart);
       const e = isoToYmd(ui.arRangeEnd);
       const rangeOk = s && e && s >= first && e <= last && s <= e;
-      if (!rangeOk) {
-        // Most recent analysed storm that touched this basin; else the last 30 days.
-        const ev = (storms?.events || []).filter((x) => x.in_analysis && x.basin_hucs?.includes(huc)).at(-1);
+      // A storm picked for another region is stale here unless that storm reached this region too.
+      const key = regionKey(ui.selectedRegion);
+      const reached = (storms || []).some((ev) => ev.start_date === ui.arRangeStart && ev.end_date === ui.arRangeEnd);
+      const stale = !!rangeOrigin.regionKey && rangeOrigin.regionKey !== key && !reached;
+      if (!rangeOk || stale) {
+        // Most recent analysed storm that reached this region; else the region's
+        // wettest five-day spell on record; else the last 30 days.
+        const ev = (storms || []).filter((s) => s.notable).at(-1) ?? null;
+        const spell = ev ? null : wettestSpells(rev, { span: 5, count: 1 })[0];
         if (ev) {
           ui.arRangeStart = ev.start_date;
           ui.arRangeEnd = ev.end_date;
+        } else if (spell) {
+          ui.arRangeStart = ymdToIso(rev.dates[spell.start]);
+          ui.arRangeEnd = ymdToIso(rev.dates[spell.end]);
         } else {
           ui.arRangeStart = ymdToIso(rev.dates[Math.max(0, rev.dates.length - 30)]);
           ui.arRangeEnd = ymdToIso(last);
         }
         ui.arEpisodeId = null;
+        rangeOrigin.regionKey = key;
       }
       const range = [isoToYmd(ui.arRangeStart), isoToYmd(ui.arRangeEnd)];
       const target = isoToYmd(ui.arTargetDate);
@@ -257,7 +260,7 @@
 
 <section class="results">
   <div class="top">
-    <div class="eyebrow" title="The map, the lead bar and both curves pool every scored day of this period over the drawn region. The storm panes below read the basin's own forecast history instead.">Pooled over the {regionKind(ui.selectedRegion).toLowerCase()} · <em>{periodLabel()}</em></div>
+    <div class="eyebrow" use:fitText={{ min: 9 }} title="The map, the lead bar and both curves pool every scored day of this period over the drawn region. The storm panes below read the region's own daily forecast history instead: the exported HUC6 basin when the click lands in one, otherwise the per-cell archive pooled over the region.">Pooled over the {regionKind(ui.selectedRegion).toLowerCase()} · <em>{periodLabel()}</em></div>
     <LeadBar />
   </div>
   <div class="paired">

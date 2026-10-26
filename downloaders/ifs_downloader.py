@@ -7,8 +7,12 @@ Source: s3://ecmwf-forecasts/{YYYYMMDD}/{HH}z/ifs/0p25/enfo/
 Same bucket and byte-range machinery as the AIFS downloader (which this
 subclasses); three differences:
 
-  1. every enfo lead file holds all 51 ensemble members — the control member
-     is selected by filtering index lines on ``type == "cf"``;
+  1. every enfo lead file holds all ensemble members — the control member
+     is selected by filtering index lines on ``type == "cf"``. From Cycle
+     50r1 (2026-05-12) the open-data ENS carries only the 50 perturbed
+     members, so the unperturbed run is read from the HRES deterministic
+     stream instead (``oper``, ``type == "fc"``, same 0.25° grid); the
+     registry's 49r1/50r1 version windows keep the two eras unpooled;
   2. ``tp`` is cumulative *meters* of water (GRIB_units "m"), not kg m**-2,
      so daily totals are ×1000 → mm via ``daily_from_cumulative_meters``
      (shared with the fig7_1 round-trip harness — one source of truth);
@@ -41,6 +45,11 @@ from aifs_downloader import AIFSDownloaderParallel
 # Cycle 49r1 went operational 2024-11-12; earlier enfo cycles exist in the
 # bucket but predate every other model's record (peers start 2025-05-06).
 IFS_FIRST_DATE = datetime(2024, 11, 12)
+# Cycle 50r1 (operational 2026-05-12, mirrored in MODEL_REGISTRY["ifs"]
+# version_windows) dropped the control member from the open-data ENS: the
+# enfo index lists ``type == "pf"`` only. The unperturbed forecast continues
+# as the HRES deterministic run (stream ``oper``, ``type == "fc"``).
+IFS_OPER_FIRST_DATE = datetime(2026, 5, 12)
 
 
 class IFSControlDownloaderParallel(AIFSDownloaderParallel):
@@ -66,17 +75,40 @@ class IFSControlDownloaderParallel(AIFSDownloaderParallel):
         )
         self.purge_gribs = purge_gribs
 
+    @staticmethod
+    def _source(init_date: datetime) -> tuple[str, str, str]:
+        """(stream, file suffix, index ``type``) for the unperturbed run of an init."""
+        if init_date >= IFS_OPER_FIRST_DATE:
+            return "oper", "fc", "fc"
+        return "enfo", "ef", "cf"
+
     def _remote_paths(self, init_date: datetime, cycle: int, fhour: int) -> tuple[str, str]:
         date_str = init_date.strftime("%Y%m%d")
         cycle_str = f"{cycle:02d}"
-        prefix = f"{date_str}/{cycle_str}z/ifs/0p25/enfo"
-        stem = f"{date_str}{cycle_str}0000-{fhour}h-enfo-ef"
+        stream, suffix, _ = self._source(init_date)
+        prefix = f"{date_str}/{cycle_str}z/ifs/0p25/{stream}"
+        stem = f"{date_str}{cycle_str}0000-{fhour}h-{stream}-{suffix}"
         grib_url = f"{self.base_url}/{prefix}/{stem}.grib2"
         idx_url = f"{self.base_url}/{prefix}/{stem}.index"
         return grib_url, idx_url
 
-    def _find_byte_range(self, idx_text: str, param: str = "tp") -> tuple[int | None, int | None]:
-        """Control member only: match ``type == "cf"`` in addition to param."""
+    def _download_task(self, task):
+        init_date, cycle, fhour, param = task.init_date, task.cycle, task.fhour, task.param
+        out_file = self._record_grib(init_date, cycle, fhour, param)
+        grib_url, idx_url = self._remote_paths(init_date, cycle, fhour)
+        member_type = self._source(init_date)[2]
+        status = self._byte_range_fetch(
+            grib_url=grib_url,
+            idx_url=idx_url,
+            idx_parser=lambda txt: self._find_byte_range(txt, param, member_type),
+            out_path=out_file,
+        )
+        return task, status
+
+    def _find_byte_range(self, idx_text: str, param: str = "tp",
+                         member_type: str = "cf") -> tuple[int | None, int | None]:
+        """One member only: match the index ``type`` (``cf`` control in the
+        ENS era, ``fc`` deterministic from 50r1) in addition to param."""
         for line in idx_text.splitlines():
             line = line.strip()
             if not line:
@@ -85,7 +117,7 @@ class IFSControlDownloaderParallel(AIFSDownloaderParallel):
                 d = json.loads(line)
             except Exception:
                 continue
-            if d.get("type") == "cf" and d.get("param") == param:
+            if d.get("type") == member_type and d.get("param") == param:
                 off = d.get("_offset")
                 ln = d.get("_length")
                 if off is None or ln is None:

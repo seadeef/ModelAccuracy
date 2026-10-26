@@ -91,3 +91,12 @@ export function selectFrame(index) {
   ui.arTime = list[next]?.time ?? null;
   ui.arFramePath = list[next]?.path ?? null;
 }
+
+/** Inspect a day (ISO): the frame moves onto its first frame with footprints
+ *  (else its first frame) and the inspected day follows. With no frames for
+ *  the day (outside the manifest) only the day changes. */
+export function selectDay(iso) {
+  ui.arTargetDate = iso;
+  const w = windowIndices({ start: iso, end: iso });
+  if (w) selectFrame(firstWithFootprints(w.lo, w.hi));
+}

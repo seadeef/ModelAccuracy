@@ -1834,6 +1834,46 @@ def export_basin_revisions(site_root: Path) -> None:
     print(f"  {written} basin revision file(s) exported; {len(index)} basins indexed")
 
 
+CUBE_DIR_NAME = "cube"
+
+
+def export_cube(site_root: Path) -> None:
+    """Publish each model's per-cell daily cube as ``cube/{model}/`` for the
+    on-demand regional series endpoint (``backend.series_query``).
+
+    The arrays are large (~100–150 MB per model) and already in their served
+    form, so they are hard-linked from ``stats_output/{model}/cube/`` when the
+    export tree shares a filesystem, and copied otherwise. Models without a
+    built cube are skipped with a warning (``compute_stats.py --only cube``).
+    """
+    from stats_pipeline.cube import (
+        CELLS_FILENAME, FORECASTS_FILENAME, META_FILENAME, OBSERVED_FILENAME, cube_dir,
+    )
+
+    out_root = site_root / CUBE_DIR_NAME
+    for model_key in MODEL_REGISTRY:
+        src_dir = cube_dir(model_key, STATS_ROOT)
+        if not (src_dir / META_FILENAME).is_file():
+            print(f"  WARNING: {model_key}: no per-cell cube ({src_dir}) — run "
+                  f"compute_stats.py --only cube; skipped")
+            continue
+        dst_dir = out_root / model_key
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for name in (META_FILENAME, CELLS_FILENAME, FORECASTS_FILENAME, OBSERVED_FILENAME):
+            src, dst = src_dir / name, dst_dir / name
+            if dst.exists():
+                same = dst.stat().st_ino == src.stat().st_ino and dst.stat().st_dev == src.stat().st_dev
+                if same or (not _FORCE_EXPORT and dst.stat().st_mtime >= src.stat().st_mtime
+                            and dst.stat().st_size == src.stat().st_size):
+                    continue
+                dst.unlink()
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+        print(f"  {model_key}: cube published under {dst_dir}")
+
+
 # Storm-table fields carried per event (per-model dicts), in catalog order.
 _STORM_MODEL_FIELDS = ("j3", "j3_ca", "r_eff", "mae3", "fss3", "fss3_ca", "r3")
 
@@ -1964,6 +2004,11 @@ def main() -> None:
              "under model_data/)",
     )
     parser.add_argument(
+        "--cube", action="store_true",
+        help="Only publish the per-cell daily cubes (stats_output/{model}/cube → "
+             "static_export/cube/) for the on-demand regional series endpoint",
+    )
+    parser.add_argument(
         "--ar-variable", metavar="NAME",
         help="tARget mask variable name (auto-detected by default)",
     )
@@ -1997,9 +2042,10 @@ def main() -> None:
     mode_count = (
         int(args.static) + int(args.data)
         + int(args.forecast) + int(args.frontend) + int(args.ar) + int(args.basins)
+        + int(args.cube)
     )
     if mode_count > 1:
-        parser.error("Use at most one of --static, --data, --forecast, --frontend, --ar.")
+        parser.error("Use at most one of --static, --data, --forecast, --frontend, --ar, --basins, --cube.")
     if args.clean and mode_count:
         parser.error(
             "--clean applies only to a full export "
@@ -2081,6 +2127,13 @@ def main() -> None:
         print("--basins: exporting storm catalogs...")
         export_storm_catalog(site_root)
         print(f"\nDone (--basins). Basin assets under {site_root / AR_DIR_NAME}")
+        return
+
+    if args.cube:
+        site_root.mkdir(parents=True, exist_ok=True)
+        print("--cube: publishing per-cell daily cubes...")
+        export_cube(site_root)
+        print(f"\nDone (--cube). Cubes under {site_root / CUBE_DIR_NAME}")
         return
 
     if args.static:
@@ -2181,6 +2234,9 @@ def main() -> None:
     print("Exporting basin revision series...")
     export_basin_revisions(site_root)
     export_storm_catalog(site_root)
+
+    print("Publishing per-cell daily cubes...")
+    export_cube(site_root)
 
     print("Building static frontend...")
     build_static_frontend(site_root / FRONTEND_DIR_NAME)

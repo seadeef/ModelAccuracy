@@ -14,6 +14,7 @@ from stats_pipeline.episode_metrics import (
 )
 from stats_pipeline.basin import run_basin_stage
 from stats_pipeline.consistency import run_consistency_stage
+from stats_pipeline.cube import run_cube_stage
 from stats_pipeline.episodes import (
     DEFAULT_MIN_AREA_FRACTION,
     find_basin_episodes,
@@ -29,9 +30,9 @@ from stats_pipeline.manifest import (
 )
 from stats_pipeline.verification import run_verification_stage
 
-StageName = Literal["verification", "consistency", "basin", "episodes", "compare"]
+StageName = Literal["verification", "consistency", "basin", "episodes", "cube", "compare"]
 STAGE_ORDER: tuple[StageName, ...] = (
-    "verification", "consistency", "basin", "episodes", "compare")
+    "verification", "consistency", "basin", "episodes", "cube", "compare")
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,12 @@ def run_pipeline(
                 output = run_episode_stage(model, episode_catalog, force=force)
                 _record_episodes(model, output, sources)
                 summary.add(model, stage, "completed", "episode catalog and scoped statistics current")
+            elif stage == "cube":
+                # Per-cell daily cube for on-demand regional series. Self-gated
+                # on its meta.json (dates + lead range), not the manifest: it
+                # depends only on the raw archive and PRISM, like the basin stage.
+                run_cube_stage(model, force=force)
+                summary.add(model, stage, "completed", "per-cell daily cube current")
 
     # Cross-model ΔR is a single global pass, not a per-model stage. It is
     # cheap (JSON + one basin-history read per model), so it recomputes every

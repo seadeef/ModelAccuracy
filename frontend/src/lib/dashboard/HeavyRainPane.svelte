@@ -3,11 +3,19 @@
    * Heavy-rain trigger sweep: event = observed ≥ q;
    * sweep the forecast trigger at the inspected lead to trace precision–recall,
    * and report the t = q slice (hit rate, frequency bias) per model.
+   *
+   * Two estimands, one display. An exported river basin judges the BASIN-MEAN
+   * day (a daily basin total crossing q), computed here from the series. Any
+   * other region is judged per CELL-DAY on the server (``/api/series/heavy-rain``):
+   * the mean over a state almost never reaches 25 mm, so the day-level curve
+   * collapses to a few steps, while hundreds of thousands of cell-days give the
+   * per-cell verification idiom the accuracy maps already use.
    */
   import { ui, appConfig } from '../state.svelte.js';
   import { dash, palette, modelLabel, selectedLead } from './dashData.svelte.js';
   import { triggerSkill } from '../basinAnalysis.js';
-  import { scopeFor } from './basinScope.svelte.js';
+  import { fetchHeavyRainAllModels } from '../api.js';
+  import { scopeFor, scopeLabel } from './basinScope.svelte.js';
   import BasinNotice from './BasinNotice.svelte';
   import ScopeChips from './ScopeChips.svelte';
   import ChartCanvas from './ChartCanvas.svelte';
@@ -16,8 +24,56 @@
   const pal = $derived(palette());
   const series = $derived(dash.basinSeries);
   const lead = $derived(selectedLead());
+  /** Cell-day pooling for regions served from the per-cell cube; basin-mean days for exported basins. */
+  const cellDays = $derived(dash.basinInfo?.source === 'cube');
+
+  /** The scope's date population, as the union over models (each model's complete dates differ slightly). */
+  const scopeDates = $derived.by(() => {
+    if (!series) return [];
+    const set = new Set();
+    for (const m of appConfig.models) {
+      const rev = series[m.key];
+      const sc = scopeFor(rev);
+      if (sc) for (const d of sc.idx) set.add(rev.dates[d]);
+    }
+    return [...set].sort();
+  });
+
+  // ── Server sweep (cell-days), generation-counter idiom ──
+  let server = $state(null);
+  let serverLoading = $state(false);
+  let srvGen = 0;
+  let srvKey = '';
+  $effect(() => {
+    const region = ui.selectedRegion;
+    const q = ui.eventThresholdMm;
+    const l = lead;
+    const dates = scopeDates;
+    const key = cellDays && region && series ? `${JSON.stringify(region.huc ?? region.fips ?? region.site ?? region.bounds ?? region.coordinates)}|${q}|${l}|${dates.length}:${dates[0]}:${dates[dates.length - 1]}|${scopeLabel()}` : '';
+    if (key === srvKey) return;
+    srvKey = key;
+    const gen = ++srvGen;
+    if (!key) { server = null; serverLoading = false; return; }
+    serverLoading = true;
+    queueMicrotask(async () => {
+      const data = await fetchHeavyRainAllModels({ region, q, lead: l, dates });
+      if (gen !== srvGen) return;
+      server = data;
+      serverLoading = false;
+    });
+  });
+
   const results = $derived.by(() => {
     if (!series) return [];
+    if (cellDays) {
+      if (!server) return [];
+      return appConfig.models.map((m) => {
+        const r = server[m.key];
+        if (!r) return null;
+        if (r.unavailable) return { key: m.key, label: m.label, unavailable: true };
+        return { key: m.key, label: m.label, ...r };
+      }).filter(Boolean);
+    }
     return appConfig.models.map((m) => {
       const rev = series[m.key];
       const sc = scopeFor(rev);
@@ -63,13 +119,23 @@
   <div class="grid">
     <section class="col">
       <div class="head stack">
-        <div class="eyebrow" title="Event = basin-mean PRISM at or above the threshold. Each curve sweeps the model's forecast trigger from 0 to 80 mm; the diamond is the operating point where the trigger equals the event threshold.">
-          Heavy-rain calls at lead day <em>{lead}</em>
+        <div class="eyebrow" title={cellDays
+          ? 'Event = PRISM at or above the threshold in one 0.25° grid cell on one day; every cell-day in the region is a trial, so a state has hundreds of thousands. Each curve sweeps the model\'s forecast trigger from 0 to 80 mm; the diamond is the operating point where the trigger equals the event threshold.'
+          : 'Event = basin-mean PRISM at or above the threshold. Each curve sweeps the model\'s forecast trigger from 0 to 80 mm; the diamond is the operating point where the trigger equals the event threshold.'}>
+          Heavy-rain calls at lead day <em>{lead}</em>{#if cellDays}<span class="cap note">· per grid cell and day</span>{/if}
         </div>
         <ScopeChips />
       </div>
-      <div class="plot"><ChartCanvas {config} /></div>
-      <div class="cap">◆ trigger = event threshold{lead0 ? ` · ${lead0.nObs} heavy days of ${lead0.dates} for ${modelLabel(lead0.key)}` : ''}</div>
+      <div class="plot">
+        {#if cellDays && !server}
+          <div class="plot-empty">{serverLoading ? 'Pooling heavy-rain calls over the region\'s grid cells…' : 'The heavy-rain request failed; change the lead or threshold to retry'}</div>
+        {:else}
+          <ChartCanvas {config} />
+        {/if}
+      </div>
+      <div class="cap">◆ trigger = event threshold{lead0 ? (cellDays
+        ? ` · ${fmt(lead0.nObs, 0)} heavy cell-days of ${fmt(lead0.cellDays, 0)} (${lead0.cells} cells × ${lead0.dates} days) for ${modelLabel(lead0.key)}`
+        : ` · ${lead0.nObs} heavy days of ${lead0.dates} for ${modelLabel(lead0.key)}`) : ''}</div>
     </section>
     <section class="side">
       <div class="head">
@@ -82,12 +148,12 @@
       <table>
         <thead><tr>
           <th></th>
-          <th title="Heavy days the model called">Hits</th>
-          <th title="Heavy days the model missed">Misses</th>
-          <th title="Calls on days that stayed below the threshold">False alarms</th>
+          <th title={cellDays ? 'Heavy cell-days the model called' : 'Heavy days the model called'}>Hits</th>
+          <th title={cellDays ? 'Heavy cell-days the model missed' : 'Heavy days the model missed'}>Misses</th>
+          <th title={cellDays ? 'Calls on cell-days that stayed below the threshold' : 'Calls on days that stayed below the threshold'}>False alarms</th>
           <th title="Share of calls that verified">Precision</th>
-          <th title="Share of heavy days caught (hit rate)">Recall</th>
-          <th title="Forecast heavy days ÷ observed heavy days. Below 1 the model under-calls heavy rain; above 1 it over-calls.">Bias</th>
+          <th title={cellDays ? 'Share of heavy cell-days caught (hit rate)' : 'Share of heavy days caught (hit rate)'}>Recall</th>
+          <th title={cellDays ? 'Forecast heavy cell-days ÷ observed heavy cell-days. Below 1 the model under-calls heavy rain; above 1 it over-calls.' : 'Forecast heavy days ÷ observed heavy days. Below 1 the model under-calls heavy rain; above 1 it over-calls.'}>Bias</th>
           <th title="Average precision: area under the precision–recall curve">AP</th>
         </tr></thead>
         <tbody>
@@ -117,7 +183,8 @@
   .head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; min-width: 0; }
   .head .eyebrow { flex: 1; }
   .head.stack { flex-direction: column; align-items: flex-start; gap: 6px; }
-  .col > .cap { margin-top: 4px; }
+  .note { margin-left: 6px; text-transform: none; letter-spacing: 0; }
+  .col > .cap { margin-top: 4px; white-space: normal; line-height: 1.35; }
   table { border-collapse: collapse; font-size: 13px; width: 100%; margin-top: 4px; }
   th { text-align: right; font-weight: 600; color: var(--text-secondary); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; padding: 2px 6px 6px; white-space: nowrap; }
   th:first-child { text-align: left; padding-left: 0; }
@@ -126,4 +193,10 @@
   td.na { text-align: left; color: var(--text-secondary); }
   tr.on td { color: #fff; }
   .c-bad { color: #f0a07a; }
+  @media (max-width: 1360px) {
+    .grid { grid-template-columns: 1fr 1.3fr; gap: 14px; }
+    .side { padding-left: 12px; }
+    table { font-size: 12px; }
+    th, td { padding-left: 4px; padding-right: 4px; }
+  }
 </style>

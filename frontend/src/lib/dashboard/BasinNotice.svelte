@@ -1,6 +1,5 @@
 <script>
-  /** Empty state for basin-only analyses. */
-  import { ui } from '../state.svelte.js';
+  /** Empty state for the analyses that need a region's daily forecast history. */
   import { dash } from './dashData.svelte.js';
   let { children } = $props();
 </script>
@@ -10,9 +9,9 @@
 {:else}
   <div class="notice">
     {#if dash.basinLoading}
-      Loading the basin's forecast history…
+      Loading the region's daily forecast history…
     {:else}
-      Storm analyses cover the river basins of California, the Pacific Northwest and the Upper Colorado. Pick one with the watershed tool.
+      No daily forecast history here: the region lies off the verification grid (20–55°N, 130–60°W) or covers only water.
     {/if}
   </div>
 {/if}

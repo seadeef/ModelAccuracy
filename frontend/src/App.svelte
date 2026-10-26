@@ -10,6 +10,7 @@
   import DrawTools from './lib/components/DrawTools.svelte';
   import CenterGuide from './lib/components/CenterGuide.svelte';
   import AtmosphericRiverControl from './lib/components/AtmosphericRiverControl.svelte';
+  import ArPanel from './lib/components/ArPanel.svelte';
   import Dashboard from './lib/dashboard/Dashboard.svelte';
   import DashHeader from './lib/dashboard/DashHeader.svelte';
   import AccuracyTiles from './lib/dashboard/AccuracyTiles.svelte';
@@ -17,6 +18,8 @@
   import { dash } from './lib/dashboard/dashData.svelte.js';
   import { STATIC_BASE } from './lib/constants.js';
   let mapView = $state();
+  /** Height of the floating AR panel (bare map, AR mode) so the map key clears it. */
+  let arPanelHeight = $state(0);
 
   // Value range of the raster overlay for the colour key (bare map and dashboard alike).
   $effect(() => {
@@ -37,7 +40,12 @@
   });
   let configReady = $state(false);
   /** The one-screen dashboard opens whenever a region is selected. */
-  const dashActive = $derived(!!ui.selectedRegion);
+  /** The dashboard shell stays up after the first Escape with its data blanked and the
+   *  picker re-armed; a second Escape (or ×) drops back to the full map. */
+  let dashShell = $state(false);
+  const dashActive = $derived(!!ui.selectedRegion || dashShell);
+  const dashBlank = $derived(dashShell && !ui.selectedRegion);
+  $effect(() => { if (ui.selectedRegion) dashShell = false; });
 
   function handleModelChange(e) {
     ui.model = typeof e === 'string' ? e : e.target.value;
@@ -122,9 +130,33 @@
   }
 
   function closeDashboard() {
+    dashShell = false;
     ui.selectedRegion = null;
     ui.wbdDrillPath = [];
   }
+
+  /** Escape, first press: drop the region but keep the dashboard shell, blank, with the
+   *  active tool re-armed for the next pick. Second press: back to the full map. Anything
+   *  that owns Escape itself — an open menu or popover, the search list, a focused text
+   *  field, a draw in progress (MapView cancels it and marks the event handled) — keeps it. */
+  function onWindowKeyDown(e) {
+    if (e.key !== 'Escape' || e.defaultPrevented || !dashActive) return;
+    if (document.querySelector('.dd-menu, .popover, .suggestions')) return;
+    const t = e.target;
+    if (t instanceof HTMLElement && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) {
+      t.blur();
+      return;
+    }
+    if (ui.selectedRegion) {
+      ui.selectedRegion = null;
+      ui.wbdDrillPath = [];
+      dashShell = true;
+    } else {
+      closeDashboard();
+    }
+  }
+
+  const toolNoun = $derived({ point: 'point', state: 'state', county: 'county', watershed: 'watershed', military: 'installation', rectangle: 'rectangle', polygon: 'polygon' }[ui.activeTool] ?? 'area');
 
   function handleLocationSelect(data) {
     mapView?.flyToLocation(data);
@@ -139,8 +171,11 @@
     ui.activeTool === 'point' && !ui.hasUsedPinTool,
   );
   // The first-use hint hides once an area tool has been used, except for the
-  // watershed tool, whose hint carries the drill breadcrumb and the Enter /
-  // Escape instructions and so stays up until a basin is selected.
+  // watershed tool, whose hint carries the Enter / Escape instructions and so
+  // stays up until a basin is selected. The body is static; only the hint
+  // names the basin currently drilled into (one name, never the whole path —
+  // the bubble must not grow with the drill, and a long name shrinks or
+  // ellipsizes inside it).
   const showBoundaryGuide = $derived(
     (ui.activeTool === 'state' || ui.activeTool === 'county' || ui.activeTool === 'watershed'
       || ui.activeTool === 'military')
@@ -150,9 +185,13 @@
     if (ui.activeTool === 'county') return 'Click a county to analyze';
     if (ui.activeTool === 'state') return 'Click a state to analyze';
     if (ui.activeTool === 'military') return 'Click a military installation marker to analyze';
-    const crumb = ui.wbdDrillPath.length ? `${ui.wbdDrillPath.join(' → ')} — ` : '';
-    return `${crumb}Click a watershed to drill down. Press Enter to analyze at the current level.`;
+    return ui.wbdDrillPath.length
+      ? 'Click a sub-basin to drill down · Enter analyzes this level · Esc backs out'
+      : 'Click a watershed to drill down · Enter analyzes the current level';
   });
+  const boundaryGuideHint = $derived(ui.activeTool === 'watershed' && ui.wbdDrillPath.length
+    ? `Inside ${ui.wbdDrillPath[ui.wbdDrillPath.length - 1]}`
+    : null);
 
   /**
    * Session-scoped latch: the point guide pulses on its very first display
@@ -179,6 +218,9 @@
   });
 </script>
 
+<svelte:window onkeydown={onWindowKeyDown} />
+
+
 {#if configReady}<div class="app" class:dash={dashActive}>
   {#if dashActive}
     <DashHeader
@@ -191,7 +233,7 @@
   <div class="workspace">
     <aside class="geography">
       <div class="map-box">
-        <div class="map-fill">
+        <div class="map-fill" style:--ar-panel-h="{!dashActive && ui.mode === 'atmospheric-rivers' && arPanelHeight ? arPanelHeight + 12 : 0}px">
           <MapView bind:this={mapView} />
 
           {#if !dashActive}
@@ -218,17 +260,17 @@
             </CenterGuide>
           {/if}
 
-          {#if !dashActive && ui.mode === 'accuracy' && showBoundaryGuide}
-            <CenterGuide>
+          {#if !dashActive && showBoundaryGuide}
+            <CenterGuide hint={boundaryGuideHint}>
               {boundaryGuideText}
             </CenterGuide>
           {/if}
 
-          {#if ui.mode === 'atmospheric-rivers' && !ui.selectedRegion}
-            <CenterGuide>
-              AR footprints are shown for the scrubbed time. Click a highlighted basin
-              on the map to open the storm analysis dashboard.
-            </CenterGuide>
+          <!-- AR mode on the bare map: the timeline floats over the map, so the
+               footprints can be scrubbed and the range set before any region is
+               picked; the dashboard's AR tab takes over once one is. -->
+          {#if !dashActive && ui.mode === 'atmospheric-rivers'}
+            <ArPanel bind:height={arPanelHeight} />
           {/if}
 
           {#if !dashActive && authSession.ready && authSession.mode === 'cognito'}
@@ -243,14 +285,23 @@
             {/if}
           {/if}
 
-          {#if !dashActive}<footer class="app-credit">Kevin Toren 2026</footer>{/if}
+          {#if !dashActive && ui.mode !== 'atmospheric-rivers'}<footer class="app-credit">Kevin Toren 2026</footer>{/if}
         </div>
       </div>
-      {#if dashActive}
+      {#if dashBlank}
+        <div class="blank-tiles" aria-hidden="true"></div>
+      {:else if dashActive}
         <AccuracyTiles onstatchange={handleStatChange} />
       {/if}
     </aside>
-    {#if dashActive}
+    {#if dashBlank}
+      <section class="blank-results">
+        <div class="blank-msg">
+          <b>Pick another area on the map</b>
+          <span>The {toolNoun} tool is ready · Esc again for the full map</span>
+        </div>
+      </section>
+    {:else if dashActive}
       <Dashboard onleadchange={(lead) => mapView?.onLeadSliderInput(lead)} />
     {/if}
   </div>
@@ -327,6 +378,8 @@
     position: relative;
     min-height: 0;
   }
+  /* The floating AR panel sits over the bottom edge: the map's attribution moves up with the key. */
+  .map-fill :global(.maplibregl-ctrl-bottom-right) { bottom: var(--ar-panel-h, 0px); transition: bottom .15s; }
 
   /* ── One-screen dashboard: map column + analysis column ── */
   .app.dash {
@@ -357,6 +410,11 @@
   .app.dash .map-box :global(.map-wrap) {
     height: 100%;
   }
+  .blank-tiles { flex: none; height: 118px; border: 1px dashed var(--panel-border); border-radius: 12px; opacity: .6; }
+  .blank-results { display: flex; align-items: center; justify-content: center; min-width: 0; min-height: 0; border: 1px dashed var(--panel-border); border-radius: 12px; }
+  .blank-msg { display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center; padding: 16px; }
+  .blank-msg b { font-size: 16px; font-weight: 600; color: var(--text-primary); }
+  .blank-msg span { font-size: 13px; color: var(--text-secondary); }
   @media (max-width: 900px) {
     .app.dash .workspace {
       grid-template-columns: 1fr;
