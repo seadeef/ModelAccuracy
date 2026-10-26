@@ -20,6 +20,7 @@
 #
 #   Backend Lambda (direct S3 GetObject — no CloudFront, no cache headers):
 #     model_data/<model>/…                  stats bins + grid.json (DATA_S3_URI)
+#     cube/<model>/…                        per-cell daily cube (POST /api/series)
 #     wbd/chunks/…                          HUC mask polygons, fetched per-parent
 #     admin/boundaries.json,
 #       military/boundaries.json            region mask polygons
@@ -146,6 +147,15 @@ sync_static() {
     aws s3 sync "$STATIC_SRC/ar" "$dest/ar" \
       --region "$AWS_REGION" --delete \
       --cache-control "$CC_MUTABLE"
+  fi
+
+  # Per-cell cube (backend-read: POST /api/series pools it over any region).
+  # 100–200 MB per model; the Lambda loads a model's cube whole on first use,
+  # so this sync pairs with LAMBDA_MEMORY_MB ≥ 3008 in deploy_infra.sh.
+  if [[ -d "$STATIC_SRC/cube" ]]; then
+    echo "==> Sync $dest/cube/ (backend-read)"
+    aws s3 sync "$STATIC_SRC/cube" "$dest/cube" \
+      --region "$AWS_REGION" --delete
   fi
 
   # Mutable (refreshed each stats rerun).

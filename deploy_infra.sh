@@ -114,6 +114,7 @@ deploy() {
       "BucketName=${BUCKET_NAME:-}" \
       "WarmPing=${WARM_PING:-true}" \
       "LambdaMemoryMb=${LAMBDA_MEMORY_MB:-1024}" \
+      "LambdaTimeoutSec=${LAMBDA_TIMEOUT_SEC:-30}" \
       "AppCallbackDomain=${CALLBACK_DOMAIN}" \
       "ExistingUserPoolId=${EXISTING_USER_POOL_ID:-}" \
       "ExistingUserPoolClientId=${EXISTING_USER_POOL_CLIENT_ID:-}" \

@@ -367,6 +367,10 @@ Resources:
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
               OriginSSLProtocols: [TLSv1.2]
+              # A cold environment's first /api/series loads a per-cell cube
+              # (100–200 MB per model) from S3; give it the full 60 s the
+              # default quota allows instead of CloudFront's 30 s default.
+              OriginReadTimeout: 60
             OriginCustomHeaders:
               - HeaderName: x-origin-verify
                 HeaderValue: !Ref OriginVerifySecret
