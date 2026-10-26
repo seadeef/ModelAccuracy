@@ -516,7 +516,11 @@
 
   async function setupMilitaryLayer() {
     if (!map) return;
-    if (militaryLoadAbort) militaryLoadAbort.abort();
+    // A load already in flight will install the layer itself (it re-checks the
+    // tool when it lands). Aborting it here would also abort the loader's shared
+    // fetch, so a second caller — the tool effect and the region-cleared effect
+    // both re-arm this tool — would leave no layer at all.
+    if (militaryLoadAbort) return;
     militaryLoadAbort = new AbortController();
     let fc;
     try {
