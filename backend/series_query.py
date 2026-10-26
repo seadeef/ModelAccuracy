@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 from backend import admin_boundaries, military_boundaries, wbd_boundaries
-from backend.static_store import LocalStaticStore, StaticStore
+from backend.static_store import LocalStaticStore, StaticStore, static_site_store_from_env
 from backend.stats_query import _build_region_mask, _get_grid, _huc_region_mask
 from model_registry import MODEL_REGISTRY
 
@@ -65,31 +65,46 @@ def _load_array(store: StaticStore, relative_path: str) -> np.ndarray:
     return np.load(io.BytesIO(store.read_bytes(relative_path)), allow_pickle=False)
 
 
+def _site(store: StaticStore) -> StaticStore:
+    """The store rooted at the static site root, where ``cube/`` and ``ar/`` live.
+
+    Locally ``store`` already is ``static_export/`` (grid.json under
+    ``model_data/<model>/`` and the cube under ``cube/<model>/`` share one
+    root). On Lambda the stats store is rooted at the ``model_data/`` S3
+    prefix, so the cube and the AR basin index must be read from the bucket
+    root, where ``deploy_static.sh`` uploads them next to the browser assets.
+    """
+    if isinstance(store, LocalStaticStore):
+        return store
+    return static_site_store_from_env()
+
+
 def cube_available(store: StaticStore, model: str) -> bool:
-    return store.exists(f"{CUBE_DIR}/{model}/meta.json")
+    return _site(store).exists(f"{CUBE_DIR}/{model}/meta.json")
 
 
 def get_cube(store: StaticStore, model: str) -> RegionCube | None:
     """The model's cube, or None when it has not been built/exported."""
-    key = (store.cache_key, model)
+    site = _site(store)
+    key = (site.cache_key, model)
     with _cube_lock:
         if key in _cube_cache:
             return _cube_cache[key]
     cube: RegionCube | None = None
     base = f"{CUBE_DIR}/{model}"
-    if store.exists(f"{base}/meta.json"):
-        meta = json.loads(store.read_text(f"{base}/meta.json"))
+    if site.exists(f"{base}/meta.json"):
+        meta = json.loads(site.read_text(f"{base}/meta.json"))
         lats, lons, n_lat, n_lon = _get_grid(store, model)
         if (int(meta["n_lat"]), int(meta["n_lon"])) != (n_lat, n_lon):
             raise RuntimeError(f"{model}: cube grid {meta['n_lat']}×{meta['n_lon']} "
                                f"does not match grid.json {n_lat}×{n_lon}")
-        cells = np.asarray(_load_array(store, f"{base}/cells.npy"), dtype=np.int32)
+        cells = np.asarray(_load_array(site, f"{base}/cells.npy"), dtype=np.int32)
         cell_pos = np.full(n_lat * n_lon, -1, dtype=np.int32)
         cell_pos[cells] = np.arange(cells.size, dtype=np.int32)
         cube = RegionCube(
             model=model, meta=meta, cells=cells, cell_pos=cell_pos,
-            forecasts=_load_array(store, f"{base}/forecasts.npy"),
-            observed=_load_array(store, f"{base}/observed.npy"),
+            forecasts=_load_array(site, f"{base}/forecasts.npy"),
+            observed=_load_array(site, f"{base}/observed.npy"),
             lats=lats, lons=lons, n_lat=n_lat, n_lon=n_lon,
         )
     with _cube_lock:
@@ -193,11 +208,12 @@ _basins_index_cache: dict[str, list[str]] = {}
 def catalogued_basins(store: StaticStore) -> list[str]:
     """HUC6 codes of the exported AR basins (``ar/basins.json``), or [] when
     the AR export is absent."""
-    key = store.cache_key
+    site = _site(store)
+    key = site.cache_key
     hit = _basins_index_cache.get(key)
     if hit is None:
         try:
-            doc = json.loads(store.read_text(BASINS_INDEX_PATH))
+            doc = json.loads(site.read_text(BASINS_INDEX_PATH))
             hit = sorted(str(h) for h in (doc.get("basins") or {}))
         except Exception:
             hit = []
